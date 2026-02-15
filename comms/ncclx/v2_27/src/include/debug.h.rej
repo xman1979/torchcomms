@@ -1,0 +1,14 @@
+--- comms/ncclx/v2_27/src/include/debug.h
++++ comms/ncclx/v2_27/src/include/debug.h
+@@ -23,9 +23,9 @@
+ extern int ncclDebugLevel;
+ extern std::string ncclDebugLogFileStr;
+ 
+-void ncclMetaDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *filefunc, int line, const char *fmt, ...) __attribute__ ((format (printf, 6, 7)));
++void ncclMetaDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *filefunc, int line, const char *fmt, ...) __attribute__ ((format (printf, 5, 6)));
+ 
+-void ncclMetaDebugLogWithScuba(ncclDebugLogLevel level, unsigned long flags, const char *filefunc, int line, const char *fmt, ...) __attribute__ ((format (printf, 6, 7)));
++void ncclMetaDebugLogWithScuba(ncclDebugLogLevel level, unsigned long flags, const char *filefunc, int line, const char *fmt, ...) __attribute__ ((format (printf, 5, 6)));
+ 
+ void ncclMetaDebugInit();
+ 
