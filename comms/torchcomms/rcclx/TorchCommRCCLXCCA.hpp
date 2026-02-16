@@ -3,18 +3,27 @@
 #pragma once
 
 #include <ATen/hip/HIPContext.h> // @manual
+#ifdef HIPIFY_V2
+#include <c10/hip/HIPCachingAllocator.h> // @manual
+using c10::cuda::CUDACachingAllocator::attachAllocatorTraceTracker;
+using c10::cuda::CUDACachingAllocator::snapshot;
+using c10::cuda::CUDACachingAllocator::TraceEntry;
+#else
 #include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h> // @manual
+using c10::hip::HIPCachingAllocator::attachAllocatorTraceTracker;
+using c10::hip::HIPCachingAllocator::snapshot;
+using c10::hip::HIPCachingAllocator::TraceEntry;
+#endif
 #include <memory>
 #include <mutex>
 #include "comms/torchcomms/rcclx/TorchCommRCCLX.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 class CachingAllocatorHookImpl {
  public:
   virtual ~CachingAllocatorHookImpl() = default;
-  virtual void regDeregMem(const c10::hip::HIPCachingAllocator::TraceEntry& te);
+  virtual void regDeregMem(const TraceEntry& te);
   virtual void registerComm(TorchCommRCCLX* comm);
   virtual void deregisterComm(TorchCommRCCLX* comm);
   virtual void registerMemPreHook();
@@ -73,11 +82,10 @@ class CachingAllocatorHook {
   }
 
   inline static std::unique_ptr<CachingAllocatorHookImpl> instance_ = nullptr;
+  inline static std::once_flag init_flag_;
 };
 
 // Global function to be registered as a hook
-void cachingAllocatorHookFn(
-    const c10::hip::HIPCachingAllocator::TraceEntry& te);
+void cachingAllocatorHookFn(const TraceEntry& te);
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

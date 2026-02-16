@@ -608,6 +608,20 @@ void CtranIb::bootstrapStart(
   folly::SocketAddress addrSockAddr;
   if (this->bootstrapMode == BootstrapMode::kDefaultServer) {
     ifnamePtr = &NCCL_SOCKET_IFNAME;
+    // Validate that NCCL_SOCKET_IFNAME contains only one interface
+    if (NCCL_SOCKET_IFNAME.find(',') != std::string::npos) {
+      CLOGF(
+          WARN,
+          "CTRAN-IB: NCCL_SOCKET_IFNAME contains multiple interfaces ({}). "
+          "Only one interface should be specified.",
+          NCCL_SOCKET_IFNAME);
+      throw ::ctran::utils::Exception(
+          "CTRAN-IB: NCCL_SOCKET_IFNAME should specify only one interface",
+          commInvalidArgument,
+          this->rank,
+          this->commHash,
+          this->commDesc);
+    }
     // Use default NCCL socket ifname
     auto maybeAddr = ctran::bootstrap::getInterfaceAddress(
         NCCL_SOCKET_IFNAME, NCCL_SOCKET_IPADDR_PREFIX);
@@ -1082,6 +1096,20 @@ commResult_t CtranIb::connectVcDirect(
   auto vc = createVc(peerRank);
   {
     const std::lock_guard<std::mutex> lock(vc->mutex);
+
+    // Verify that getLocalVcIdentifier() was called first to create QPs.
+    // This is a precondition for connectVcDirect().
+    if (!vc->areQpsInitialized()) {
+      CLOGF(
+          ERR,
+          "CTRAN-IB: connectVcDirect called for peerRank {} before getLocalVcIdentifier(). "
+          "QPs must be initialized first. commHash {:x}, commDesc {}",
+          peerRank,
+          commHash,
+          commDesc);
+      return commInternalError;
+    }
+
     FB_COMMCHECKTHROW_EX(
         vc->setupVc((void*)remoteVcIdentifier.data()), this->ncclLogData);
   }
@@ -1341,7 +1369,7 @@ commResult_t CtranIb::updateVcState(
     // transferred to vcStateMaps
     // TODO: for now we apply a hot fix to address segfault caused by race from
     // concurrent threads updating pendingVcs_. We need to revisit why we
-    // need pendingVcs_? To add explaination to it or remove
+    // need pendingVcs_? To add explanation to it or remove
     std::lock_guard<std::mutex> lock(cqMutex);
     pendingVcs_.erase(peerRank);
   }

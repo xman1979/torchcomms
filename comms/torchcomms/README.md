@@ -7,12 +7,14 @@ collective operations for distributed training and inference.
 ## Table of Contents
 
 - [Installation](#installation)
+  - [Version Requirements](#version-requirements)
 - [API Overview](#api-overview)
 - [Detailed API Reference](#detailed-api-reference)
   - [Constructor and Initialization](#constructor-and-initialization)
   - [Point-to-Point Operations](#point-to-point-operations)
   - [Collective Operations](#collective-operations)
   - [Scatter and Gather Operations](#scatter-and-gather-operations)
+  - [Window-Based RMA Operations](#window-based-rma-operations)
   - [Communicator Management](#communicator-management)
   - [Work Object](#work-object)
   - [Options Configuration](#options-configuration)
@@ -27,6 +29,22 @@ Python as:
 ```python
 import torchcomms
 ```
+
+### Version Requirements
+
+The nccl and ncclx backends require specific library versions for full
+functionality:
+
+| Feature | Minimum Version |
+|---------|---------------------|
+| NCCLX backend | NCCLX 2.25.0 |
+| Memory registration (commRegister/commDeregister) | NCCL 2.19.0 |
+| Named communicators | NCCL 2.27.0 |
+| Sparse reduce | NCCL 2.28.0 |
+
+**Note**: Features that require a newer version than what is installed will
+throw a runtime error when called. The NCCLX backend requires NCCLX 2.25.0 or
+later and will fail to compile with older versions.
 
 ## API Overview
 
@@ -339,6 +357,27 @@ Gather tensors from all ranks to the root rank.
 - **timeout** (timedelta, optional): Timeout for the operation
 - **Returns**: TorchWork object
 
+### Window-Based RMA Operations
+
+TorchComm provides window-based Remote Memory Access (RMA) operations for
+one-sided communication. Windows allow direct memory access between ranks
+without requiring receiver-side matching, enabling asynchronous communication
+patterns with reduced coordination overhead.
+
+For detailed API documentation and examples, see the
+[TorchComm.new_window](https://meta-pytorch.org/torchcomms/main/api.html#torchcomms.TorchComm.new_window)
+method in the API reference.
+
+**Key Methods**:
+- `comm.new_window()` - Create a new window object
+- `window.tensor_register(tensor)` - Register a tensor buffer for RMA operations
+- `window.put(tensor, dst_rank, offset, async_op)` - One-sided put operation
+- `window.signal(dst_rank, async_op)` / `window.wait_signal(peer_rank, async_op)` - Synchronization
+- `window.map_remote_tensor(rank)` - Map remote rank's buffer as local tensor
+- `window.tensor_deregister()` - Deregister and clean up
+
+**Note**: Window operations require the `ncclx` backend.
+
 ### Communicator Management
 
 #### Split
@@ -444,7 +483,7 @@ TorchComm uses the following environment variables for configuration:
 - **TORCHCOMM_ABORT_ON_ERROR**: Whether to abort the process on timeout or error
   (default: "true")
 - **TORCHCOMM_TIMEOUT_SECONDS**: Default timeout in seconds for operations
-  (default: "30.0")
+  (default: "600")
 
 ## Examples
 
@@ -556,7 +595,7 @@ device = torch.device("cuda:0")
 comm = torchcomms.new_comm(
     "ncclx",
     device,
-    timeout=torch.timedelta(seconds=60.0),
+    timeout=torch.timedelta(seconds=60),
     abort_process_on_timeout_or_error=False,
     hints={
         "torchcomm::ncclx::high_priority_stream": "true",
@@ -567,3 +606,9 @@ comm = torchcomms.new_comm(
 # ...
 comm.finalize()
 ```
+
+### Window-Based RMA Example
+
+For a complete window-based RMA example, see the
+[TorchComm.new_window](https://meta-pytorch.org/torchcomms/main/api.html#torchcomms.TorchComm.new_window)
+API documentation.

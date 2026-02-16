@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Extension: torchcomms._comms_nccl
 file(GLOB TORCHCOMMS_NCCL_SOURCES "comms/torchcomms/nccl/*.cpp")
-file(GLOB TORCHCOMMS_CUDA_API_SOURCE "comms/torchcomms/device/CudaApi.cpp")
+file(GLOB TORCHCOMMS_CUDA_API_SOURCE "comms/torchcomms/device/cuda/CudaApi.cpp")
 find_package(CUDA)
 
 if(USE_SYSTEM_LIBS)
@@ -11,7 +11,9 @@ if(USE_SYSTEM_LIBS)
 elseif(EXISTS "${TORCH_INSTALL_PREFIX}/../build/nccl/include/nccl.h")
     # Use NCCL from PyTorch source build
     set(NCCL_INCLUDE "${TORCH_INSTALL_PREFIX}/../build/nccl/include")
-    set(NCCL_STATIC_LIB "${TORCH_INSTALL_PREFIX}/../build/nccl/lib/libnccl_static.a")
+    set(NCCL_STATIC_LIB
+        "${TORCH_INSTALL_PREFIX}/../build/nccl/lib/libnccl_static.a"
+    )
 else()
     # Use NCCL packaged with PyTorch (pip install)
     set(NCCL_INCLUDE "${TORCH_INSTALL_PREFIX}/../nvidia/nccl/include")
@@ -19,6 +21,8 @@ else()
         "${TORCH_INSTALL_PREFIX}/../nvidia/nccl/lib/libnccl.so.2"
     )
 endif()
+
+set(FMT_INCLUDE "${ROOT}/third-party/fmt/include")
 
 add_library(torchcomms_comms_nccl MODULE
     ${TORCHCOMMS_NCCL_SOURCES}
@@ -33,6 +37,7 @@ set_target_properties(torchcomms_comms_nccl PROPERTIES
 target_include_directories(torchcomms_comms_nccl PRIVATE
     ${ROOT}
     ${NCCL_INCLUDE}
+    ${FMT_INCLUDE}
     ${CONDA_INCLUDE}
     ${Python3_INCLUDE_DIRS}
 )
@@ -46,10 +51,12 @@ target_link_libraries(torchcomms_comms_nccl PRIVATE
 if(USE_SYSTEM_LIBS)
     target_link_libraries(torchcomms_comms_nccl PRIVATE
         ${NCCL_SHARED_LIB}
+        "-lfmt"
     )
 else()
     target_link_libraries(torchcomms_comms_nccl PRIVATE
         ${NCCL_STATIC_LIB}
+        "-l:libfmt.a"
     )
 endif()
 

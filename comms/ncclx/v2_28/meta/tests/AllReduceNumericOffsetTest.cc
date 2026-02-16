@@ -50,12 +50,6 @@ class AllReduceNumericOffsetTest : public NcclxBaseTest {
     NcclxBaseTest::TearDown();
   }
 
-  void assignChunkValue(TYPE* buf, size_t count, TYPE val) {
-    std::vector<TYPE> expectedVals(count, val);
-    CUDACHECKIGNORE(cudaMemcpy(
-        buf, expectedVals.data(), count * sizeof(TYPE), cudaMemcpyDefault));
-  }
-
   void verifyMaxDiff(
       TYPE* tensorA,
       TYPE* tensorB,
@@ -107,10 +101,8 @@ class AllReduceNumericOffsetTest : public NcclxBaseTest {
     TYPE *tensorA = nullptr, *tensorB = nullptr;
 
     // create and register buffers
-    FB_COMMCHECKTHROW(ncclToMetaComm(
-        ncclMemAlloc((void**)&tensorA, tensorASize * sizeof(TYPE))));
-    FB_COMMCHECKTHROW(ncclToMetaComm(
-        ncclMemAlloc((void**)&tensorB, tensorBSize * sizeof(TYPE))));
+    NCCLCHECK_TEST(ncclMemAlloc((void**)&tensorA, tensorASize * sizeof(TYPE)));
+    NCCLCHECK_TEST(ncclMemAlloc((void**)&tensorB, tensorBSize * sizeof(TYPE)));
 
     // Initialize tensorA with rank-specific values
     std::vector<TYPE> hostTensorA(tensorASize);

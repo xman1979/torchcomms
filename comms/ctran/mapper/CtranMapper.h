@@ -17,9 +17,10 @@
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/gpe/CtranGpeDev.h"
 #include "comms/ctran/mapper/CtranMapperImpl.h"
-#include "comms/ctran/mapper/CtranMapperRegMem.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
 #include "comms/ctran/profiler/Profiler.h"
+#include "comms/ctran/regcache/IpcRegCache.h"
+#include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CtranPerf.h"
 #include "comms/ctran/utils/Exception.h"
@@ -887,7 +888,7 @@ class CtranMapper {
   }
 
   // Dump exported registration cache, for testing only
-  std::unordered_map<CtranMapperRegElem*, std::unordered_set<int>>
+  std::unordered_map<ctran::regcache::RegElem*, std::unordered_set<int>>
   dumpExportRegCache() const;
 
  protected:
@@ -901,11 +902,11 @@ class CtranMapper {
       FB_COMMCHECK(this->ctranTcpDm->progress());
     }
 
-    // Check if any posted CB_CTRL requests are completed and cleanup
+    // Check if any posted IPC release requests are completed and cleanup
     for (auto it = this->postedCbCtrlReqs_.begin();
          it != this->postedCbCtrlReqs_.end();) {
       auto& req = *it;
-      if (req->checkComplete()) {
+      if (req->completed.load()) {
         it = this->postedCbCtrlReqs_.erase(it);
       } else {
         it++;
@@ -1072,7 +1073,7 @@ class CtranMapper {
       void* hdl,
       ControlMsg& msg,
       CtranMapperBackend backend = CtranMapperBackend::UNSET) {
-    auto regElem = reinterpret_cast<CtranMapperRegElem*>(hdl);
+    auto regElem = reinterpret_cast<ctran::regcache::RegElem*>(hdl);
 
     // For a NVL peer, send NVL registration if the buffer has been registered
     // as NVL sharable buffer (i.e., allocated by cuMem). Otherwise pass IB
@@ -1082,7 +1083,10 @@ class CtranMapper {
     }
 
     if (backend == CtranMapperBackend::NVL) {
-      FB_COMMCHECK(CtranNvl::exportMem(buf, regElem->nvlRegElem, msg));
+      msg.setType(ControlMsgType::NVL_EXPORT_MEM);
+      FB_COMMCHECK(
+          ctran::IpcRegCache::getInstance()->exportMem(
+              buf, regElem->ipcRegElem, msg.ipcDesc));
 
       // Record the exported remote rank to notify at deregistration
       exportRegCache_.wlock()->record(regElem, rank);
@@ -1121,7 +1125,7 @@ class CtranMapper {
         remKey->backend = CtranMapperBackend::IB;
         FB_COMMCHECK(CtranIb::importMem(buf, &(remKey->ibKey), msg));
         break;
-      case ControlMsgType::NVL_EXPORT_MEM:
+      case ControlMsgType::NVL_EXPORT_MEM: {
         if (!this->ctranNvl) {
           CLOGF(
               ERR,
@@ -1130,9 +1134,17 @@ class CtranMapper {
           return commInternalError;
         }
         remKey->backend = CtranMapperBackend::NVL;
+        const std::string peerId = comm->statex_->gPid(rank);
         FB_COMMCHECK(
-            this->ctranNvl->importMem(buf, &(remKey->nvlKey), rank, msg));
+            ctran::IpcRegCache::getInstance()->importMem(
+                peerId,
+                msg.ipcDesc,
+                comm->statex_->cudaDev(),
+                buf,
+                &(remKey->nvlKey),
+                &this->logMetaData_));
         break;
+      }
       default:
         CLOGF(
             ERR,
@@ -1144,10 +1156,10 @@ class CtranMapper {
   }
 
   inline CtranMapperBackend queryPeerBackend(
-      CtranMapperRegElem* regElem,
+      ctran::regcache::RegElem* regElem,
       int rank) {
     if (this->ctranNvl && this->ctranNvl->isSupported(rank) &&
-        regElem->nvlRegElem) {
+        regElem->ipcRegElem) {
       return CtranMapperBackend::NVL;
     } else if (this->ctranIb && regElem->ibRegElem) {
       return CtranMapperBackend::IB;
@@ -1458,8 +1470,8 @@ class CtranMapper {
         put.req->setConfig(put.config);
       }
 
-      struct CtranMapperRegElem* regElem =
-          reinterpret_cast<struct CtranMapperRegElem*>(shdl);
+      struct ctran::regcache::RegElem* regElem =
+          reinterpret_cast<struct ctran::regcache::RegElem*>(shdl);
       auto regLk = regElem->stateMnger.rlock();
       CLOGF_TRACE(
           COLL,
@@ -1531,8 +1543,8 @@ class CtranMapper {
         }
       }
 
-      struct CtranMapperRegElem* regElem =
-          reinterpret_cast<struct CtranMapperRegElem*>(shdl);
+      struct ctran::regcache::RegElem* regElem =
+          reinterpret_cast<struct ctran::regcache::RegElem*>(shdl);
       auto regLk = regElem->stateMnger.rlock();
 
       if (this->ctranIb != nullptr) {
@@ -1658,8 +1670,8 @@ class CtranMapper {
         }
       }
 
-      struct CtranMapperRegElem* regElem =
-          reinterpret_cast<struct CtranMapperRegElem*>(shdl);
+      struct ctran::regcache::RegElem* regElem =
+          reinterpret_cast<struct ctran::regcache::RegElem*>(shdl);
       auto regLk = regElem->stateMnger.rlock();
 
       if (this->ctranIb != nullptr) {
@@ -1738,7 +1750,7 @@ class CtranMapper {
       KernelElem* kernElem,
       CtranMapperNotify* notify,
       int notifyCnt) {
-    auto regElem = reinterpret_cast<CtranMapperRegElem*>(recvHdl);
+    auto regElem = reinterpret_cast<ctran::regcache::RegElem*>(recvHdl);
     auto regLk = regElem->stateMnger.rlock();
 
     auto backend = this->queryPeerBackend(regElem, peerRank);
@@ -1909,7 +1921,7 @@ class CtranMapper {
     return commSuccess;
   }
 
-  commResult_t remReleaseMem(CtranMapperRegElem* regElem);
+  commResult_t remReleaseMem(ctran::regcache::RegElem* regElem);
 
   bool atDestruction{false};
 
@@ -1924,51 +1936,22 @@ class CtranMapper {
   std::vector<bool> enableBackends_{
       std::vector<bool>(CtranMapperBackend::NUM_BACKENDS, false)};
 
-  // Lightweight request object to track mapper internal callback ctrl msgs
-  class CbCtrlRequest {
-   public:
-    CbCtrlRequest(int peer, CtranMapperBackend backend)
-        : peer(peer), backend(backend) {
-      if (backend == CtranMapperBackend::IB) {
-        ibReq = CtranIbRequest();
-      } else if (backend == CtranMapperBackend::SOCKET) {
-        sockReq = CtranSocketRequest();
-      } else if (backend == CtranMapperBackend::TCPDM) {
-        tcpDmReq = ctran::CtranTcpDmRequest();
-      } else {
-        CLOGF(ERR, "CTRAN-MAPPER: Unsupported backend {}", backend);
-        FB_COMMCHECKTHROW_EX_NOCOMM(commInternalError);
-      }
-    };
-    ~CbCtrlRequest() {};
-    bool checkComplete() {
-      if (backend == CtranMapperBackend::IB) {
-        return ibReq.isComplete();
-      } else if (backend == CtranMapperBackend::SOCKET) {
-        return sockReq.isComplete();
-      } else if (backend == CtranMapperBackend::TCPDM) {
-        return tcpDmReq.isComplete();
-      }
-      return false;
-    }
-
-    int peer{-1};
-    union {
-      CtranIbRequest ibReq;
-      CtranSocketRequest sockReq;
-      ctran::CtranTcpDmRequest tcpDmReq;
-    };
-    CtranMapperBackend backend;
-    ControlMsg msg;
-  };
-
-  // List of outstanding internal callback ctrl message requests to be processed
-  // when polling progress. The internal msg buffer is used to hold the content
-  // and may be queued at VC layer. Thus, we need temporarily hold the request
+  // List of outstanding internal IPC release requests to be processed
+  // when polling progress. We need to temporarily hold the request
   // instance and erase after completion.
-  std::deque<std::unique_ptr<CbCtrlRequest>> postedCbCtrlReqs_;
+  std::deque<std::unique_ptr<ctran::regcache::IpcReqCb>> postedCbCtrlReqs_;
 
-  // Record remote ranks that each nvlRegElem has exported to.
+  // Peer IPC server addresses for async socket communication, indexed by rank.
+  // Populated via bootstrap allGather during mapper initialization.
+  std::vector<sockaddr_storage> peerIpcServerAddrs_;
+
+  // AllGather IPC server addresses from all ranks via bootstrap.
+  commResult_t allGatherIpcServerAddrs();
+
+  // Get peer's IPC server address by rank.
+  folly::SocketAddress getPeerIpcServerAddr(int rank) const;
+
+  // Record remote ranks that each ipcRegElem has exported to.
   // - For each remote rank, the local rank will send RELEASE_MEM ctrlmsg to
   //   the remote rank at deregMem.
   // - The export cache is maintained per communicator in order to ensure a

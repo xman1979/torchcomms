@@ -625,6 +625,10 @@ cvars:
    default     : ""
    description : https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-net-force-merge
 
+ - name        : NCCL_NET_WIDEN_LINKS
+   type        : bool
+   default     : true
+   description : When set to false, disables PCI link widening for bonded vNics in ncclTopoGetVNicParent. By default (true), ncclTopoWidenLinks sums the PCI link widths of constituent physical NICs.
 
  - name        : NCCL_NTHREADS
    type        : int64_t
@@ -1427,6 +1431,14 @@ cvars:
      staging buffer / minimum chunk size). The size of per-peer ChunkState buffer
      is CTRAN_P2P_NVL_DEVMEM_MAX_CHUNKS * sizeof(ChunkState)=128*128=16KB
 
+ - name        : NCCL_CTRAN_P2P_NVL_COPY_PIPELINE_DEPTH
+   type        : size_t
+   default     : 2
+   description : |-
+     Pipeline depth for NVL P2P copy-based kernel. This value controls the
+     number of pipeline stages used for data transfer operations between
+     NVLink peers.
+
  - name        : NCCL_CTRAN_BCAST_NVL_SHARED_DEVBUF_SIZE
    type        : uint64_t
    default     : 33554432
@@ -1896,13 +1908,14 @@ cvars:
  - name        : NCCL_SENDRECV_ALGO
    type        : enum
    default     : orig
-   choices     : orig, ctran, ctzcopy, ctstaged
+   choices     : orig, ctran, ctzcopy, ctstaged, ctp2p
    description : |-
      The algorithm to use for sendrecv communication
      orig - Copy-based communication
      ctran - Ctran-based communication auto-select
      ctzcopy - Ctran-based zero-copy kernel for NVL
      ctstaged - Ctran-based staged-copy kernel for NVL
+     ctp2p - Experimental algo: Ctran-based point-to-point kernel for NVL
 
  - name        : NCCL_ALLGATHER_P_ALGO
    type        : enum
@@ -1937,6 +1950,14 @@ cvars:
      ctdirect - Ctran-based direct point-to-point algorithm
      ctring - Ctran-based rail ring algorithm for inter-node only case
      ctrhd - Ctran-based recursive vector-halving distance-doubling algorithm
+
+ - name        : NCCL_REDUCESCATTER_PAT_AVG_ENABLE
+   type        : bool
+   default     : false
+   description : |-
+     Enable PAT algorithm with native AVG support for ReduceScatter operations.
+     When enabled, ReduceScatter with ncclAvg uses FuncPatAvg for true floating-point
+     division instead of FuncSumPostDiv (which only supports unsigned integers).
 
  - name        : NCCL_ALLTOALL_ALGO
    type        : enum
@@ -2145,6 +2166,8 @@ cvars:
      of the following features. Leave empty to disable all features.
      verbose - print every completed event as NCCL INFO log. Mostly for debug.
      trace - Just enable collective trace.
+     algostat - lightweight algorithm counting (no CUDA events/worker thread).
+                Use ncclx::colltrace::dumpAlgoStat(comm) to retrieve stats.
 
  - name        : NCCL_COLLTRACE_USE_NEW_COLLTRACE
    type        : bool
@@ -2351,13 +2374,12 @@ cvars:
  - name        : NCCL_ALLREDUCE_ALGO
    type        : enum
    default     : orig
-   choices     : orig, ctran, ctdirect, ctarg, ctring
+   choices     : orig, ctran, ctdirect, ctring
    description : |-
      The algorithm to use for Allreduce communication
      orig - Copy-based algorithm
      ctran - Picks the best ctran-based algorithm
      ctdirect - Ctran-based direct point-to-point algorithm
-     ctarg - ctran-based direct alltoall + reduce + all gather algorithm
      ctring - ctran-based ring algorithm
 
  - name        : NCCL_ALLREDUCE_TYPE
@@ -2741,7 +2763,7 @@ cvars:
 
  - name        : NCCL_CTRAN_ALLREDUCE_RING_MAX_NUM_THREAD_BLOCKS
    type        : int
-   default     : 2
+   default     : 8
    description : |-
      Maximum number of thread blocks used for the AllReduce kernel.
      We might use fewer thread blocks, if we can achieve max occupancy
@@ -2776,6 +2798,14 @@ cvars:
      backends specified by NCCL_CTRAN_BACKENDS.
      Usage: If the NCCL_CTRAN_BACKENS is set with certain values,
      this config will allow MCCL to override backends.
+
+ - name        : MCCL_SCUBA_ENABLED
+   type        : bool
+   default     : false
+   description : |-
+     Enable MCCL Scuba structured logging. When enabled, MCCL will log
+     events to dedicated MCCL Scuba tables for observability and debugging.
+     This is separate from NCCLX logging to minimize risk.
 
  - name        : NCCL_GIN_GDAKI_NIC_HANDLER
    type        : int

@@ -6,7 +6,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h> // @manual
 #include <gtest/gtest.h>
-#include <mpi.h>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -16,7 +15,6 @@
 
 #include <folly/futures/Future.h>
 
-#include "caffe2/torch/csrc/distributed/c10d/TCPStore.hpp"
 #include "comms/ctran/Ctran.h"
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/commstate/CommStateX.h"
@@ -166,22 +164,62 @@ inline consteval commDataType_t getCommDataType() {
   }
 }
 
+// Allocate disjoint memory segments mapped to a single VA range.
+// - reservedVASize: optional, if specified reserves larger VA than mapped
+//                   segments (enables later expansion). If 0 or unspecified,
+//                   reserves exactly sum of segment sizes.
 commResult_t commMemAllocDisjoint(
     void** ptr,
     std::vector<size_t>& disjointSegmentSizes,
     std::vector<TestMemSegment>& segments,
     bool setRdmaSupport = true,
     std::optional<CUmemAllocationHandleType> handleType =
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+    size_t reservedVASize = 0);
+
 commResult_t commMemFreeDisjoint(
     void* ptr,
-    std::vector<size_t>& disjointSegmentSizes);
+    std::vector<size_t>& disjointSegmentSizes,
+    size_t reservedVASize = 0);
+
+// State for expandable buffer that can grow in-place (simulates PyTorch CCA)
+struct ExpandableTestBuffer {
+  void* base{nullptr};
+  size_t reservedSize{0};
+  size_t mappedSize{0};
+  size_t segmentSize{0};
+  std::vector<CUmemGenericAllocationHandle> handles;
+  std::vector<TestMemSegment> segments;
+  CUmemAllocationProp memprop{};
+  CUmemAccessDesc accessDesc{};
+  int cudaDev{-1};
+};
+
+// Allocate expandable buffer with reserved VA larger than initially mapped
+commResult_t commMemAllocExpandable(
+    ExpandableTestBuffer* buf,
+    size_t reservedSize,
+    size_t initialMappedSize,
+    bool setRdmaSupport = true);
+
+// Expand buffer by mapping more segments into reserved VA (NO unmap/dereg)
+commResult_t commMemExpandBuffer(
+    ExpandableTestBuffer* buf,
+    size_t newMappedSize);
+
+// Free all resources
+commResult_t commMemFreeExpandable(ExpandableTestBuffer* buf);
 
 void* commMemAlloc(
     size_t bufSize,
     MemAllocType memType,
-    std::vector<TestMemSegment>& segments);
-void commMemFree(void* buf, size_t bufSize, MemAllocType memType);
+    std::vector<TestMemSegment>& segments,
+    size_t numSegments = 2);
+void commMemFree(
+    void* buf,
+    size_t bufSize,
+    MemAllocType memType,
+    size_t numSegments = 2);
 
 // Bootstrap initialization type
 enum class InitEnvType { MPI, TCP_STORE, STANDALONE };
@@ -200,17 +238,6 @@ inline bool checkTcpStoreEnv() {
       masterAddrEnv && masterPortEnv);
 }
 
-std::unique_ptr<c10d::TCPStore> createTcpStore(bool isServer);
-
-// Detect which initialization environment to use
-InitEnvType getInitEnvType();
-
-class CtranEnvironmentBase : public ::testing::Environment {
- public:
-  void SetUp() override;
-  void TearDown() override;
-};
-
 // ============================================================================
 // Base Test Fixture Hierarchy
 // ============================================================================
@@ -219,10 +246,10 @@ class CtranEnvironmentBase : public ::testing::Environment {
 //       |
 //       +-- CtranStandaloneFixture (single-rank with MockBootstrap)
 //       |
-//       +-- CtranDistTestFixture (multi-rank distributed tests)
-//       |       - MPI mode: real multi-process with MPI bootstrap
-//       |       - TCPStore mode: real multi-process with TCPStore bootstrap
-//       |       - Standalone mode: single-rank with IntraProcessBootstrap
+//       +-- CtranDistTestFixture (multi-rank distributed tests) [in
+//       CtranDistTestUtils.h] |       - MPI mode: real multi-process with MPI
+//       bootstrap |       - TCPStore mode: real multi-process with TCPStore
+//       bootstrap
 //       |
 //       +-- CtranIntraProcessFixture (multi-rank simulation in single process)
 //               - Uses threads + IntraProcessBootstrap
@@ -266,37 +293,6 @@ class CtranStandaloneFixture : public CtranTestFixtureBase {
           ctran::utils::createAbort(/*enabled=*/true));
 
   int rank{0}; // Always 0 for standalone tests
-};
-
-// CtranDistTestFixture is a fixture for testing Ctran with multiple
-// processes/ranks that supports both MPI and TCPStore bootstrap methods.
-class CtranDistTestFixture : public CtranTestFixtureBase {
- public:
- protected:
-  void SetUp() override;
-  void TearDown() override;
-
-  std::unique_ptr<CtranComm> makeCtranComm();
-
-  // Rank information
-  int globalRank{-1};
-  int numRanks{-1};
-  int localRank{-1};
-  int numLocalRanks_{-1};
-  bool enableNolocal{false};
-
- private:
-  void setUpMpi();
-  void setUpTcpStore();
-
-  // TCP Store support
-  std::unique_ptr<c10d::TCPStore> tcpStore_{nullptr};
-  bool isTcpStoreServer() const;
-  std::vector<std::string>
-  exchangeInitUrls(const std::string& selfUrl, int numRanks, int selfRank);
-
-  // Test counter for TCP Store key generation
-  static std::atomic<int> testCount_;
 };
 
 // Intra-process multi-rank fixture for testing with IntraProcessBootstrap.

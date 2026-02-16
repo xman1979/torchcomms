@@ -7,8 +7,7 @@
 #include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/TorchCommTracing.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 TorchWorkNCCLX::TorchWorkNCCLX(
     std::shared_ptr<TorchCommNCCLX> comm,
@@ -53,7 +52,7 @@ TorchWorkNCCLX::~TorchWorkNCCLX() {
   comm_->returnEvent(end_event_);
 }
 
-void TorchWorkNCCLX::recordFunctionStart(const std::string& coll_name) {
+void TorchWorkNCCLX::recordFunctionStart(std::string_view coll_name) {
   recordFunction_.emplace(at::RecordScope::USER_SCOPE);
   if (!recordFunction_->isActive()) {
     return;
@@ -78,7 +77,7 @@ void TorchWorkNCCLX::recordFunctionStart(const std::string& coll_name) {
   }
 }
 
-void TorchWorkNCCLX::recordStart(const std::string& coll_name) {
+void TorchWorkNCCLX::recordStart(std::string_view coll_name) {
   recordFunctionStart(coll_name);
 
   CUDA_CHECK(
@@ -188,5 +187,4 @@ void TorchWorkNCCLX::wait() {
   inputTensors_.clear();
   inputTensor_.reset();
 }
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

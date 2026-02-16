@@ -7,7 +7,7 @@
 #include <memory>
 
 #include "comms/ctran/mapper/CtranMapper.h"
-#include "comms/ctran/mapper/CtranMapperRegMem.h"
+#include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/tests/CtranTestUtils.h"
 
 using ctran::CtranTcpDm;
@@ -29,9 +29,7 @@ class CtranMapperTcpdmTest : public ::testing::Test {
       ncclCvarInit();
       auto commRAII = ctran::createDummyCtranComm();
       commRAII.reset();
-    } catch (const std::runtime_error& e) {
-      GTEST_SKIP() << "TCPDM backend not enabled. Skip test";
-    } catch (const ctran::utils::Exception& e) {
+    } catch (const ctran::utils::Exception&) {
       GTEST_SKIP() << "TCPDM backend not enabled. Skip test";
     }
   }
@@ -74,6 +72,5 @@ TEST_F(CtranMapperTcpdmTest, OverrideBackendThroughHints) {
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
-  ::testing::AddGlobalTestEnvironment(new ctran::CtranEnvironmentBase);
   return RUN_ALL_TESTS();
 }

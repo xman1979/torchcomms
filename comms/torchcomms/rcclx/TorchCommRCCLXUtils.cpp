@@ -8,8 +8,7 @@
 #include "comms/torchcomms/TorchCommLogging.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp"
 #include "rccl.h" // @manual
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 namespace {
 
@@ -55,7 +54,11 @@ void createPreMulSum(
       is_tensor ? dataType == getNcclDataTypeInternal(tensor)
                 : dataType != ncclBfloat16,
       "PreMulSum factor type must match input data type");
-  rcclx_api->redOpCreatePreMulSum(op, scalar, dataType, residence, comm);
+  RCCLX_CHECK(
+      rcclx_api,
+      comm,
+      rcclx_api->redOpCreatePreMulSum(op, scalar, dataType, residence, comm),
+      "RCCLX redOpCreatePreMulSum failed");
 }
 
 } // namespace
@@ -105,7 +108,10 @@ TorchCommRCCLX::RedOpRAII::RedOpRAII(
 
 TorchCommRCCLX::RedOpRAII::~RedOpRAII() {
   if (comm_) {
-    rcclx_api_->redOpDestroy(ncclRedOp_, comm_);
+    RCCLX_CHECK_IGNORE(
+        rcclx_api_,
+        rcclx_api_->redOpDestroy(ncclRedOp_, comm_),
+        "RCCLX redOpDestroy failed");
   }
 }
 
@@ -180,6 +186,8 @@ void TorchCommRCCLX::garbageCollectWorkQueues() {
           // Continue to the next element in the queue
           continue;
         }
+        default:
+          TORCH_INTERNAL_ASSERT(false, "Unexpected WorkStatus enum value");
       }
     }
 
@@ -195,10 +203,10 @@ void TorchCommRCCLX::garbageCollectWorkQueues() {
 // The timeout thread cannot make NCCL calls.  The only CUDA call it can make
 // it hipEventQuery (done inside checkStatus).
 void TorchCommRCCLX::timeoutWatchdog() noexcept {
-  TC_LOG(INFO) << "Timeout thread starting for rank: " << rank_;
+  TC_LOG(INFO, this) << "Timeout thread starting for rank: " << rank_;
 
   hipStreamCaptureMode mode = hipStreamCaptureModeThreadLocal;
-  HIP_CHECK(
+  HIP_CHECK_IGNORE(
       hip_api_,
       hip_api_->threadExchangeStreamCaptureMode(&mode),
       "Failed to swap capture mode for timeout thread");
@@ -227,15 +235,32 @@ void TorchCommRCCLX::timeoutWatchdog() noexcept {
       // communicator as it is not safe to call NCCL operations from
       // multiple threads at the same time.
       if (comm_state_ == CommState::TIMEOUT) {
-        TC_LOG(ERROR) << "Aborting process due to timeout";
+        TC_LOG(ERROR, this) << "Aborting process due to timeout";
       } else if (comm_state_ == CommState::ERROR) {
-        TC_LOG(ERROR) << "Aborting process due to error";
+        TC_LOG(ERROR, this) << "Aborting process due to error";
       }
       abort();
     }
+
+    // Check communicator for async error
+    if (comm_state_ == CommState::NORMAL) {
+      ncclResult_t asyncErr;
+      RCCLX_CHECK(
+          rcclx_api_,
+          nccl_comm_,
+          rcclx_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+          "failed to get async error");
+      if (asyncErr != ncclSuccess) {
+        comm_state_ = CommState::ERROR;
+        TC_LOG(ERROR, this)
+            << "Aborting process due to error on rank " << rank_
+            << " - rcclx hit async error: " << ncclGetErrorString(asyncErr);
+        abort();
+      }
+    }
   }
 
-  TC_LOG(INFO) << "Timeout thread exiting for rank: " << rank_;
+  TC_LOG(INFO, this) << "Timeout thread exiting for rank: " << rank_;
 }
 
 void TorchCommRCCLX::checkInitialized() const {
@@ -262,8 +287,13 @@ void TorchCommRCCLX::checkAndAbortIfTimedOutOrError() {
     throw std::runtime_error("NCCL operation timed out");
   } else if (comm_state_ == CommState::ERROR) {
     ncclResult_t asyncErr;
-    rcclx_api_->commGetAsyncError(nccl_comm_, &asyncErr);
-    RCCLXException RCCLXException(*rcclx_api_, "NCCL Async Error", asyncErr);
+    RCCLX_CHECK(
+        rcclx_api_,
+        nccl_comm_,
+        rcclx_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+        "failed to get async error");
+    RCCLXException RCCLXException(
+        *rcclx_api_, "NCCL Async Error", asyncErr, nccl_comm_);
     abortRcclxComm();
     throw RCCLXException;
   }
@@ -301,7 +331,7 @@ hipStream_t TorchCommRCCLX::getOperationStream(bool async_op) {
   if (async_op) {
     // Get current PyTorch CUDA stream for this device
     hipStream_t current_stream =
-        hip_api_->getCurrentHIPStreamMasqueradingAsCUDA(device_.index());
+        hip_api_->getCurrentCUDAStream(device_.index());
 
     // Record event on current stream and wait for it on internal stream
     HIP_CHECK(
@@ -317,7 +347,7 @@ hipStream_t TorchCommRCCLX::getOperationStream(bool async_op) {
     return internal_stream_;
   } else {
     // Use the current PyTorch CUDA stream for synchronous operations
-    return hip_api_->getCurrentHIPStreamMasqueradingAsCUDA(device_.index());
+    return hip_api_->getCurrentCUDAStream(device_.index());
   }
 }
 
@@ -363,5 +393,4 @@ void TorchCommRCCLX::detachMemoryHook() {
   CachingAllocatorHook::getInstance().deregisterComm(this);
 }
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

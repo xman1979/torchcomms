@@ -6,11 +6,13 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#include "comms/pipes/ThreadGroup.cuh"
+
 namespace comms::pipes::test {
 
 // Kernel: testContiguousLocalityKernel
 // Tests that for_each_item_contiguous assigns CONTIGUOUS blocks of work items
-// to each warp. Each warp writes its group_id to all work items it processes.
+// to each group. Each group writes its group_id to all work items it processes.
 // The CPU then verifies that work items [start, end) all have the same
 // group_id, confirming contiguous-based assignment.
 void testContiguousLocality(
@@ -18,7 +20,8 @@ void testContiguousLocality(
     uint32_t numItems,
     uint32_t* errorCount_d,
     int numBlocks,
-    int blockSize);
+    int blockSize,
+    SyncScope scope);
 
 // Tests make_block_group() - where all threads in a block form one group
 // Verifies:
@@ -47,7 +50,8 @@ void testPartition(
     uint32_t numPartitions,
     uint32_t* errorCount_d,
     int numBlocks,
-    int blockSize);
+    int blockSize,
+    SyncScope scope);
 
 // Tests that subgroup preserves thread_id_in_group, group_size, and scope
 // from the original group
@@ -58,7 +62,8 @@ void testPartitionSubgroupProperties(
     uint32_t numPartitions,
     uint32_t* errorCount_d,
     int numBlocks,
-    int blockSize);
+    int blockSize,
+    SyncScope scope);
 
 // Tests partition(cuda::std::span<const uint32_t>) - weighted partition
 // Verifies proportional assignment based on weights
@@ -70,6 +75,73 @@ void testWeightedPartition(
     uint32_t numPartitions,
     uint32_t* errorCount_d,
     int numBlocks,
+    int blockSize,
+    SyncScope scope);
+
+// Tests partition_interleaved(num_partitions) - round-robin partition
+// Verifies:
+// - Each group gets partition_id = group_id % num_partitions
+// - subgroup.group_id is renumbered as group_id / num_partitions
+// - subgroup.total_groups is correctly computed for interleaved assignment
+void testPartitionInterleaved(
+    uint32_t* partitionIds_d,
+    uint32_t* subgroupIds_d,
+    uint32_t* subgroupTotalGroups_d,
+    uint32_t numPartitions,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize,
+    SyncScope scope);
+
+// =============================================================================
+// Multiwarp Tests (4 warps = 128 threads per group)
+// =============================================================================
+
+// Tests make_multiwarp_group() - where 4 warps (128 threads) form one group
+// Verifies:
+// - group_size == 128 (4 * warpSize)
+// - thread_id_in_group == tid % 128 (linear thread ID within multiwarp)
+// - group_id is computed correctly across all multiwarps
+// - total_groups == (threads_per_block / 128) * num_blocks
+// - Work items are distributed contiguously across multiwarps
+void testMultiwarpGroup(
+    uint32_t* groupIds_d,
+    uint32_t* threadIdsInGroup_d,
+    uint32_t* groupSizes_d,
+    uint32_t numItems,
+    uint32_t* errorCount_d,
+    int numBlocks,
     int blockSize);
+
+// Tests multiwarp synchronization using named barriers
+// Verifies:
+// - All 128 threads in a multiwarp synchronize correctly
+// - sync() uses bar.sync PTX instruction with correct barrier ID
+// - Multiple multiwarps can synchronize independently within a block
+void testMultiwarpSync(
+    uint32_t* syncResults_d,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize);
+
+// =============================================================================
+// Cluster Tests (Hopper SM90+ cluster synchronization)
+// =============================================================================
+
+// Kernel for testing make_cluster_group()
+// All blocks in a cluster form one group
+__global__ void testBlockClusterGroupKernel(
+    uint32_t* groupIds,
+    uint32_t* threadIdsInGroup,
+    uint32_t* groupSizes,
+    uint32_t numItems,
+    uint32_t* errorCount);
+
+// Test cluster synchronization using barrier.cluster.arrive/wait
+// Each thread writes to shared memory, then after cluster sync,
+// verifies all threads in the cluster wrote their values.
+__global__ void testBlockClusterSyncKernel(
+    uint32_t* syncResults,
+    uint32_t* errorCount);
 
 } // namespace comms::pipes::test

@@ -3,9 +3,10 @@
 #include <cuda.h>
 #include <memory>
 
-#include "Types.h"
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/RMA/Types.h"
+#include "comms/ctran/algos/RMA/WaitSignalImpl.h"
 #include "comms/ctran/colltrace/CollTraceWrapper.h"
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/mapper/CtranMapper.h"
@@ -19,12 +20,12 @@ using meta::comms::colltrace::CollTraceHandleTriggerState;
 extern __global__ void ncclKernelPutNotify(
     int* flag,
     CtranAlgoDeviceState* devState,
-    CtranKernelPutNotifyArgs args);
+    ctran::rma::KernelPutNotifyArgs args);
 
 extern __global__ void ncclKernelWaitNotify(
     int* flag,
     CtranAlgoDeviceState* devState,
-    CtranKernelWaitNotifyArgs args);
+    ctran::rma::KernelWaitNotifyArgs args);
 
 extern __global__ void ncclKernelPutSignal(
     int* flag,
@@ -380,7 +381,7 @@ waitSignalDriverApi(int peer, CtranWin* win, cudaStream_t stream) {
 #endif
 }
 
-static commResult_t waitSignalSpinningKernel(
+commResult_t waitSignalSpinningKernel(
     int peer,
     CtranWin* win,
     cudaStream_t stream,
@@ -393,6 +394,7 @@ static commResult_t waitSignalSpinningKernel(
   KernelConfig config = KernelConfig(
       KernelConfig::KernelType::WAITSIGNAL, stream, "WaitSignal", waitOpCount);
   config.args.devState_d = comm->ctran_->algo->getDevState();
+  config.canConcurrent = true;
 
   std::vector<std::unique_ptr<struct OpElem>> opGroup;
   opGroup.clear();
@@ -512,7 +514,25 @@ commResult_t ctranWaitSignal(int peer, CtranWin* win, cudaStream_t stream) {
   // Only try hardware wait for GPU memory windows
   if (win->isGpuMem()) {
     // Try hardware-accelerated wait first (zero GPU overhead!)
+
+    // CollTrace tracing logic for hardware-accelerated case. In this case the
+    // wait will not trigger gpe->submit, so we need to record manually in the
+    // algo. In other cases, this handle would be a no-op and the tracing
+    // will take place in the gpe function.
+    auto colltraceHandle = meta::comms::colltrace::getCollTraceHandleRMA(
+        comm,
+        {},
+        KernelConfig{
+            KernelConfig::KernelType::WAITSIGNAL,
+            stream,
+            "WaitSignal",
+            waitOpCount},
+        true);
+    colltraceHandle->trigger(CollTraceHandleTriggerState::BeforeEnqueueKernel);
+
     commResult_t hwResult = waitSignalDriverApi(peer, win, stream);
+
+    colltraceHandle->trigger(CollTraceHandleTriggerState::AfterEnqueueKernel);
 
     if (hwResult == commSuccess) {
       CLOGF_TRACE(

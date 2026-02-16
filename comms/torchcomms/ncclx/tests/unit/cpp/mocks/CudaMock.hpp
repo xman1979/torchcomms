@@ -4,11 +4,9 @@
 
 #include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
 #include <gmock/gmock.h>
-#include "comms/torchcomms/device/CudaApi.hpp"
+#include "comms/torchcomms/device/cuda/CudaApi.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 /**
  * Mock implementation of CudaApi using Google Mock.
@@ -112,6 +110,11 @@ class CudaMock : public CudaApi {
   MOCK_METHOD(cudaError_t, free, (void* devPtr), (override));
   MOCK_METHOD(
       cudaError_t,
+      memcpy,
+      (void* dst, const void* src, size_t count, cudaMemcpyKind kind),
+      (override));
+  MOCK_METHOD(
+      cudaError_t,
       memcpyAsync,
       (void* dst,
        const void* src,
@@ -151,6 +154,4 @@ class CudaMock : public CudaApi {
   void reset();
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

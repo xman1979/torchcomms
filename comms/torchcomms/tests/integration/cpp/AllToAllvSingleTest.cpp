@@ -17,6 +17,7 @@ void AllToAllvSingleTest::SetUp() {
   torchcomm_ = wrapper_->getTorchComm();
   rank_ = torchcomm_->getRank();
   num_ranks_ = torchcomm_->getSize();
+  device_type_ = wrapper_->getDevice().type();
 }
 
 void AllToAllvSingleTest::TearDown() {
@@ -155,6 +156,14 @@ void AllToAllvSingleTest::testGraphAllToAllvSingle(
     const std::vector<uint64_t>& input_split_sizes,
     const std::vector<uint64_t>& output_split_sizes,
     at::ScalarType dtype) {
+  // Skip CUDA Graph tests when running on CPU
+  if (isRunningOnCPU()) {
+    std::cout
+        << "Skipping CUDA Graph all_to_all_v_single test: not supported on CPU"
+        << std::endl;
+    return;
+  }
+
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing CUDA Graph all_to_all_v_single with dtype="
@@ -202,6 +211,14 @@ void AllToAllvSingleTest::testGraphAllToAllvSingleInputDeleted(
     const std::vector<uint64_t>& input_split_sizes,
     const std::vector<uint64_t>& output_split_sizes,
     at::ScalarType dtype) {
+  // Skip CUDA Graph tests when running on CPU
+  if (isRunningOnCPU()) {
+    std::cout << "Skipping CUDA Graph all_to_all_v_single (input deleted) "
+                 "test: not supported on CPU"
+              << std::endl;
+    return;
+  }
+
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing CUDA Graph all_to_all_v_single with input deleted after graph creation with dtype="
@@ -257,14 +274,15 @@ void AllToAllvSingleTest::testSyncAllToAllvSingleMultiDimTensor(
       ::testing::Message() << "Testing sync all_to_all_v_single with dtype="
                            << getDtypeName(dtype));
 
+  // Create input and output tensors using original sizes
+  at::Tensor input = createInputTensor(input_split_sizes_, dtype);
+  input = input.reshape({input.numel() / 2, 2});
+  at::Tensor output = createOutputTensor(output_split_sizes_, dtype);
+  output = output.reshape({output.numel() / 2, 2});
+
+  // Copy split sizes before modifying them
   std::vector<uint64_t> input_split_sizes = input_split_sizes_;
   std::vector<uint64_t> output_split_sizes = output_split_sizes_;
-
-  // Create input and output tensors
-  at::Tensor input = createInputTensor(input_split_sizes, dtype);
-  input = input.reshape({input.numel() / 2, 2});
-  at::Tensor output = createOutputTensor(output_split_sizes, dtype);
-  output = output.reshape({output.numel() / 2, 2});
 
   // Reduce each value in input_split_sizes and output_split_sizes by half
   for (size_t i = 0; i < input_split_sizes.size(); ++i) {

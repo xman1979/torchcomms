@@ -17,8 +17,6 @@
 #include "comms/ctran/utils/LogInit.h"
 #include "comms/ctran/utils/Utils.h"
 #include "comms/mccl/utils/Utils.h"
-#include "comms/testinfra/mpi/MpiBootstrap.h"
-#include "comms/testinfra/mpi/MpiTestUtils.h"
 #include "comms/utils/InitFolly.h"
 #include "comms/utils/logger/LogUtils.h"
 #include "comms/utils/logger/Logger.h"
@@ -41,62 +39,6 @@ std::unique_ptr<TestCtranCommRAII> createDummyCtranComm(int devId) {
   auto raii = std::make_unique<TestCtranCommRAII>(std::move(result.ctranComm));
   raii->bootstrap_ = std::move(result.bootstrap);
   return raii;
-}
-
-static std::atomic<int> testCount = 0;
-inline void incrTestCount() {
-  testCount.fetch_add(1);
-}
-
-std::unique_ptr<c10d::TCPStore> createTcpStore(bool isServer) {
-  const char* masterAddrStr = getenv("MASTER_ADDR");
-  const char* masterPortStr = getenv("MASTER_PORT");
-  if (!masterAddrStr) {
-    XLOG(FATAL) << "MASTER_ADDR env variable is not set";
-  }
-  if (!masterPortStr) {
-    XLOG(FATAL) << "MASTER_PORT env variable is not set";
-  }
-
-  incrTestCount();
-  auto key = fmt::format("test_tcpstore_init_{}", testCount.load());
-
-  const std::string masterAddr(masterAddrStr);
-  c10d::TCPStoreOptions opts{
-      .port = static_cast<uint16_t>(std::stoi(masterPortStr)),
-      .waitWorkers = false,
-      .useLibUV = true,
-      .isServer = isServer,
-  };
-
-  XLOG(INFO) << "TCPStore "
-             << (isServer ? "server starting on " : "client connecting to ")
-             << masterAddr << ":" << opts.port << " ..." << " using key "
-             << key;
-
-  if (isServer) {
-    auto server = std::make_unique<c10d::TCPStore>(masterAddr, opts);
-    server->set(key, {1});
-    XLOG(INFO) << "TCPStore server started.";
-    return server;
-  }
-
-  // TCPStore Client may start before fresh TCPStore Server has started
-  // We need to retry until we connect to a fresh TCPStore Server
-  while (true) {
-    try {
-      auto server = std::make_unique<c10d::TCPStore>(masterAddr, opts);
-      if (server->check({key})) {
-        XLOG(INFO) << "TCPStore client started.";
-        return server;
-      }
-    } catch (...) {
-      XLOG(INFO) << "Connected to stale TCPStore Server. "
-                 << "Waiting for fresh TCPStore Server to start.";
-      std::this_thread::sleep_for(
-          std::chrono::milliseconds{100}); // Sleep for 100ms
-    }
-  }
 }
 
 namespace {
@@ -129,7 +71,8 @@ commResult_t commMemAllocDisjoint(
     std::vector<size_t>& disjointSegmentSizes,
     std::vector<TestMemSegment>& segments,
     bool setRdmaSupport,
-    std::optional<CUmemAllocationHandleType> handleType) {
+    std::optional<CUmemAllocationHandleType> handleType,
+    size_t reservedVASize) {
   commResult_t ret = commSuccess;
 
   size_t numSegments = disjointSegmentSizes.size();
@@ -177,12 +120,23 @@ commResult_t commMemAllocDisjoint(
   FB_CUCHECK(cuMemGetAllocationGranularity(
       &memGran, &memprop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
-  vaSize = 0;
+  // Calculate mapped size (sum of aligned segment sizes)
+  size_t mappedSize = 0;
   std::vector<size_t> alignedSizes(numSegments);
   for (int i = 0; i < numSegments; i++) {
     alignedSizes[i] = disjointSegmentSizes[i];
     ALIGN_SIZE(alignedSizes[i], memGran);
-    vaSize += alignedSizes[i];
+    mappedSize += alignedSizes[i];
+  }
+
+  // Use reservedVASize if specified, otherwise use mappedSize
+  vaSize = (reservedVASize > 0) ? reservedVASize : mappedSize;
+  ALIGN_SIZE(vaSize, memGran);
+
+  if (vaSize < mappedSize) {
+    LOG(ERROR) << "reservedVASize " << reservedVASize
+               << " is smaller than mapped size " << mappedSize;
+    return ErrorStackTraceUtil::log(commInvalidArgument);
   }
 
   for (int i = 0; i < numSegments; i++) {
@@ -207,18 +161,19 @@ commResult_t commMemAllocDisjoint(
 
     curPtr = ctran::utils::addDevicePtr(curPtr, alignedSizes[i]);
   }
-  // Now allow RW access to the newly mapped memory.
+  // Now allow RW access to the mapped memory only (not the entire reserved VA).
   accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   accessDesc.location.id = currentDev;
   accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  FB_CUCHECK(cuMemSetAccess((CUdeviceptr)*ptr, vaSize, &accessDesc, 1));
+  FB_CUCHECK(cuMemSetAccess((CUdeviceptr)*ptr, mappedSize, &accessDesc, 1));
 
   return ret;
 }
 
 commResult_t commMemFreeDisjoint(
     void* ptr,
-    std::vector<size_t>& disjointSegmentSizes) {
+    std::vector<size_t>& disjointSegmentSizes,
+    size_t reservedVASize) {
   commResult_t ret = commSuccess;
   int saveDevice;
   CUmemGenericAllocationHandle handle;
@@ -250,14 +205,18 @@ commResult_t commMemFreeDisjoint(
   FB_CUCHECK(cuMemGetAllocationGranularity(
       &memGran, &memprop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
-  size_t vaSize = 0;
+  size_t mappedSize = 0;
   size_t numSegments = disjointSegmentSizes.size();
   std::vector<size_t> alignedSizes(numSegments);
   for (int i = 0; i < numSegments; i++) {
     alignedSizes[i] = disjointSegmentSizes[i];
     ALIGN_SIZE(alignedSizes[i], memGran);
-    vaSize += alignedSizes[i];
+    mappedSize += alignedSizes[i];
   }
+
+  // Use reservedVASize if specified, otherwise use mappedSize
+  size_t vaSize = (reservedVASize > 0) ? reservedVASize : mappedSize;
+  ALIGN_SIZE(vaSize, memGran);
 
   CUdeviceptr curPtr = (CUdeviceptr)ptr;
   for (int i = 0; i < alignedSizes.size(); i++) {
@@ -277,17 +236,144 @@ commResult_t commMemFreeDisjoint(
   return ret;
 }
 
+commResult_t commMemAllocExpandable(
+    ExpandableTestBuffer* buf,
+    size_t reservedSize,
+    size_t initialMappedSize,
+    bool setRdmaSupport) {
+  buf->reservedSize = reservedSize;
+
+  // Create initial segment sizes vector
+  std::vector<size_t> initialSegments = {initialMappedSize};
+
+  // Call commMemAllocDisjoint with larger reservedVASize
+  FB_COMMCHECK(commMemAllocDisjoint(
+      &buf->base,
+      initialSegments,
+      buf->segments,
+      setRdmaSupport,
+      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+      reservedSize));
+
+  buf->mappedSize = buf->segments[0].size;
+  buf->segmentSize = buf->mappedSize;
+
+  CUDACHECK_TEST(cudaGetDevice(&buf->cudaDev));
+  CUdevice currentDev;
+  FB_CUCHECK(cuDeviceGet(&currentDev, buf->cudaDev));
+
+  buf->memprop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  buf->memprop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  buf->memprop.location.id = currentDev;
+  buf->memprop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  if (setRdmaSupport &&
+      ctran::utils::gpuDirectRdmaWithCudaVmmSupported(
+          currentDev, buf->cudaDev)) {
+    buf->memprop.allocFlags.gpuDirectRDMACapable = 1;
+  }
+
+  buf->accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  buf->accessDesc.location.id = currentDev;
+  buf->accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+  // Store initial handle via cuMemRetainAllocationHandle
+  CUmemGenericAllocationHandle initialHandle;
+  FB_CUCHECK(cuMemRetainAllocationHandle(&initialHandle, buf->base));
+  buf->handles.push_back(initialHandle);
+
+  return commSuccess;
+}
+
+commResult_t commMemExpandBuffer(
+    ExpandableTestBuffer* buf,
+    size_t newMappedSize) {
+  if (newMappedSize <= buf->mappedSize) {
+    LOG(ERROR) << "newMappedSize " << newMappedSize
+               << " must be greater than current mappedSize "
+               << buf->mappedSize;
+    return commInvalidArgument;
+  }
+  if (newMappedSize > buf->reservedSize) {
+    LOG(ERROR) << "newMappedSize " << newMappedSize << " exceeds reservedSize "
+               << buf->reservedSize;
+    return commInvalidArgument;
+  }
+
+  // Calculate number of new segments needed
+  size_t additionalSize = newMappedSize - buf->mappedSize;
+  size_t numNewSegments =
+      (additionalSize + buf->segmentSize - 1) / buf->segmentSize;
+
+  CUdeviceptr curPtr =
+      ctran::utils::addDevicePtr((CUdeviceptr)buf->base, buf->mappedSize);
+
+  for (size_t i = 0; i < numNewSegments; i++) {
+    CUmemGenericAllocationHandle handle;
+    FB_CUCHECK(cuMemCreate(&handle, buf->segmentSize, &buf->memprop, 0));
+    FB_CUCHECK(cuMemMap(curPtr, buf->segmentSize, 0, handle, 0));
+
+    buf->handles.push_back(handle);
+    buf->segments.emplace_back(
+        reinterpret_cast<void*>(curPtr), buf->segmentSize);
+
+    LOG(INFO) << "commMemExpandBuffer maps new segment ptr "
+              << reinterpret_cast<void*>(curPtr) << " size "
+              << buf->segmentSize;
+
+    curPtr = ctran::utils::addDevicePtr(curPtr, buf->segmentSize);
+  }
+
+  // Set access for new region
+  size_t newRegionSize = numNewSegments * buf->segmentSize;
+  FB_CUCHECK(cuMemSetAccess(
+      ctran::utils::addDevicePtr((CUdeviceptr)buf->base, buf->mappedSize),
+      newRegionSize,
+      &buf->accessDesc,
+      1));
+
+  buf->mappedSize += newRegionSize;
+
+  return commSuccess;
+}
+
+commResult_t commMemFreeExpandable(ExpandableTestBuffer* buf) {
+  if (buf->base == nullptr) {
+    return commSuccess;
+  }
+
+  // Unmap and release all segments
+  CUdeviceptr curPtr = (CUdeviceptr)buf->base;
+  for (size_t i = 0; i < buf->segments.size(); i++) {
+    FB_CUCHECK(cuMemUnmap(curPtr, buf->segments[i].size));
+    curPtr = ctran::utils::addDevicePtr(curPtr, buf->segments[i].size);
+  }
+
+  // Release all handles
+  for (auto& handle : buf->handles) {
+    FB_CUCHECK(cuMemRelease(handle));
+  }
+
+  // Free the reserved VA
+  FB_CUCHECK(cuMemAddressFree((CUdeviceptr)buf->base, buf->reservedSize));
+
+  *buf = ExpandableTestBuffer{};
+  return commSuccess;
+}
+
 // Wrapper for memory allocation in tests with different memory types
 // - bufSize: size of the buffer to allocate
 // - memType: memory type to allocate
 // - segments: vector of underlying allocated segments. It can be two segments
 //             with kCuMemAllocDisjoint type, which map to a single virtual
 //             memory range. For other mem types, it should be 1 segment.
+// - numSegments: optional number of segments for kCuMemAllocDisjoint type
+//                (default: 2). Ignored for other mem types.
 // - return: pointer to the allocated virtual memory range.
 void* commMemAlloc(
     size_t bufSize,
     MemAllocType memType,
-    std::vector<TestMemSegment>& segments) {
+    std::vector<TestMemSegment>& segments,
+    size_t numSegments) {
   void* buf = nullptr;
   switch (memType) {
     case kMemCudaMalloc:
@@ -297,9 +383,9 @@ void* commMemAlloc(
     case kCuMemAllocDisjoint: {
       // Allocate disjoint segments mapping to a single virtual memory range;
       // it mimics the behavior of Pytorch CCA expandable segment mode where a
-      // single tensor may be mapped by two disjoint segments.
-      const auto segSize = getSegmentSize(bufSize, 2);
-      std::vector<size_t> disjointSegSizes(2, segSize);
+      // single tensor may be mapped by multiple disjoint segments.
+      const auto segSize = getSegmentSize(bufSize, numSegments);
+      std::vector<size_t> disjointSegSizes(numSegments, segSize);
       COMMCHECK_TEST(commMemAllocDisjoint(&buf, disjointSegSizes, segments));
       break;
     }
@@ -325,14 +411,18 @@ void* commMemAlloc(
   return buf;
 }
 
-void commMemFree(void* buf, size_t bufSize, MemAllocType memType) {
+void commMemFree(
+    void* buf,
+    size_t bufSize,
+    MemAllocType memType,
+    size_t numSegments) {
   switch (memType) {
     case kMemCudaMalloc:
       CUDACHECK_TEST(cudaFree(buf));
       break;
     case kCuMemAllocDisjoint: {
-      const auto segSize = getSegmentSize(bufSize, 2);
-      std::vector<size_t> disjointSegSizes(2, segSize);
+      const auto segSize = getSegmentSize(bufSize, numSegments);
+      std::vector<size_t> disjointSegSizes(numSegments, segSize);
       commMemFreeDisjoint(buf, disjointSegSizes);
       break;
     }
@@ -351,66 +441,6 @@ void commMemFree(void* buf, size_t bufSize, MemAllocType memType) {
       XLOG(FATAL) << "Unsupported memType: " << memType;
       break;
   }
-}
-
-InitEnvType getInitEnvType() {
-  if (checkTcpStoreEnv()) {
-    return InitEnvType::TCP_STORE;
-  }
-  return InitEnvType::MPI;
-}
-
-void CtranEnvironmentBase::SetUp() {
-  const auto initType = getInitEnvType();
-  if (initType == InitEnvType::MPI) {
-    MPI_CHECK(MPI_Init(nullptr, nullptr));
-  }
-  // TCPStore doesn't need global initialization
-
-  // Set up default envs for CTRAN tests
-  // Default logging level = WARN
-  // Individual test can override the logging level
-  setenv("NCCL_DEBUG", "WARN", 0);
-
-  // Disable FBWHOAMI Topology failure for tests
-  setenv("NCCL_IGNORE_TOPO_LOAD_FAILURE", "0", 1);
-  setenv("NCCL_CTRAN_PROFILING", "none", 1);
-  setenv("NCCL_CTRAN_ENABLE", "1", 0);
-  setenv("NCCL_COLLTRACE_USE_NEW_COLLTRACE", "1", 0);
-
-#ifdef NCCL_COMM_STATE_DEBUG_TOPO_NOLOCAL
-  setenv("NCCL_COMM_STATE_DEBUG_TOPO", "nolocal", 1);
-#endif
-#ifdef NCCL_COMM_STATE_DEBUG_TOPO_VNODE
-  setenv("NCCL_COMM_STATE_DEBUG_TOPO", "vnode", 1);
-#endif
-
-// Allow each test to choose different fast init mode
-#if defined(TEST_ENABLE_FASTINIT)
-  setenv("NCCL_FASTINIT_MODE", "ring_hybrid", 1);
-#else
-  setenv("NCCL_FASTINIT_MODE", "none", 1);
-#endif
-
-#if defined(TEST_ENABLE_CTRAN)
-  setenv("NCCL_CTRAN_ENABLE", "1", 1);
-#endif
-
-#if defined(TEST_ENABLE_LOCAL_REGISTER)
-  setenv("NCCL_LOCAL_REGISTER", "1", 1);
-#endif
-
-#if defined(TEST_CUDA_GRAPH_MODE)
-  setenv("NCCL_CTRAN_ALLOW_CUDA_GRAPH", "1", 1);
-#endif
-}
-
-void CtranEnvironmentBase::TearDown() {
-  const auto initType = getInitEnvType();
-  if (initType == InitEnvType::MPI) {
-    MPI_CHECK(MPI_Finalize());
-  }
-  // TCPStore doesn't need global cleanup
 }
 
 // ============================================================================
@@ -491,204 +521,6 @@ std::unique_ptr<CtranComm> CtranStandaloneFixture::makeCtranComm(
   CLOGF(INFO, "UT CTran initialized");
 
   return ctranComm;
-}
-
-// ============================================================================
-// CtranDistTestFixture Implementation
-// ============================================================================
-
-void CtranDistTestFixture::SetUp() {
-  const auto initType = getInitEnvType();
-
-  // Get rank info based on initialization type
-  if (initType == InitEnvType::MPI) {
-    setUpMpi();
-  } else if (initType == InitEnvType::TCP_STORE) {
-    setUpTcpStore();
-  }
-
-  // Set cudaDev based on localRank before calling base SetUp
-  cudaDev = localRank;
-
-  // Call base class SetUp which handles environment setup
-  CtranTestFixtureBase::SetUp();
-
-  // Initialize additional ctran settings
-  setenv("RANK", std::to_string(globalRank).c_str(), 1);
-
-#ifdef NCCL_COMM_STATE_DEBUG_TOPO_NOLOCAL
-  enableNolocal = true;
-#endif
-
-  if (globalRank == 0) {
-    XLOG(INFO) << "Testing with NCCL_COMM_STATE_DEBUG_TOPO="
-               << (enableNolocal ? "nolocal" : "default");
-  }
-
-  stream.emplace(cudaStreamNonBlocking); // Create RAII non-blocking CUDA stream
-}
-
-void CtranDistTestFixture::TearDown() {
-  stream.reset(); // Reset the CUDA stream (RAII handles destruction)
-  tcpStore_.reset();
-}
-
-void CtranDistTestFixture::setUpMpi() {
-  // Get rank info via MPI
-  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &globalRank));
-  MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &numRanks));
-
-  MPI_Comm localComm{MPI_COMM_NULL};
-  MPI_CHECK(MPI_Comm_split_type(
-      MPI_COMM_WORLD,
-      OMPI_COMM_TYPE_HOST,
-      globalRank,
-      MPI_INFO_NULL,
-      &localComm));
-  MPI_CHECK(MPI_Comm_rank(localComm, &localRank));
-  MPI_CHECK(MPI_Comm_size(localComm, &numLocalRanks_));
-  MPI_CHECK(MPI_Comm_free(&localComm));
-}
-
-void CtranDistTestFixture::setUpTcpStore() {
-  // Get rank info from environment variables
-  localRank = std::stoi(getenv("LOCAL_RANK"));
-  globalRank = std::stoi(getenv("GLOBAL_RANK"));
-  numRanks = std::stoi(getenv("WORLD_SIZE"));
-  numLocalRanks_ = std::stoi(getenv("LOCAL_SIZE"));
-
-  tcpStore_ = createTcpStore(isTcpStoreServer()); // Initialize TCP Store
-}
-
-bool CtranDistTestFixture::isTcpStoreServer() const {
-  return globalRank == 0;
-}
-
-std::vector<std::string> CtranDistTestFixture::exchangeInitUrls(
-    const std::string& selfUrl,
-    int numRanks,
-    int selfRank) {
-  const auto initType = getInitEnvType();
-  CHECK(initType == InitEnvType::TCP_STORE);
-
-  std::vector<std::string> res(numRanks);
-  std::vector<std::string> rankKeys(numRanks);
-
-  const auto testNum = testCount.load();
-  const auto keyUid = fmt::format("commid_{}", testNum);
-
-  for (int i = 0; i < numRanks; ++i) {
-    rankKeys.at(i) = fmt::format("rank_{}_{}", i, keyUid);
-  }
-  const auto selfRankKey = fmt::format("rank_{}_{}", selfRank, keyUid);
-  std::vector<uint8_t> urlBuf(selfUrl.begin(), selfUrl.end());
-  tcpStore_->set(selfRankKey, urlBuf);
-
-  // Wait for urls set by peer ranks
-  tcpStore_->wait(rankKeys);
-  if (tcpStore_->check(rankKeys)) {
-    auto rankUrls = tcpStore_->multiGet(rankKeys);
-    for (int i = 0; i < numRanks; ++i) {
-      const auto& url = rankUrls.at(i);
-      res[i] = std::string(url.begin(), url.end());
-    }
-  } else {
-    XLOG(FATAL) << "TCPStore key check returned false";
-  }
-
-  return res;
-}
-
-std::unique_ptr<CtranComm> CtranDistTestFixture::makeCtranComm() {
-  const auto initType = getInitEnvType();
-  const std::string uuid{"0"};
-  uint64_t commHash =
-      ctran::utils::getHash(uuid.data(), static_cast<int>(uuid.size()));
-  std::string commDesc = fmt::format("CtranTestComm-{}", globalRank);
-
-  auto comm =
-      std::make_unique<CtranComm>(ctran::utils::createAbort(/*enabled=*/false));
-  comm->logMetaData_.commId = 0;
-  comm->logMetaData_.commHash = commHash;
-  comm->logMetaData_.commDesc = commDesc;
-  comm->logMetaData_.rank = globalRank;
-  comm->logMetaData_.nRanks = numRanks;
-
-  const auto useVirtualTopo =
-      (NCCL_COMM_STATE_DEBUG_TOPO == NCCL_COMM_STATE_DEBUG_TOPO::nolocal ||
-       NCCL_COMM_STATE_DEBUG_TOPO == NCCL_COMM_STATE_DEBUG_TOPO::vnode);
-
-  // Initialize StateX before bootstrap, so bootstran can honor DEBUG_TOPO set
-  // by StateX
-  int cudaDev;
-  CUDACHECK_TEST(cudaGetDevice(&cudaDev));
-  const int cudaArch = ctran::utils::getCudaArch(cudaDev).value_or(-1);
-  const int64_t busId = ctran::utils::BusId::makeFrom(cudaDev).toInt64();
-
-  std::vector<ncclx::RankTopology> rankTopologies{};
-  std::vector<int> commRanksToWorldRanks{};
-  comm->statex_ = std::make_unique<ncclx::CommStateX>(
-      globalRank,
-      numRanks,
-      cudaDev,
-      cudaArch,
-      busId,
-      commHash,
-      rankTopologies,
-      commRanksToWorldRanks,
-      commDesc);
-
-  // Use appropriate bootstrap based on init type
-  if (initType == InitEnvType::MPI && useVirtualTopo) {
-    // Explicitly initialize virtual topology which doesn't need bootstrap
-    mccl::utils::initRankTopologyNoSystem(comm->statex_.get());
-
-    // statex can be queried after topo initialization
-    const auto localRank = comm->statex_->localRank();
-    const auto node = comm->statex_->node();
-
-    // Create bootstrap with virtual localRank and node for internal localComm
-    comm->bootstrap_ =
-        std::make_unique<meta::comms::MpiBootstrap>(localRank, node);
-  } else if (initType == InitEnvType::MPI) {
-    comm->bootstrap_ = std::make_unique<meta::comms::MpiBootstrap>();
-    // Initialize StateX with topology using helper function
-    mccl::utils::initRankTopology(comm->statex_.get(), comm->bootstrap_.get());
-  } else {
-    // For TCP Store, create and initialize mccl::bootstrap::Bootstrap
-    // then wrap with CtranAdapter
-    auto bootstrap = std::make_shared<mccl::bootstrap::Bootstrap>(
-        NCCL_SOCKET_IFNAME,
-        mccl::bootstrap::Options{
-            .port = 0, .ifAddrPrefix = NCCL_SOCKET_IPADDR_PREFIX});
-
-    // Get our own URL and exchange with all ranks
-    std::string selfUrl = bootstrap->semi_getInitUrl().get();
-    XLOG(INFO) << "Rank " << globalRank << " initURL: " << selfUrl;
-
-    auto allUrls = exchangeInitUrls(selfUrl, numRanks, globalRank);
-
-    // Convert to vector of InitURL for init() call
-    std::vector<mccl::InitURL> urlVec(allUrls.begin(), allUrls.end());
-
-    // Initialize the bootstrap with all URLs
-    // void init(urls, myRank, uuid, abort, timeout)
-    bootstrap->init(urlVec, static_cast<size_t>(globalRank), 0 /* uuid */);
-
-    comm->bootstrap_ =
-        std::make_unique<mccl::bootstrap::CtranAdapter>(bootstrap);
-    // Initialize StateX with topology using helper function
-    mccl::utils::initRankTopology(comm->statex_.get(), comm->bootstrap_.get());
-  }
-
-  // TODO: add memCache if enabled
-
-  // Initialize Ctran
-  comm->config_.commDesc = comm->statex_->commDesc().c_str();
-
-  COMMCHECK_TEST(ctranInit(comm.get()));
-  CHECK(ctranInitialized(comm.get())) << "Ctran not initialized";
-  return comm;
 }
 
 // ============================================================================

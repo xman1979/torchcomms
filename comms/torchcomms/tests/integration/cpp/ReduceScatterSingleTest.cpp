@@ -16,6 +16,7 @@ void ReduceScatterSingleTest::SetUp() {
   torchcomm_ = wrapper_->getTorchComm();
   rank_ = torchcomm_->getRank();
   num_ranks_ = torchcomm_->getSize();
+  device_type_ = wrapper_->getDevice().type();
 }
 
 void ReduceScatterSingleTest::TearDown() {
@@ -28,7 +29,7 @@ void ReduceScatterSingleTest::TearDown() {
 void ReduceScatterSingleTest::testSyncReduceScatterSingle(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message() << "Testing sync reduce_scatter_single with count="
                            << count << " and dtype=" << getDtypeName(dtype)
@@ -50,7 +51,7 @@ void ReduceScatterSingleTest::testSyncReduceScatterSingle(
 void ReduceScatterSingleTest::testSyncReduceScatterSingleNoWork(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing sync reduce_scatter_single without work object with count="
@@ -72,7 +73,7 @@ void ReduceScatterSingleTest::testSyncReduceScatterSingleNoWork(
 void ReduceScatterSingleTest::testAsyncReduceScatterSingle(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message() << "Testing async reduce_scatter_single with count="
                            << count << " and dtype=" << getDtypeName(dtype)
@@ -96,7 +97,7 @@ void ReduceScatterSingleTest::testAsyncReduceScatterSingle(
 void ReduceScatterSingleTest::testAsyncReduceScatterSingleEarlyReset(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing async reduce_scatter_single with early reset with count="
@@ -125,7 +126,7 @@ void ReduceScatterSingleTest::testAsyncReduceScatterSingleEarlyReset(
 void ReduceScatterSingleTest::testReduceScatterSingleInputDeleted(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing async reduce_scatter_single with input deleted after enqueue with count="
@@ -153,7 +154,12 @@ void ReduceScatterSingleTest::testReduceScatterSingleInputDeleted(
 void ReduceScatterSingleTest::testGraphReduceScatterSingle(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
+  // Skip CUDA Graph tests when running on CPU
+  if (isRunningOnCPU()) {
+    GTEST_SKIP() << "CUDA Graph tests are not supported on CPU";
+  }
+
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing CUDA Graph reduce_scatter_single with count=" << count
@@ -199,7 +205,12 @@ void ReduceScatterSingleTest::testGraphReduceScatterSingle(
 void ReduceScatterSingleTest::testGraphReduceScatterSingleInputDeleted(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
+  // Skip CUDA Graph tests when running on CPU
+  if (isRunningOnCPU()) {
+    GTEST_SKIP() << "CUDA Graph tests are not supported on CPU";
+  }
+
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing CUDA Graph reduce_scatter_single with input deleted after graph creation with count="
@@ -279,7 +290,7 @@ at::Tensor ReduceScatterSingleTest::createOutputTensor(
 // Helper function to verify results
 void ReduceScatterSingleTest::verifyResults(
     const at::Tensor& output,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   // Calculate expected value based on operation type
   int expected_value = 0;
   if (op == torch::comms::ReduceOp::SUM) {
@@ -287,6 +298,9 @@ void ReduceScatterSingleTest::verifyResults(
     expected_value = num_ranks_ * (rank_ + 1);
   } else if (op == torch::comms::ReduceOp::MAX) {
     // Max: rank+1
+    expected_value = rank_ + 1;
+  } else if (op == torch::comms::ReduceOp::AVG) {
+    // Avg: (num_ranks * (rank+1)) / num_ranks = rank+1
     expected_value = rank_ + 1;
   }
 

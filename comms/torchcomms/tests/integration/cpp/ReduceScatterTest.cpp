@@ -18,6 +18,7 @@ void ReduceScatterTest::SetUp() {
   torchcomm_ = wrapper_->getTorchComm();
   rank_ = torchcomm_->getRank();
   num_ranks_ = torchcomm_->getSize();
+  device_type_ = wrapper_->getDevice().type();
 }
 
 void ReduceScatterTest::TearDown() {
@@ -30,7 +31,7 @@ void ReduceScatterTest::TearDown() {
 void ReduceScatterTest::testSyncReduceScatter(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message() << "Testing sync reduce_scatter with count=" << count
                            << " and dtype=" << getDtypeName(dtype)
@@ -52,7 +53,7 @@ void ReduceScatterTest::testSyncReduceScatter(
 void ReduceScatterTest::testSyncReduceScatterNoWork(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing sync reduce_scatter without work object with count=" << count
@@ -73,7 +74,7 @@ void ReduceScatterTest::testSyncReduceScatterNoWork(
 void ReduceScatterTest::testAsyncReduceScatter(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message() << "Testing async reduce_scatter with count="
                            << count << " and dtype=" << getDtypeName(dtype)
@@ -97,7 +98,7 @@ void ReduceScatterTest::testAsyncReduceScatter(
 void ReduceScatterTest::testAsyncReduceScatterEarlyReset(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing async reduce_scatter with early reset with count=" << count
@@ -125,7 +126,7 @@ void ReduceScatterTest::testAsyncReduceScatterEarlyReset(
 void ReduceScatterTest::testReduceScatterInputDeleted(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing async reduce_scatter with input deleted after enqueue with count="
@@ -182,10 +183,13 @@ at::Tensor ReduceScatterTest::createOutputTensor(
 }
 
 // Helper function to calculate expected result
-int ReduceScatterTest::calculateExpectedResult(torch::comms::ReduceOp op) {
+int ReduceScatterTest::calculateExpectedResult(
+    const torch::comms::ReduceOp& op) {
   if (op == torch::comms::ReduceOp::SUM) {
     return num_ranks_ * (rank_ + 1);
   } else if (op == torch::comms::ReduceOp::MAX) {
+    return rank_ + 1;
+  } else if (op == torch::comms::ReduceOp::AVG) {
     return rank_ + 1;
   } else {
     throw std::runtime_error("Unsupported reduce operation");
@@ -195,7 +199,7 @@ int ReduceScatterTest::calculateExpectedResult(torch::comms::ReduceOp op) {
 // Helper function to verify results
 void ReduceScatterTest::verifyResults(
     const at::Tensor& output,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
   // Calculate expected result
   int expected = calculateExpectedResult(op);
 
@@ -208,7 +212,12 @@ void ReduceScatterTest::verifyResults(
 void ReduceScatterTest::testGraphReduceScatter(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
+  // Skip CUDA Graph tests when running on CPU
+  if (isRunningOnCPU()) {
+    GTEST_SKIP() << "CUDA Graph tests are not supported on CPU";
+  }
+
   SCOPED_TRACE(
       ::testing::Message() << "Testing CUDA Graph reduce_scatter with count="
                            << count << " and dtype=" << getDtypeName(dtype)
@@ -254,7 +263,12 @@ void ReduceScatterTest::testGraphReduceScatter(
 void ReduceScatterTest::testGraphReduceScatterInputDeleted(
     int count,
     at::ScalarType dtype,
-    torch::comms::ReduceOp op) {
+    const torch::comms::ReduceOp& op) {
+  // Skip CUDA Graph tests when running on CPU
+  if (isRunningOnCPU()) {
+    GTEST_SKIP() << "CUDA Graph tests are not supported on CPU";
+  }
+
   SCOPED_TRACE(
       ::testing::Message()
       << "Testing CUDA Graph reduce_scatter with input deleted after graph creation with count="

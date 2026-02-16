@@ -8,8 +8,7 @@
 #include "comms/torchcomms/TorchCommLogging.hpp"
 #include "nccl.h" // @manual
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 namespace {
 
@@ -42,7 +41,7 @@ ncclDataType_t getNcclDataTypeInternal(const at::ScalarType scalar_type) {
     case at::ScalarType::UInt64:
       return ncclUint64;
     default:
-      throw std::runtime_error("Unsupported scaler data type for NCCLX");
+      throw std::runtime_error("Unsupported scalar data type for NCCLX");
   }
 }
 
@@ -67,7 +66,11 @@ void createPreMulSum(
       is_tensor ? dataType == getNcclDataTypeInternal(tensor)
                 : dataType != ncclBfloat16,
       "PreMulSum factor type must match input data type");
-  nccl_api->redOpCreatePreMulSum(op, scalar, dataType, residence, comm);
+  NCCLX_CHECK(
+      nccl_api,
+      comm,
+      nccl_api->redOpCreatePreMulSum(op, scalar, dataType, residence, comm),
+      "NCCLX redOpCreatePreMulSum failed");
 }
 
 } // namespace
@@ -117,7 +120,10 @@ TorchCommNCCLX::RedOpRAII::RedOpRAII(
 
 TorchCommNCCLX::RedOpRAII::~RedOpRAII() {
   if (comm_) {
-    nccl_api_->redOpDestroy(ncclRedOp_, comm_);
+    NCCLX_CHECK_IGNORE(
+        nccl_api_,
+        nccl_api_->redOpDestroy(ncclRedOp_, comm_),
+        "NCCLX redOpDestroy failed");
   }
 }
 
@@ -180,7 +186,7 @@ void TorchCommNCCLX::timeoutWatchdog() noexcept {
   TC_LOG(INFO, this) << "Timeout thread starting for rank: " << rank_;
 
   cudaStreamCaptureMode mode = cudaStreamCaptureModeThreadLocal;
-  CUDA_CHECK(
+  CUDA_CHECK_IGNORE(
       cuda_api_,
       cuda_api_->threadExchangeStreamCaptureMode(&mode),
       "Failed to swap capture mode for timeout thread");
@@ -202,6 +208,9 @@ void TorchCommNCCLX::timeoutWatchdog() noexcept {
     }
 
     // Check work objects for completion or timeout
+    // Thread-safety: checkWorkQueue() calls garbageCollect() which acquires
+    // work_queues_mutex_ before accessing the work queue, ensuring safe
+    // concurrent access with the main thread's enqueueWork() calls.
     checkWorkQueue();
     if (comm_state_ != CommState::NORMAL &&
         options_.abort_process_on_timeout_or_error) {
@@ -217,6 +226,23 @@ void TorchCommNCCLX::timeoutWatchdog() noexcept {
                             << " - timeout watchdog detected operation error. ";
       }
       abort();
+    }
+
+    // Check communicator for async error
+    if (comm_state_ == CommState::NORMAL) {
+      ncclResult_t asyncErr;
+      NCCLX_CHECK(
+          nccl_api_,
+          nccl_comm_,
+          nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+          "failed to get async error");
+      if (asyncErr != ncclSuccess) {
+        comm_state_ = CommState::ERROR;
+        TC_LOG(ERROR, this)
+            << "Aborting process due to error on rank " << rank_
+            << " - nccl hit async error: " << ncclGetErrorString(asyncErr);
+        abort();
+      }
     }
   }
 
@@ -244,13 +270,17 @@ void TorchCommNCCLX::checkAndAbortIfTimedOutOrError() {
       TC_LOG(ERROR, this) << "Aborting process due to timeout";
       abort();
     } else {
-      throw std::runtime_error("NCCL operation timed out");
+      throw std::runtime_error("NCCLX operation timed out");
     }
   } else if (comm_state_ == CommState::ERROR) {
     ncclResult_t asyncErr;
-    nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr);
-    NCCLException ncclException(
-        *nccl_api_, "NCCL Async Error", asyncErr, nccl_comm_);
+    NCCLX_CHECK(
+        nccl_api_,
+        nccl_comm_,
+        nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+        "failed to get async error");
+    NCCLXException ncclException(
+        *nccl_api_, "NCCLX Async Error", asyncErr, nccl_comm_);
     abortNcclComm();
     if (options_.abort_process_on_timeout_or_error) {
       TC_LOG(ERROR, this) << "Aborting process due to error: "
@@ -458,5 +488,4 @@ void TorchCommNCCLX::detachMemoryHook() {
   CachingAllocatorHook::getInstance().deregisterComm(this);
 }
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

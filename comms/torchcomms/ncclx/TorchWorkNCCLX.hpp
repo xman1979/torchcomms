@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <string_view>
 #include <unordered_map>
 
 #include <ATen/ATen.h>
@@ -17,11 +18,15 @@
 #include "comms/torchcomms/TorchWork.hpp"
 #include "comms/torchcomms/ncclx/TorchCommNCCLXPersistentRequest.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Forward declaration
 class TorchCommNCCLX;
+
+// TorchCommWindowNCCLX is now a template - forward declare
+// Note: The type alias TorchCommWindowNCCLXGin is defined in
+// TorchCommWindowNCCLX.hpp
+template <typename Backend>
 class TorchCommWindowNCCLX;
 
 // Forward declaration for test class
@@ -53,6 +58,9 @@ class TorchWorkNCCLX : public TorchWork {
 
   // Override virtual functions from TorchWork
   void wait() override;
+  std::chrono::milliseconds getTimeout() const override {
+    return timeout_ms_;
+  }
 
   // Set persistent request reference to keep it alive until work is freed
   void setPersistentRequest(
@@ -61,10 +69,11 @@ class TorchWorkNCCLX : public TorchWork {
   }
 
  protected:
-  void recordStart(const std::string& coll_name);
+  void recordStart(std::string_view coll_name);
   void recordEnd();
 
   friend class TorchCommNCCLX;
+  template <typename B>
   friend class TorchCommWindowNCCLX;
   friend class TorchWorkNCCLXQueue;
   friend class torch::comms::test::TorchCommNCCLXTest;
@@ -73,11 +82,7 @@ class TorchWorkNCCLX : public TorchWork {
   // Check the status of the work object
   WorkStatus checkStatus();
 
-  void recordFunctionStart(const std::string& coll_name);
-
-  std::chrono::milliseconds getTimeout() {
-    return timeout_ms_;
-  }
+  void recordFunctionStart(std::string_view coll_name);
 
   // Tensors supplied might either be a vector of tensors,
   // or a single tensor. In case it is a single tensor, we
@@ -124,5 +129,4 @@ class TorchWorkNCCLXQueue {
   friend class TorchWorkNCCLXQueueCommTest;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

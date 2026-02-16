@@ -22,16 +22,18 @@ extern FILE *ncclDebugFile;
 
 void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *filefunc, int line, const char *fmt, ...) __attribute__ ((format (printf, 5, 6)));
 
+void ncclMetaDebugLogWithScuba(ncclDebugLogLevel level, unsigned long flags, const char *filefunc, int line, const char *fmt, ...) __attribute__ ((format (printf, 5, 6)));
+
 // Let code temporarily downgrade WARN into INFO
 extern thread_local int ncclDebugNoWarn;
 extern char ncclLastError[];
 
-#define VERSION(...) ncclDebugLog(NCCL_LOG_VERSION, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
-#define WARN(...) ncclDebugLog(NCCL_LOG_WARN, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
-#define ERR(...) ncclDebugLog(NCCL_LOG_WARN, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
+#define VERSION(...) ncclDebugLog(NCCL_LOG_VERSION, NCCL_ALL, __func__, __LINE__, __VA_ARGS__)
+#define WARN(...) ncclDebugLog(NCCL_LOG_WARN, NCCL_ALL, __func__, __LINE__, __VA_ARGS__)
+#define ERR(...) ncclDebugLog(NCCL_LOG_ERROR, NCCL_ALL, __func__, __LINE__, __VA_ARGS__)
 
-#define WARN_WITH_SCUBA(...) ncclDebugLog(NCCL_LOG_WARN, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
-#define ERR_WITH_SCUBA(...) ncclDebugLog(NCCL_LOG_WARN, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
+#define WARN_WITH_SCUBA(...) ncclMetaDebugLogWithScuba(NCCL_LOG_WARN, NCCL_ALL, __func__, __LINE__, __VA_ARGS__)
+#define ERR_WITH_SCUBA(...) ncclMetaDebugLogWithScuba(NCCL_LOG_ERROR, NCCL_ALL, __func__, __LINE__, __VA_ARGS__)
 
 
 #define NOWARN(EXPR, FLAGS) \

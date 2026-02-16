@@ -39,7 +39,10 @@ USE_NCCLX = flag_enabled("USE_NCCLX", True)
 USE_GLOO = flag_enabled("USE_GLOO", True)
 USE_RCCL = flag_enabled("USE_RCCL", False)
 USE_RCCLX = flag_enabled("USE_RCCLX", False)
-USE_TRANSPORT = flag_enabled("USE_TRANSPORT", True)
+USE_XCCL = flag_enabled("USE_XCCL", False)
+IS_ROCM = hasattr(torch.version, "hip") and torch.version.hip is not None
+# Transport is CUDA-only; disable by default on ROCm but allow explicit opt-in.
+USE_TRANSPORT = flag_enabled("USE_TRANSPORT", not IS_ROCM)
 
 requirement_path = os.path.join(ROOT, "requirements.txt")
 try:
@@ -62,6 +65,21 @@ def get_version() -> str:
         version = os.environ["BUILD_VERSION"]
 
     return version
+
+
+def detect_hipify_v2():
+    try:
+        from packaging.version import Version
+        from torch.utils.hipify import __version__
+
+        if Version(__version__) >= Version("2.0.0"):
+            return True
+    except Exception as e:
+        print(
+            "failed to detect pytorch hipify version, defaulting to version 1.0.0 behavior"
+        )
+        print(e)
+    return False
 
 
 class CMakeExtension(Extension):
@@ -87,7 +105,10 @@ class build_ext(build_ext_orig):
         build_temp.mkdir(parents=True, exist_ok=True)
         extdir = pathlib.Path(self.get_ext_fullpath(ext.name))
 
-        pybind11_build_flags = _get_pybind11_abi_build_flags()
+        build_flags = []
+        build_flags += _get_pybind11_abi_build_flags()
+        if detect_hipify_v2():
+            build_flags += ["-DHIPIFY_V2"]
 
         cfg = os.environ.get("CMAKE_BUILD_TYPE", "RelWithDebInfo")
         print(f"- Building with {cfg} configuration")
@@ -99,7 +120,7 @@ class build_ext(build_ext_orig):
             f"-DCMAKE_INSTALL_PREFIX={extdir.parent.absolute()}",
             f"-DCMAKE_INSTALL_DIR={extdir.parent.absolute()}",
             f"-DCMAKE_PREFIX_PATH={TORCH_ROOT}",
-            f"-DCMAKE_CXX_FLAGS={shlex.quote(' '.join(pybind11_build_flags))}",
+            f"-DCMAKE_CXX_FLAGS={shlex.quote(' '.join(build_flags))}",
             f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DLIB_SUFFIX={os.environ.get('LIB_SUFFIX', 'lib')}",
             f"-DUSE_NCCL={flag_str(USE_NCCL)}",
@@ -107,6 +128,7 @@ class build_ext(build_ext_orig):
             f"-DUSE_GLOO={flag_str(USE_GLOO)}",
             f"-DUSE_RCCL={flag_str(USE_RCCL)}",
             f"-DUSE_RCCLX={flag_str(USE_RCCLX)}",
+            f"-DUSE_XCCL={flag_str(USE_XCCL)}",
             f"-DUSE_TRANSPORT={flag_str(USE_TRANSPORT)}",
         ]
         build_args = ["--", "-j"]
@@ -127,6 +149,7 @@ extras_require = {
         "psutil",
         "lintrunner",
         "parameterized",
+        "pydot",
     ],
 }
 
@@ -154,6 +177,10 @@ if USE_RCCLX:
     ext_modules += [
         CMakeExtension("torchcomms._comms_rcclx"),
     ]
+if USE_XCCL:
+    ext_modules += [
+        CMakeExtension("torchcomms._comms_xccl"),
+    ]
 if USE_TRANSPORT:
     ext_modules += [
         CMakeExtension("torchcomms._transport"),
@@ -171,6 +198,7 @@ setup(
             "gloo = torchcomms._comms_gloo",
             "rccl = torchcomms._comms_rccl",
             "rcclx = torchcomms._comms_rcclx",
+            "xccl = torchcomms._comms_xccl",
             "dummy = torchcomms._comms",
         ]
     },
