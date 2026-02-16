@@ -79,6 +79,9 @@ function build_automake_library() {
 
   export LDFLAGS="-Wl,--allow-shlib-undefined"
   pushd "$library_name"
+  if [ -f "./autogen.sh" ]; then
+    ./autogen.sh
+  fi
   ./configure --prefix="$CMAKE_PREFIX_PATH" --disable-pie
 
   make -j
@@ -136,6 +139,7 @@ function build_third_party {
 
   mkdir -p $(pwd)/tmp/third-party
   pushd $(pwd)/tmp/third-party
+
   if [[ -z "${USE_SYSTEM_LIBS}" ]]; then
     build_fb_oss_library "https://github.com/fmtlib/fmt.git" "11.2.0" fmt "-DFMT_INSTALL=ON -DFMT_TEST=OFF -DFMT_DOC=OFF"
     build_fb_oss_library "https://github.com/fmtlib/fmt.git" "11.2.0" fmt "-DFMT_INSTALL=ON -DFMT_TEST=OFF -DFMT_DOC=OFF -DBUILD_SHARED_LIBS=ON"
@@ -157,6 +161,14 @@ function build_third_party {
     build_fb_oss_library "https://github.com/libevent/libevent.git" "release-2.1.12-stable" event
     build_fb_oss_library "https://github.com/google/double-conversion.git" "v3.3.1" double-conversion
     build_fb_oss_library "https://github.com/facebook/folly.git" "$third_party_tag" folly "-DUSE_STATIC_DEPS_ON_UNIX=ON -DOPENSSL_USE_STATIC_LIBS=ON"
+
+    build_fb_oss_library "https://github.com/nghttp2/nghttp2.git" "v1.68.0" "libnghttp2" "-DENABLE_LIB_ONLY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_TESTING=OFF"
+    build_fb_oss_library "https://github.com/libssh2/libssh2.git" "libssh2-1.11.1" libssh2 "-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF"
+    build_fb_oss_library "https://github.com/abseil/abseil-cpp" "20240116.2" abseil "-DABSL_BUILD_TEST_HELPERS=OFF"
+    build_automake_library "https://github.com/protocolbuffers/protobuf" "v3.20.3" protobuf "-Dprotobuf_BUILD_TESTS=OFF"
+    build_automake_library "https://github.com/rockdaboot/libpsl" "libpsl-0.21.0" psl
+    build_fb_oss_library "https://github.com/curl/curl" "curl-8_16_0" curl "-DBUILD_SHARED_LIBS=OFF -DCURL_BROTLI=OFF -DOPENSSL_USE_STATIC_LIBS=ON"
+    build_fb_oss_library "https://github.com/open-telemetry/opentelemetry-cpp" "v1.19.0" opentelemetry-cpp "-DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DWITH_OTLP_HTTP=ON -DCMAKE_FIND_LIBRARY_SUFFIXES=.a -DWITH_EXAMPLES=OFF -DCMAKE_LIBRARY_PATH=${CONDA_PREFIX}/lib -DOPENSSL_USE_STATIC_LIBS=TRUE"
   else
     if [[ -z "${NCCL_SKIP_CONDA_INSTALL}" ]]; then
       DEPS=(
@@ -251,7 +263,7 @@ BASE_DIR=${BASE_DIR:="${PWD}"}
 CUDARTLIB=cudart_static
 THIRD_PARTY_LDFLAGS=""
 
-#NCCL_BUILD_SKIP_DEPS=1
+NCCL_BUILD_SKIP_DEPS=1
 
 if [[ -z "${NCCL_BUILD_SKIP_DEPS}" ]]; then
   echo "Building dependencies"
