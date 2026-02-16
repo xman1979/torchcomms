@@ -264,7 +264,7 @@ BASE_DIR=${BASE_DIR:="${PWD}"}
 CUDARTLIB=cudart_static
 THIRD_PARTY_LDFLAGS=""
 
-NCCL_BUILD_SKIP_DEPS=1
+#NCCL_BUILD_SKIP_DEPS=1
 
 if [[ -z "${NCCL_BUILD_SKIP_DEPS}" ]]; then
   echo "Building dependencies"
