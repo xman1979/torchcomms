@@ -135,6 +135,7 @@ size_t ScubaOtel::addRawData(
     logger_->EmitLogRecord(std::move(sample));
   } catch (const std::exception& e) {
     std::cerr << "Error parsing JSON: " << e.what() << '\n';
+    return 0;
   }
   return 1;
 }
