@@ -164,7 +164,7 @@ function build_third_party {
     build_fb_oss_library "https://github.com/facebook/folly.git" "$third_party_tag" folly "-DUSE_STATIC_DEPS_ON_UNIX=ON -DOPENSSL_USE_STATIC_LIBS=ON"
 
     build_fb_oss_library "https://github.com/nghttp2/nghttp2.git" "v1.68.0" "libnghttp2" "-DENABLE_LIB_ONLY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_TESTING=OFF"
-    build_fb_oss_library "https://github.com/libssh2/libssh2.git" "libssh2-1.11.1" libssh2 "-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF"
+    build_fb_oss_library "https://github.com/libssh2/libssh2.git" "libssh2-1.12.0" libssh2 "-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DOPENSSL_USE_STATIC_LIBS=ON"
     build_fb_oss_library "https://github.com/abseil/abseil-cpp" "20240116.2" abseil "-DABSL_BUILD_TEST_HELPERS=OFF"
     build_automake_library "https://github.com/protocolbuffers/protobuf" "v3.20.3" protobuf
     build_automake_library "https://github.com/rockdaboot/libpsl" "libpsl-0.21.0" psl
