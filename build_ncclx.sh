@@ -163,13 +163,15 @@ function build_third_party {
     build_fb_oss_library "https://github.com/google/double-conversion.git" "v3.3.1" double-conversion
     build_fb_oss_library "https://github.com/facebook/folly.git" "$third_party_tag" folly "-DUSE_STATIC_DEPS_ON_UNIX=ON -DOPENSSL_USE_STATIC_LIBS=ON"
 
-    build_fb_oss_library "https://github.com/nghttp2/nghttp2.git" "v1.68.0" "libnghttp2" "-DENABLE_LIB_ONLY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_TESTING=OFF"
-    build_fb_oss_library "https://github.com/libssh2/libssh2.git" "libssh2-1.11.1" libssh2 "-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DOPENSSL_USE_STATIC_LIBS=ON"
-    build_fb_oss_library "https://github.com/abseil/abseil-cpp" "20240116.2" abseil "-DABSL_BUILD_TEST_HELPERS=OFF"
-    build_automake_library "https://github.com/protocolbuffers/protobuf" "v3.20.3" protobuf
-    build_automake_library "https://github.com/rockdaboot/libpsl" "libpsl-0.21.0" psl
-    build_fb_oss_library "https://github.com/curl/curl" "curl-8_16_0" curl "-DBUILD_SHARED_LIBS=OFF -DCURL_BROTLI=OFF -DOPENSSL_USE_STATIC_LIBS=ON -DUSE_LIBIDN2=OFF"
-    build_fb_oss_library "https://github.com/open-telemetry/opentelemetry-cpp" "v1.19.0" opentelemetry-cpp "-DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DWITH_OTLP_HTTP=ON -DCMAKE_FIND_LIBRARY_SUFFIXES=.a -DWITH_EXAMPLES=OFF -DCMAKE_LIBRARY_PATH=${CONDA_PREFIX}/lib -DOPENSSL_USE_STATIC_LIBS=TRUE"
+    if [[ -n "${OTEL_EXPORTER_OTLP_ENDPOINT}" ]]; then
+      build_fb_oss_library "https://github.com/nghttp2/nghttp2.git" "v1.68.0" "libnghttp2" "-DENABLE_LIB_ONLY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_TESTING=OFF"
+      build_fb_oss_library "https://github.com/libssh2/libssh2.git" "libssh2-1.11.1" libssh2 "-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DOPENSSL_USE_STATIC_LIBS=ON"
+      build_fb_oss_library "https://github.com/abseil/abseil-cpp" "20240116.2" abseil "-DABSL_BUILD_TEST_HELPERS=OFF"
+      build_automake_library "https://github.com/protocolbuffers/protobuf" "v3.20.3" protobuf
+      build_automake_library "https://github.com/rockdaboot/libpsl" "libpsl-0.21.0" psl
+      build_fb_oss_library "https://github.com/curl/curl" "curl-8_16_0" curl "-DBUILD_SHARED_LIBS=OFF -DCURL_BROTLI=OFF -DOPENSSL_USE_STATIC_LIBS=ON -DUSE_LIBIDN2=OFF"
+      build_fb_oss_library "https://github.com/open-telemetry/opentelemetry-cpp" "v1.19.0" opentelemetry-cpp "-DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DWITH_OTLP_HTTP=ON -DCMAKE_FIND_LIBRARY_SUFFIXES=.a -DWITH_EXAMPLES=OFF -DCMAKE_LIBRARY_PATH=${CONDA_PREFIX}/lib -DOPENSSL_USE_STATIC_LIBS=TRUE"
+    fi
   else
     if [[ -z "${NCCL_SKIP_CONDA_INSTALL}" ]]; then
       DEPS=(
