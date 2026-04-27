@@ -116,6 +116,10 @@ class CtranAlgo {
     RING_TMP_SEND_BUF,
     RING_TMP_RECV_BUF,
 
+    // Reverse direction buffers for bi-directional AllGather in Ring AllReduce
+    RING_TMP_SEND_BUF_REV,
+    RING_TMP_RECV_BUF_REV,
+
     NUM_TMPBUFS,
   };
 
@@ -138,6 +142,8 @@ class CtranAlgo {
   CtranIbConfig* getCollToVcConfig(CollType type);
 
  private:
+  friend commResult_t ctranInitPipesResources(CtranAlgo* algo);
+
   class SharedResource;
 
   commResult_t destroyDevState();
@@ -251,6 +257,7 @@ class CtranPersistentRequest {
     ALLTOALL_DEDUP,
     ALLTOALL_P,
     ALLTOALLV_DEDUP,
+    ALLGATHER_P_WIN,
   };
 
   Type type;

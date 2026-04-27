@@ -28,9 +28,9 @@
 
 // Forward declarations of ncclx classes to avoid circular dependencies
 class ICtran;
-namespace ctran::bootstrap {
+namespace meta::comms {
 class IBootstrap;
-} // namespace ctran::bootstrap
+} // namespace meta::comms
 class CollTrace;
 namespace ncclx {
 class CommStateX;
@@ -239,6 +239,14 @@ struct ncclTaskColl {
   int eActivationMask;
   void* eventHandle;
   uint8_t nChannels;
+
+  // NCCLX specific fields
+  // Random seed pointer for quantized collectives (stochastic rounding)
+  uint64_t* quantizeRandomSeedPtr;
+  // The type we should use for transport. This will be the same as the
+  // datatype for non-quantized collectives, and will be the quantized
+  // datatype for quantized collectives.
+  ncclDataType_t transportType;
 };
 struct ncclTaskP2p {
   struct ncclTaskP2p* next;
@@ -694,7 +702,7 @@ struct ncclComm {
   struct CommLogData logMetaData;
   std::shared_ptr<CollTrace> collTrace;
   std::shared_ptr<meta::comms::colltrace::ICollTrace> newCollTrace;
-  std::shared_ptr<ctran::bootstrap::IBootstrap> ctranBootstrap;
+  std::shared_ptr<meta::comms::IBootstrap> ctranBootstrap;
   std::shared_ptr<ncclx::memory::memCacheAllocator> memCache{nullptr};
   std::vector<std::string> connSetupBufKeys;
   std::shared_ptr<ncclx::transport::TransportProxy> transportProxy_;
@@ -702,6 +710,9 @@ struct ncclComm {
   // This is the only bridge between ctran and baseline code
   bool useCtran_{false}; // Ctran per-communicator control; set at init entry functions
   std::unique_ptr<CtranComm> ctranComm_;
+
+  // Disable local transports (P2P and SHM); forces NET for all connections
+  bool noLocal_{false};
 
   uint64_t endMagic;
 };

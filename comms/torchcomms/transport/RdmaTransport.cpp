@@ -6,6 +6,7 @@
 
 #include <fmt/core.h>
 #include "comms/ctran/backends/ib/CtranIb.h"
+#include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CudaWrap.h"
 #include "comms/ctran/utils/LogInit.h"
@@ -31,10 +32,35 @@ void initEnvironment() {
 
 namespace torch::comms {
 
-RdmaMemory::RdmaMemory(const void* buf, size_t len, int cudaDev)
-    : buf_(buf), len_(len), cudaDev_(cudaDev) {
+RdmaMemory::RdmaMemory(const void* buf, size_t len, int cudaDev, bool cacheReg)
+    : buf_(buf), len_(len), cudaDev_(cudaDev), cacheReg_(cacheReg) {
   initEnvironment();
-  FB_COMMCHECKTHROW(CtranIb::regMem(buf_, len_, cudaDev_, &regHdl_));
+  // Hold a shared_ptr to ensure RegCache lifetime while RdmaMemory is in
+  // scope
+  regCache_ = ctran::RegCache::getInstance();
+
+  // Try to find an existing registration first.
+  regHdl_ = regCache_->searchIbRegHandle(buf_, len_, cudaDev_);
+
+  if (regHdl_ != nullptr) {
+    // Buffer is already registered. If caller didn't expect that, upgrade to
+    // cache-managed so the destructor won't deregister a handle it doesn't own.
+    cacheReg_ = true;
+  } else if (cacheReg_) {
+    // Caller asserted the buffer is pre-registered, but it wasn't found.
+    throw std::runtime_error(
+        "Failed to fetch the IB handle from regCache. The buffer may not be registered");
+  } else {
+    // Not registered yet; do it now.
+    FB_COMMCHECKTHROW(regCache_->globalRegister(
+        buf_, len_, true /* forceReg */, false /* ncclManaged */, cudaDev_));
+    regHdl_ = regCache_->searchIbRegHandle(buf_, len_, cudaDev_);
+    if (regHdl_ == nullptr) {
+      FB_COMMCHECKIGNORE(regCache_->globalDeregister(
+          buf_, len_, false /* skipRemRelease */, cudaDev_));
+      throw std::runtime_error("Failed to fetch the IB handle from regCache.");
+    }
+  }
   remoteKey_ = CtranIb::getRemoteAccessKey(regHdl_).toString();
 }
 
@@ -43,19 +69,28 @@ RdmaMemory::RdmaMemory(RdmaMemory&& other) noexcept
       len_(other.len_),
       cudaDev_(other.cudaDev_),
       regHdl_(other.regHdl_),
-      remoteKey_(std::move(other.remoteKey_)) {
+      remoteKey_(std::move(other.remoteKey_)),
+      cacheReg_(other.cacheReg_),
+      regCache_(std::move(other.regCache_)) {
   // Properly invalidate the moved-from object to prevent double-free
   // and ensure the object is in a valid but unspecified state
   other.buf_ = nullptr;
   other.len_ = 0;
   other.cudaDev_ = -1;
   other.regHdl_ = nullptr;
+  other.cacheReg_ = false;
   // Note: remoteKey_ is already moved, leaving other.remoteKey_ empty
 }
 
 RdmaMemory::~RdmaMemory() noexcept {
+  if (cacheReg_) {
+    // cacheReg path only queried the handle; caller owns registration lifetime
+    return;
+  }
   if (remoteKey_.size() > 0 && regHdl_) {
-    FB_COMMCHECKIGNORE(CtranIb::deregMem(regHdl_));
+    FB_COMMCHECKIGNORE(regCache_->globalDeregister(
+        buf_, len_, false /* skipRemRelease */, cudaDev_));
+    regHdl_ = nullptr;
   }
 }
 
@@ -78,7 +113,10 @@ struct RdmaTransport::Work {
   std::chrono::steady_clock::time_point creationTime;
 };
 
-RdmaTransport::RdmaTransport(int cudaDev, folly::EventBase* evb)
+RdmaTransport::RdmaTransport(
+    int cudaDev,
+    folly::EventBase* evb,
+    std::optional<int> maxNumCqe)
     : cudaDev_(cudaDev), evb_(evb) {
   initEnvironment();
   // Create IB Instance
@@ -87,9 +125,12 @@ RdmaTransport::RdmaTransport(int cudaDev, folly::EventBase* evb)
       cudaDev,
       -1 /* commHash */,
       "RDMA-Transport",
-      nullptr /* ctrlManager */,
       true /* enableLocalFlush */,
-      CtranIb::BootstrapMode::kExternal);
+      CtranIb::BootstrapMode::kExternal,
+      std::nullopt /* qpServerAddr */,
+      ::ctran::utils::createAbort(/*enabled=*/false),
+      nullptr /* socketFactory */,
+      maxNumCqe);
 
   if (evb_) {
     // Optionally create progress timeout; skip it if the transport is never
@@ -137,7 +178,6 @@ bool queryRdmaSupport() {
           kDummyDevice,
           -1 /* commHash */,
           "Query-RDMA-Support",
-          nullptr /* ctrlManager */,
           true /* enableLocalFlush */,
           CtranIb::BootstrapMode::kExternal);
     } catch (const std::exception& e) {
@@ -170,6 +210,10 @@ commResult_t RdmaTransport::connect(const std::string& peerId) {
 
 bool RdmaTransport::connected() const {
   return ib_->getVc(kDummyRank) != nullptr;
+}
+
+int RdmaTransport::getMaxCqe() const {
+  return ib_->getMaxCqe();
 }
 
 folly::SemiFuture<commResult_t> RdmaTransport::write(

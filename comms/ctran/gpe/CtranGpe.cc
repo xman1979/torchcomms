@@ -13,6 +13,51 @@
 
 using namespace ctran;
 
+namespace {
+std::string kernelTypeToOpName(KernelConfig::KernelType type) {
+  switch (type) {
+    case KernelConfig::ALLGATHER:
+    case KernelConfig::ALLGATHERP:
+    // ALLGATHERP_INIT goes through submitHost(), not submit(), so this
+    // case is currently unreachable. Included for completeness.
+    case KernelConfig::ALLGATHERP_INIT:
+      return "AllGather";
+    case KernelConfig::ALLREDUCE:
+      return "AllReduce";
+    case KernelConfig::SEND:
+    case KernelConfig::RECV:
+    case KernelConfig::SENDRECV:
+    case KernelConfig::SENDRECV_P2P:
+    case KernelConfig::RECV_UNPACK:
+    case KernelConfig::SENDRECV_UNPACK:
+      return "SendRecv";
+    case KernelConfig::ALLTOALL:
+    case KernelConfig::ALLTOALL_DEDUP:
+    case KernelConfig::DEVICE_ALLTOALLV:
+    case KernelConfig::ALLTOALLV:
+    case KernelConfig::ALLTOALLV_DYNAMIC:
+    case KernelConfig::ALLTOALLV_DYNAMIC_SPLIT:
+    case KernelConfig::ALLTOALLV_DYNAMIC_SPLIT_NON_CONTIG:
+    case KernelConfig::ALLTOALLV_DEDUP:
+      return "AllToAll";
+    case KernelConfig::BROADCAST:
+    case KernelConfig::BROADCAST_UNPACK:
+      return "Broadcast";
+    case KernelConfig::REDUCESCATTER:
+      return "ReduceScatter";
+    case KernelConfig::PUTNOTIFY:
+    case KernelConfig::WAITNOTIFY:
+    case KernelConfig::PUTSIGNAL:
+    case KernelConfig::WAITSIGNAL:
+    case KernelConfig::SIGNAL:
+    case KernelConfig::GET:
+      return "RMA";
+    default:
+      return "Unknown";
+  }
+}
+} // namespace
+
 OpElem::OpElem(enum opType type, CtranComm* comm, uint64_t opCount)
     : OpElem(type, nullptr, comm, nullptr, opCount) {};
 
@@ -143,6 +188,9 @@ OpElem::OpElem(
       new (&this->allreduce.remoteAccessKeys)
           std::vector<struct CtranMapperRemoteAccessKey>;
       this->allreduce.remoteAccessKeys.resize(comm_->statex_->nRanks());
+      new (&this->allreduce.hostArgs) ctran::allreduce::ring::HostArgs();
+      new (&this->allreduce.hostResource)
+          ctran::allreduce::ring::HostResource();
       break;
     default:
       break;
@@ -172,15 +220,13 @@ OpElem::~OpElem() {
       break;
     // Free kElem for later reclaim back to KernelElemPool
     case SEND:
-      // when copy engine is enabled, kElem is freed by the kernels
-      if (this->send.kElem && !NCCL_CTRAN_NVL_SENDRECV_COPY_ENGINE_ENABLE) {
+      if (this->send.kElem) {
         this->send.kElem->free();
       }
       this->send.remoteAccessKey.~CtranMapperRemoteAccessKey();
       break;
     case RECV:
-      // when copy engine is enabled, kElem is freed by the kernels
-      if (this->recv.kElem && !NCCL_CTRAN_NVL_SENDRECV_COPY_ENGINE_ENABLE) {
+      if (this->recv.kElem) {
         this->recv.kElem->free();
       }
       break;
@@ -217,6 +263,9 @@ OpElem::~OpElem() {
       this->allreduce.kElemStepMap.~unordered_map();
       this->allreduce.remoteRecvBuffs.~vector();
       this->allreduce.remoteAccessKeys.~vector();
+      this->allreduce.hostArgs.~HostArgs();
+      // ~HostResource releases GpeKernelSyncs back to pool
+      this->allreduce.hostResource.~HostResource();
       break;
     }
     case ALLTOALLV_DYNAMIC: {
@@ -232,6 +281,12 @@ OpElem::~OpElem() {
       break;
     }
     case ALLTOALLV_DYNAMIC_SPLIT_NON_CONTIG: {
+      if (this->alltoallv_dynamic.kElem) {
+        this->alltoallv_dynamic.kElem->free();
+      }
+      break;
+    }
+    case ALLTOALLV_DYNAMIC_SPLIT_NON_CONTIG_P: {
       if (this->alltoallv_dynamic.kElem) {
         this->alltoallv_dynamic.kElem->free();
       }
@@ -313,6 +368,14 @@ void OpElem::setStatus(KernelElem::ElemStatus status) {
       }
       break;
     }
+    case ALLTOALL_DEDUP: {
+      for (auto& pair : this->alltoall_dedup.bcastElemMap) {
+        if (pair.second != nullptr) {
+          pair.second->setStatus(status);
+        }
+      }
+      break;
+    }
     default:
       // FIXME: add a WARN log here
       break;
@@ -324,6 +387,7 @@ static std::unordered_map<KernelConfig::KernelType, std::string>
         {KernelConfig::KernelType::ALLGATHER, "ALLGATHER"},
         {KernelConfig::KernelType::ALLREDUCE, "ALLREDUCE"},
         {KernelConfig::KernelType::ALLTOALL, "ALLTOALL"},
+        {KernelConfig::KernelType::DEVICE_ALLTOALLV, "DEVICE_ALLTOALLV"},
         {KernelConfig::KernelType::ALLTOALLV, "ALLTOALLV"},
         {KernelConfig::KernelType::ALLTOALL_DEDUP, "ALLTOALL_DEDUP"},
         {KernelConfig::KernelType::ALLTOALLV_DYNAMIC, "ALLTOALLV_DYNAMIC"},
@@ -334,11 +398,7 @@ static std::unordered_map<KernelConfig::KernelType, std::string>
         {KernelConfig::KernelType::SENDRECV, "SENDRECV"},
         {KernelConfig::KernelType::SEND, "SEND"},
         {KernelConfig::KernelType::RECV, "RECV"},
-        {KernelConfig::KernelType::SENDRECV_NOTIFY, "SENDRECV_NOTIFY"},
-        {KernelConfig::KernelType::SENDRECV_STAGED, "SENDRECV_STAGED"},
         {KernelConfig::KernelType::SENDRECV_P2P, "SENDRECV_P2P"},
-        {KernelConfig::KernelType::SEND_NOTIFY, "SEND_NOTIFY"},
-        {KernelConfig::KernelType::RECV_NOTIFY, "RECV_NOTIFY"},
         {KernelConfig::KernelType::BROADCAST, "BROADCAST"},
         {KernelConfig::KernelType::REDUCESCATTER, "REDUCESCATTER"},
         {KernelConfig::KernelType::PUTNOTIFY, "PUTNOTIFY"},
@@ -379,6 +439,10 @@ commResult_t CtranGpe::submit(
     const void* ncclKernel,
     std::optional<std::chrono::milliseconds> timeout,
     PreLaunchGraphPrepareFn graphPrepareFn) {
+  if (this->pimpl->comm->algoStats_) {
+    this->pimpl->comm->algoStats_->record(
+        kernelTypeToOpName(kernelConfig.type), kernelConfig.algoName);
+  }
   return this->pimpl->submit(
       CtranGpeCmd::TypeEnum::GRAPH_ENQUEUE,
       std::move(opGroup),
@@ -410,10 +474,6 @@ commResult_t CtranGpe::allocKernelElems(
   if (numElems > this->pimpl->kernelElemPool->size()) {
     this->pimpl->kernelElemPool->reclaim();
 
-    // We do not expect such high amount of inuse elements, return error here to
-    // avoid hang. If there can be really such a high usage case, either
-    // increase the pool size or set a timeout here to reclaim multiple times.
-    // Avoid timeout logic for now to avoid complexity.
     if (numElems > this->pimpl->kernelElemPool->size()) {
       CLOGF(
           WARN,
@@ -441,6 +501,7 @@ commResult_t CtranGpe::allocKernelElems(
     }
     elem = elem->next;
   }
+
   return commSuccess;
 }
 
@@ -458,6 +519,20 @@ size_t CtranGpe::numInUseKernelFlags() {
   // Return the number of inuse flags
   return this->pimpl->kernelFlagPool->capacity() -
       this->pimpl->kernelFlagPool->size();
+}
+
+size_t CtranGpe::numInUseChecksums() {
+  this->pimpl->checksumPool->reclaim();
+  return this->pimpl->checksumPool->capacity() -
+      this->pimpl->checksumPool->size();
+}
+
+size_t CtranGpe::numInUseGpeKernelSyncs() {
+  // Last chance to cleanup
+  this->pimpl->gpeKernelSyncPool->reclaim();
+  // Return the number of inuse elements
+  return this->pimpl->gpeKernelSyncPool->capacity() -
+      this->pimpl->gpeKernelSyncPool->size();
 }
 
 commResult_t CtranGpe::allocGpeKernelSyncs(

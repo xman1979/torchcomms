@@ -8,87 +8,22 @@
 #include <comms/torchcomms/RemovableHandle.hpp>
 #include <comms/torchcomms/TorchCommBackend.hpp>
 #include <comms/torchcomms/TorchCommBatch.hpp>
+#include <comms/torchcomms/TorchCommHooks.hpp>
 #include <comms/torchcomms/TorchCommOptions.hpp>
 #include <comms/torchcomms/TorchCommTypes.hpp>
-#include <comms/torchcomms/TorchCommUtils.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <memory>
 #include <string>
 
 namespace torch::comms {
 
+// Reset the global op_id generator. Used when creating isolated
+// FlightRecorder instances to ensure each test gets a fresh op_id space.
+void resetGlobalOpIdGenerator();
+
 // Forward declarations
-class TorchWork;
 class TorchCommNCCLX;
 class TorchWin;
-
-// Enum for collective operation names
-enum class OpName {
-  send,
-  recv,
-  broadcast,
-  all_reduce,
-  reduce,
-  all_gather,
-  all_gather_v,
-  all_gather_single,
-  reduce_scatter,
-  reduce_scatter_v,
-  reduce_scatter_single,
-  all_to_all_single,
-  all_to_all_v_single,
-  all_to_all,
-  barrier,
-  scatter,
-  gather,
-  split,
-  new_window,
-};
-
-// Convert OpName enum to string
-constexpr std::string_view toString(OpName name) {
-  switch (name) {
-    case OpName::send:
-      return "send";
-    case OpName::recv:
-      return "recv";
-    case OpName::broadcast:
-      return "broadcast";
-    case OpName::all_reduce:
-      return "all_reduce";
-    case OpName::reduce:
-      return "reduce";
-    case OpName::all_gather:
-      return "all_gather";
-    case OpName::all_gather_v:
-      return "all_gather_v";
-    case OpName::all_gather_single:
-      return "all_gather_single";
-    case OpName::reduce_scatter:
-      return "reduce_scatter";
-    case OpName::reduce_scatter_v:
-      return "reduce_scatter_v";
-    case OpName::reduce_scatter_single:
-      return "reduce_scatter_single";
-    case OpName::all_to_all_single:
-      return "all_to_all_single";
-    case OpName::all_to_all_v_single:
-      return "all_to_all_v_single";
-    case OpName::all_to_all:
-      return "all_to_all";
-    case OpName::barrier:
-      return "barrier";
-    case OpName::scatter:
-      return "scatter";
-    case OpName::gather:
-      return "gather";
-    case OpName::split:
-      return "split";
-    case OpName::new_window:
-      return "new_window";
-  }
-  return "unknown";
-}
 
 /**
  * TorchComm - Main communication abstraction for TorchComms.
@@ -106,6 +41,7 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
   void finalize();
   int getRank() const;
   int getSize() const;
+  std::vector<int> getRanks() const;
   std::string_view getCommName() const;
 
   // Point-to-Point Operations
@@ -204,6 +140,12 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
       int root,
       bool async_op,
       const GatherOptions& options = {});
+  c10::intrusive_ptr<TorchWork> gather_single(
+      at::Tensor& output,
+      const at::Tensor& input,
+      int root,
+      bool async_op,
+      const GatherSingleOptions& options = {});
 
   // Communicator Management
   std::shared_ptr<TorchComm> split(
@@ -222,42 +164,69 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
     return backend_;
   }
 
-  std::shared_ptr<TorchCommBackend> unsafeGetBackend() const {
+  std::string_view getBackendVersion() const;
+
+  // Device Transport API — returns device pointer as int64 for Triton kernels.
+  // Throws if not supported by the backend.
+  int64_t get_device_transport();
+
+  std::shared_ptr<TorchCommBackend> getBackendImpl() const {
     return impl_;
   }
 
   std::shared_ptr<TorchCommWindow> new_window(
       const std::optional<at::Tensor>& tensor = std::nullopt);
 
-  // Hooks
-  struct PreHookArgs {
-    OpName name;
-    bool async_op{false};
-    std::vector<at::Tensor>* input_tensors{nullptr};
-    std::vector<at::Tensor>* output_tensors{nullptr};
-    const at::Tensor* input_tensor{nullptr};
-    const at::Tensor* output_tensor{nullptr};
-    int root{-1};
-    // For all_to_all_v_single
-    const std::vector<uint64_t>* output_split_sizes{nullptr};
-    const std::vector<uint64_t>* input_split_sizes{nullptr};
-    // For split
-    const std::vector<int>* ranks{nullptr};
-    const std::string* split_name{nullptr};
-  };
-  using PreHook = std::function<void(PreHookArgs)>;
-  struct PostHookArgs {
-    OpName name;
-    std::optional<c10::weak_intrusive_ptr<TorchWork>> work{};
-    std::weak_ptr<TorchComm> new_comm{};
-    std::weak_ptr<TorchCommWindow> new_window{};
-  };
-  using PostHook = std::function<void(PostHookArgs)>;
+  // Persistent AllGather operations
+  using AllGatherPHandle = TorchCommBackend::AllGatherPHandle;
 
-  // These are not thread safe and must not be modified while a collective is
-  // in progress.
-  RemovableHandle registerPreHook(PreHook preHook);
-  RemovableHandle registerPostHook(PostHook postHook);
+  AllGatherPHandle all_gather_p_init(
+      at::Tensor& output,
+      const AllGatherPInitOptions& options = {});
+
+  c10::intrusive_ptr<TorchWork> all_gather_p_exec(
+      AllGatherPHandle handle,
+      const at::Tensor& input,
+      bool async_op,
+      const AllGatherPExecOptions& options = {});
+
+  void all_gather_p_free(AllGatherPHandle handle);
+
+  // Fault Tolerance API
+
+  /**
+   * Get the initialization handle for this communicator.
+   * In dynamic regime, this handle encodes information required by the backend
+   * to complete the initialization process via reconfigure().
+   *
+   * @return An InitHandle containing the initialization URL/handle.
+   * @throws std::runtime_error if not implemented by the backend.
+   */
+  InitHandle getInitHandle() const;
+
+  /**
+   * Reconfigure the communicator with a new set of peers.
+   * In dynamic regime, this method initializes the communicator with the
+   * provided set of peers. After a successful reconfigure call, the
+   * communicator is fully initialized and collective operations are permitted.
+   *
+   * @param opts ReconfigureOptions containing uuid, handles, timeout, and
+   * hints.
+   * @return A TorchWork handle that can be used to wait for completion.
+   * @throws std::runtime_error if not implemented by the backend.
+   */
+  c10::intrusive_ptr<TorchWork> reconfigure(const ReconfigureOptions& opts);
+
+  // Hook types (defined in TorchCommHooks.hpp; aliased for backward compat)
+  using PreHook = ::torch::comms::PreHook;
+  using PostHook = ::torch::comms::PostHook;
+  using AbortHook = ::torch::comms::AbortHook;
+
+  // Hook registration (not thread-safe; must not be called while a collective
+  // is in progress)
+  std::unique_ptr<RemovableHandle> registerPreHook(PreHook preHook);
+  std::unique_ptr<RemovableHandle> registerPostHook(PostHook postHook);
+  std::unique_ptr<RemovableHandle> registerAbortHook(AbortHook hook);
 
   // Disable copy and move semantics
   TorchComm(const TorchComm&) = delete;
@@ -272,32 +241,40 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
       const std::string& name,
       const CommOptions& options);
 
- protected:
-  std::shared_ptr<TorchCommBackend> getBackendImpl() const {
-    return impl_;
-  }
-
  private:
-  // constructor for split communicators
+  // constructor for root communicators
   explicit TorchComm(
       const std::string& backend,
       std::shared_ptr<TorchCommBackend> impl);
 
-  void preHook(PreHookArgs&& args);
-  void postHook(PostHookArgs&& args);
+  // constructor for split communicators
+  TorchComm(
+      const std::string& backend,
+      std::shared_ptr<TorchCommBackend> impl,
+      std::vector<int> ranks);
+
+  void preHook(OpName name, size_t op_id, PreHookArgs&& args);
+  void postHook(size_t op_id, PostHookArgs&& args);
 
   // Rank validation helper
   void validateRank(int rank, const char* param_name) const;
 
- private:
+  // Initialize ranks_ from the backend's current size
+  void initRanks();
+
   // Backend name
   std::string backend_;
+  std::string backend_version_;
   // Implementation object
   std::shared_ptr<TorchCommBackend> impl_;
 
   int64_t nextHookId_ = 0;
   std::unordered_map<int64_t, PreHook> preHooks_;
   std::unordered_map<int64_t, PostHook> postHooks_;
+  // Global ranks of the members of this communicator.
+  // For root communicators: [0, 1, 2, ..., size-1]
+  // For split communicators: global ranks from the parent communicator
+  std::vector<int> ranks_;
 };
 
 // Constructor that creates the appropriate backend implementation

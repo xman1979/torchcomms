@@ -34,9 +34,9 @@
 
 // Forward declarations of ncclx classes to avoid circular dependencies
 class ICtran;
-namespace ctran::bootstrap {
+namespace meta::comms {
 class IBootstrap;
-} // namespace ctran::bootstrap
+} // namespace meta::comms
 class CollTrace;
 namespace ncclx {
 class CommStateX;
@@ -731,7 +731,7 @@ struct ncclComm {
   std::shared_ptr<CollTrace> collTrace;
   std::shared_ptr<meta::comms::colltrace::ICollTrace> newCollTrace;
   std::unique_ptr<meta::comms::colltrace::AlgoStats> algoStats;
-  std::shared_ptr<ctran::bootstrap::IBootstrap> ctranBootstrap;
+  std::shared_ptr<meta::comms::IBootstrap> ctranBootstrap;
   std::shared_ptr<ncclx::memory::memCacheAllocator> memCache{nullptr};
   std::vector<std::string> connSetupBufKeys;
   std::shared_ptr<ncclx::transport::TransportProxy> transportProxy_;
@@ -743,6 +743,9 @@ struct ncclComm {
   // [META:PAT_AVG] per-communicator control; set at init entry functions
   // When enabled, forces PAT algorithm with ncclDevPatSumPostDiv for ReduceScatter with ncclAvg
   bool usePatAvg_{false};
+
+  // Disable local transports (P2P and SHM); forces NET for all connections
+  bool noLocal_{false};
 
   uint64_t endMagic;
 };

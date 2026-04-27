@@ -2,9 +2,9 @@
 
 #include "comms/torchcomms/nccl/TorchWorkNCCL.hpp"
 #include <ATen/cuda/CUDAContext.h>
-#include "comms/torchcomms/TorchCommLogging.hpp"
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/nccl/TorchCommNCCL.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/TracingGuard.hpp"
 
 namespace torch::comms {
 
@@ -144,7 +144,8 @@ TorchWorkNCCL::WorkStatus TorchWorkNCCL::checkStatus() {
 
     // Check if the operation has timed out
     if (elapsed_milliseconds > timeout_ms_) {
-      // Operation has timed out
+      TC_LOG(ERROR, comm_.get()) << "Operation timed out after "
+                                 << elapsed_milliseconds.count() << " ms";
       setStatus(WorkStatus::TIMEDOUT);
     }
   } else {
@@ -159,6 +160,8 @@ TorchWorkNCCL::WorkStatus TorchWorkNCCL::checkStatus() {
 }
 
 void TorchWorkNCCL::wait() {
+  runWaitHooks();
+
   // If already completed, return immediately
   WorkStatus local_state = status();
   if (local_state == WorkStatus::COMPLETED ||
@@ -166,7 +169,7 @@ void TorchWorkNCCL::wait() {
     return;
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       std::string(comm_->getCommName()),
       comm_->getSize(),
       "wait",

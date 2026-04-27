@@ -11,7 +11,6 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 import torchcomms
 from torchcomms import ReduceOp
-from torchcomms._comms import _get_store
 from torchcomms.device_mesh import (
     _create_torchcomm_process_group,
     _flatten_with_comm,
@@ -24,6 +23,15 @@ try:
     HAS_MESH_LAYOUT = True
 except ImportError:
     HAS_MESH_LAYOUT = False
+
+try:
+    from torch.distributed._mesh_layout import (  # noqa: F401  # pyre-ignore[21]
+        _FlatLayout,
+    )
+
+    HAS_FLAT_LAYOUT = True
+except ImportError:
+    HAS_FLAT_LAYOUT = False
 
 
 class DeviceMeshTest(unittest.TestCase):
@@ -54,8 +62,8 @@ class DeviceMeshTest(unittest.TestCase):
         dist.all_reduce(t, group=group)
 
         # Device-aware synchronization
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
         # No synchronization needed for CPU
 
         self.assertEqual(t[0].item(), comm.get_size())
@@ -63,7 +71,7 @@ class DeviceMeshTest(unittest.TestCase):
         comm.finalize()
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 4, "Skipping non GPU situations for now"
+        torch.accelerator.device_count() < 4, "Skipping non GPU situations for now"
     )
     def test_2_d_parallel(self) -> None:
         backend = os.environ["TEST_BACKEND"]
@@ -132,8 +140,8 @@ class DeviceMeshTest(unittest.TestCase):
             dist.all_reduce(t, group=sub_group)
 
             # Device-aware synchronization
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            if torch.accelerator.is_available():
+                torch.accelerator.synchronize()
             # No synchronization needed for CPU
 
             self.assertEqual(t[0].item(), sub_comm.get_size())
@@ -151,8 +159,8 @@ class DeviceMeshTest(unittest.TestCase):
         dist.all_reduce(t, group=sub_group)
 
         # Device-aware synchronization
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
         # No synchronization needed for CPU
 
         self.assertEqual(t[0].item(), sub_comm.get_size())
@@ -177,15 +185,23 @@ class DeviceMeshTest(unittest.TestCase):
         self, device_mesh_3d, flatten_dim_name, flatten_mesh_dim_names, comm, ranks
     ):
         """Set up a flattened mesh dimension with proper layout."""
-        sizes = []
-        strides = []
-        # This is important because we need to make sure the layout is correct
-        for dim_name in flatten_mesh_dim_names[flatten_dim_name]:
-            layout = device_mesh_3d[dim_name]._layout
-            sizes.append(layout.sizes)
-            strides.append(layout.strides)
-        # pyre-fixme[19]: _MeshLayout dataclass accepts positional args
-        flatten_layout = _MeshLayout(tuple(sizes), tuple(strides))
+        if HAS_FLAT_LAYOUT:
+            # New PyTorch API (2.13+): _MeshLayout is a Sequence[_FlatLayout]
+            flat_layouts = []
+            for dim_name in flatten_mesh_dim_names[flatten_dim_name]:
+                sub_layout = device_mesh_3d[dim_name]._layout
+                flat_layouts.append(sub_layout[0])
+            flatten_layout = _MeshLayout(flat_layouts)
+        else:
+            # Old PyTorch API: _MeshLayout has .shape and .stride fields
+            sizes = []
+            strides = []
+            for dim_name in flatten_mesh_dim_names[flatten_dim_name]:
+                layout = device_mesh_3d[dim_name]._layout
+                sizes.append(layout.shape)
+                strides.append(layout.stride)
+            # pyre-fixme[19]: _MeshLayout dataclass accepts positional args
+            flatten_layout = _MeshLayout(tuple(sizes), tuple(strides))
         _flatten_with_comm(
             device_mesh_3d,
             flatten_dim_name,
@@ -209,7 +225,7 @@ class DeviceMeshTest(unittest.TestCase):
         return flatten_ranks_per_dim
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 8 or not HAS_MESH_LAYOUT,
+        torch.accelerator.device_count() < 8 or not HAS_MESH_LAYOUT,
         "Skipping non GPU situations for now",
     )
     def test_n_d_parallel(self) -> None:
@@ -293,7 +309,7 @@ class DeviceMeshTest(unittest.TestCase):
         comm.finalize()
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 4,
+        torch.accelerator.device_count() < 4,
         "Skipping not enough GPUs situations for now",
     )
     def test_backend_wrapper_split_group(self) -> None:
@@ -303,10 +319,7 @@ class DeviceMeshTest(unittest.TestCase):
 
         # Create a TorchComm communicator
         comm = torchcomms.new_comm(backend, device, name="comms_test_split_group")
-        store = _get_store("torchcomm", "store_dist_test")
-        pg = _create_torchcomm_process_group(
-            comm, "comms_test_split_group", prefix_store=store
-        )
+        pg = _create_torchcomm_process_group(comm, "comms_test_split_group")
 
         # Get current rank and world size
         cur_rank = comm.get_rank()
@@ -355,8 +368,8 @@ class DeviceMeshTest(unittest.TestCase):
         direct_split_comm.all_reduce(duplicate_t, ReduceOp.SUM, False)
 
         # Device-aware synchronization
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
 
         # Verify the all_reduce result
         torch.testing.assert_close(t, duplicate_t)

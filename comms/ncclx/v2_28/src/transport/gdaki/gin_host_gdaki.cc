@@ -344,13 +344,23 @@ static inline T gdaki_round_up(T x, T y) {
   return ((x + y - 1) / y) * y;
 }
 
-static ncclResult_t gdakiFindDevice(char *ibDevName, struct ibv_device **outIbDev) {
+static ncclResult_t __attribute__((unused)) gdakiFindDevice(char *ibDevName, struct ibv_device **outIbDev) {
   ncclResult_t status = ncclSuccess;
   int numOfDevice;
   struct ibv_device **devList = nullptr;
   struct ibv_device *ibDev = nullptr;
 
   assert(ibDevName != nullptr);
+
+  // NCCL_IB_DATA_DIRECT=1 appends "_dma" to device names (e.g. "mlx5_0_dma"),
+  // but kernel verbs only knows "mlx5_0". Strip the suffix before comparing.
+  static const char dmaSuffix[] = "_dma";
+  static const size_t sufLen = strlen(dmaSuffix);
+  size_t nameLen = strlen(ibDevName);
+  size_t cmpLen = nameLen;
+  if (nameLen > sufLen && strcmp(ibDevName + nameLen - sufLen, dmaSuffix) == 0) {
+    cmpLen = nameLen - sufLen;
+  }
 
   NCCLCHECK(wrap_ibv_get_device_list(&devList, &numOfDevice));
 
@@ -362,13 +372,14 @@ static ncclResult_t gdakiFindDevice(char *ibDevName, struct ibv_device **outIbDe
 
   for (int i = 0; i < numOfDevice; ++i) {
     struct ibv_device *ibDev_ = devList[i];
-    if (!strcmp(wrap_ibv_get_device_name(ibDev_), ibDevName)) {
+    const char *kernelName = wrap_ibv_get_device_name(ibDev_);
+    if (strlen(kernelName) == cmpLen && strncmp(kernelName, ibDevName, cmpLen) == 0) {
       ibDev = ibDev_;
       break;
     }
   }
   if (!ibDev) {
-    WARN("IB device %s not found", ibDevName);
+    WARN("IB device %s not found (cmpLen=%zu)", ibDevName, cmpLen);
     status = ncclInvalidArgument;
     goto fail;
   }
@@ -584,11 +595,10 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
 
   DOCACHECKGOTO(doca_gpu_create(pciBusId, &gdaki_ctx->gdev), docaStatus, status, out);
 
-  // Find the IB/RoCE device by name
-  NCCLCHECKGOTO(gdakiFindDevice(props.name, &gdaki_ctx->ib_dev), status, out);
-
-  // Open the IB context
-  NCCLCHECKGOTO(wrap_ibv_open_device(&gdaki_ctx->ib_ctx, gdaki_ctx->ib_dev), status, out);
+  // Use net_ib's shared ibv_context (set by ncclGinIbGdakiCreateContext).
+  // This is required on aarch64 SMMU platforms (e.g. GB300) where a separately
+  // opened ibv_context cannot register cudaMalloc memory via nvidia-peermem.
+  gdaki_ctx->ib_ctx = (struct ibv_context *)cComm->ibvCtx;
 
   // Allocate the protection domain
   NCCLCHECKGOTO(wrap_ibv_alloc_pd(&gdaki_ctx->ib_pd, gdaki_ctx->ib_ctx), status, out);
@@ -933,7 +943,7 @@ ncclResult_t ncclGinGdakiDestroyContext(void *ginCtx) {
     DOCACHECK(doca_gpu_destroy(gdaki_ctx->gdev));
   }
   if (gdaki_ctx->ib_pd) NCCLCHECK(wrap_ibv_dealloc_pd(gdaki_ctx->ib_pd));
-  if (gdaki_ctx->ib_ctx) NCCLCHECK(wrap_ibv_close_device(gdaki_ctx->ib_ctx));
+  // ib_ctx is borrowed from net_ib (cComm->ibvCtx), do not close it here.
 
   if (gdaki_ctx->devHandle) free(gdaki_ctx->devHandle);
 
@@ -1000,6 +1010,66 @@ ncclResult_t ncclGinGdakiDeregMrSym(void *collComm, void *mhandle) {
 
   memset(gdaki_mhandle, 0, sizeof(*gdaki_mhandle));
 
+  free(gdaki_mhandle);
+
+  return ncclSuccess;
+}
+
+// Local-only MR registration - NO allGather, only lkey, rkeys=NULL
+// Used for source buffers that don't need to be accessed by remote peers.
+// The resulting handle can only be used as a source buffer for RDMA writes.
+ncclResult_t ncclGinGdakiRegMrLocal(void *collComm, void *data, size_t size, int type,
+                                    void **mhandle, void **ginHandle) {
+  struct ncclGinIbCollComm *cComm = (struct ncclGinIbCollComm *)collComm;
+  struct gdaki_context *gdaki_ctx = (struct gdaki_context *)cComm->ginCtx;
+  struct ibv_mr *mr = nullptr;
+
+  // Allocate device-side handle (no rkeys array needed for local-only registration)
+  GdakiHostGPUMemHandle<struct ncclGinGdakiMemHandle> *gdaki_mhandle_hd_mhandle =
+    new GdakiHostGPUMemHandle<struct ncclGinGdakiMemHandle>(1);
+
+  struct gdaki_mem_handle *gdaki_mhandle = nullptr;
+  gdaki_mhandle = (struct gdaki_mem_handle *)calloc(1, sizeof(*gdaki_mhandle));
+  EQCHECK(gdaki_mhandle, nullptr);
+
+  // Local IB memory registration - uses parent's ib_pd (shared via ginState)
+  // Only need LOCAL_WRITE and REMOTE_READ for source buffers
+  NCCLCHECK(gdakiRegMr(&mr, gdaki_ctx->ib_pd, data, size,
+                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ));
+
+  // NO allGather - this is the key difference from regMrSym
+  // Populate handle with lkey only, rkeys = NULL (cannot be used as destination)
+  gdaki_mhandle_hd_mhandle->host_buf->rkeys = nullptr;
+  gdaki_mhandle_hd_mhandle->host_buf->lkey = htobe32(mr->lkey);
+  NCCLCHECK(gdaki_mhandle_hd_mhandle->copy_h_to_d());
+
+  gdaki_mhandle->type = type;
+  gdaki_mhandle->mr = mr;
+  gdaki_mhandle->gdaki_mhandle_hd_mhandle = gdaki_mhandle_hd_mhandle;
+  gdaki_mhandle->rkeys_hd_mhandle = nullptr;  // No rkeys for local-only registration
+
+  INFO(NCCL_NET, "[%d] Local MR registered: data=%p, size=%zu, lkey(be32)=%#x",
+       cComm->rank, data, size, htobe32(mr->lkey));
+
+  *mhandle = (void *)gdaki_mhandle;
+  *ginHandle = (void *)gdaki_mhandle_hd_mhandle->gpu_buf;
+
+  return ncclSuccess;
+}
+
+ncclResult_t ncclGinGdakiDeregMrLocal(void *collComm, void *mhandle) {
+  struct ncclGinIbCollComm *cComm = (struct ncclGinIbCollComm *)collComm;
+  struct gdaki_mem_handle *gdaki_mhandle = (struct gdaki_mem_handle *)mhandle;
+  struct ibv_mr *mr = gdaki_mhandle->mr;
+
+  INFO(NCCL_NET, "[%d] Unregistering local MR: lkey(be32)=%#x", cComm->rank, htobe32(mr->lkey));
+
+  NCCLCHECK(wrap_ibv_dereg_mr(mr));
+
+  delete gdaki_mhandle->gdaki_mhandle_hd_mhandle;
+  // Note: rkeys_hd_mhandle is nullptr for local-only registrations, no need to delete
+
+  memset(gdaki_mhandle, 0, sizeof(*gdaki_mhandle));
   free(gdaki_mhandle);
 
   return ncclSuccess;

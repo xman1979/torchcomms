@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "comms/ctran/interfaces/IBootstrap.h" // @manual
+#include "comms/common/bootstrap/IBootstrap.h"
 
 #if defined(USE_ROCM)
 #include "rccl.h" // @manual
@@ -13,29 +13,13 @@
 namespace meta::comms {
 
 // Only used in unit tests for the components in /comms/common
-class TestBaselineBootstrap : public ::ctran::bootstrap::IBootstrap {
+class TestBaselineBootstrap : public IBootstrap {
  public:
   explicit TestBaselineBootstrap(ncclComm_t comm) : comm_(comm) {}
   virtual folly::SemiFuture<int>
   allGather(void* buf, int len, int rank, int nranks) override;
 
-  virtual folly::SemiFuture<int> allGatherIntraNode(
-      void* buf,
-      int len,
-      int localRank,
-      int localNranks,
-      std::vector<int> localRankToCommRank) override {
-    throw std::runtime_error("Not implemented");
-  }
-
   virtual folly::SemiFuture<int> barrier(int rank, int nranks) override {
-    throw std::runtime_error("Not implemented");
-  }
-
-  virtual folly::SemiFuture<int> barrierIntraNode(
-      int localRank,
-      int localNranks,
-      std::vector<int> localRankToCommRank) override {
     throw std::runtime_error("Not implemented");
   }
 

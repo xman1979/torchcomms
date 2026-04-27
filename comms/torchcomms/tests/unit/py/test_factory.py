@@ -3,12 +3,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import os
-import tempfile
 import unittest
 
 import torch
 import torchcomms
-from torchcomms._comms import _get_store
 
 
 class TestFactory(unittest.TestCase):
@@ -24,7 +22,7 @@ class TestFactory(unittest.TestCase):
 
         comm = torchcomms.new_comm("gloo", torch.device("cpu"), "my_comm")
         comm.finalize()
-        backend = comm.unsafe_get_backend()
+        backend = comm.get_backend_impl()
         print(backend)
 
         from torchcomms._comms_gloo import TorchCommGloo
@@ -35,13 +33,3 @@ class TestFactory(unittest.TestCase):
     def test_factory_missing(self):
         with self.assertRaisesRegex(ModuleNotFoundError, "failed to find backend"):
             torchcomms.new_comm("invalid", torch.device("cuda"), "my_comm")
-
-    def test_duplciate_store(self):
-        _, path = tempfile.mkstemp()
-        os.environ["TORCHCOMM_STORE_PATH"] = path
-
-        _get_store("custom_backend", "name")
-        with self.assertRaisesRegex(
-            RuntimeError, r"Store prefix has been reused.*custom_backend.*name"
-        ):
-            _get_store("custom_backend", "name")

@@ -58,26 +58,48 @@ commResult_t checkEpochLock(CtranIb* ctranIb) {
   return commSuccess;
 }
 
-CtranIbSingleton& CtranIbSingleton::getInstance() {
-  static CtranIbSingleton s;
-  return s;
+// folly::Singleton instance for CtranIbSingleton
+static folly::Singleton<CtranIbSingleton> ctranIbSingleton;
+
+std::shared_ptr<CtranIbSingleton> CtranIbSingleton::getInstance() {
+  return ctranIbSingleton.try_get();
 }
 
 CtranIbSingleton::CtranIbSingleton() {
   auto ibvInitResult = ibverbx::ibvInit();
-  FOLLY_EXPECTED_CHECKTHROW_EX_NOCOMM(ibvInitResult);
+  try {
+    FOLLY_EXPECTED_CHECKTHROW_EX_NOCOMM(ibvInitResult);
+  } catch (const ctran::utils::Exception& e) {
+    CLOGF(
+        ERR,
+        "CTRAN-IB: Failed to initialize ibverbs (libibverbs.so): {}. "
+        "Set NCCL_CTRAN_BACKENDS=nvl,socket to use alternative backends.",
+        e.what());
+    throw;
+  }
   auto maybeDeviceList = ibverbx::IbvDevice::ibvGetDeviceList(
       NCCL_IB_HCA, NCCL_IB_HCA_PREFIX, CTRAN_IB_ANY_PORT, NCCL_IB_DATA_DIRECT);
-  FOLLY_EXPECTED_CHECKTHROW_EX_NOCOMM(maybeDeviceList);
+  try {
+    FOLLY_EXPECTED_CHECKTHROW_EX_NOCOMM(maybeDeviceList);
+  } catch (const ctran::utils::Exception& e) {
+    CLOGF(
+        ERR,
+        "CTRAN-IB: Failed to get InfiniBand device list: {}. "
+        "Set NCCL_CTRAN_BACKENDS=nvl,socket to use alternative backends.",
+        e.what());
+    throw;
+  }
   ibvDevices = std::move(*maybeDeviceList);
 
   if (ibvDevices.size() < NCCL_CTRAN_IB_DEVICES_PER_RANK) {
-    CLOGF(
-        WARN,
-        "CTRAN-IB : active device found {} is less than requested device count {}",
+    std::string msg = fmt::format(
+        "CTRAN-IB: Found {} InfiniBand device(s) but {} required "
+        "(NCCL_CTRAN_IB_DEVICES_PER_RANK). "
+        "Set NCCL_CTRAN_BACKENDS=nvl,socket to use alternative backends.",
         ibvDevices.size(),
         NCCL_CTRAN_IB_DEVICES_PER_RANK);
-    throw std::bad_alloc();
+    CLOGF(ERR, msg);
+    throw ctran::utils::Exception(msg, commSystemError);
   }
 
   for (auto i = 0; i < this->ibvDevices.size(); i++) {
@@ -96,8 +118,6 @@ CtranIbSingleton::CtranIbSingleton() {
   for (auto& p : this->devBytes_) {
     p = std::make_unique<std::atomic<size_t>>(0);
   }
-
-  return;
 }
 
 commResult_t CtranIbSingleton::destroy() {
@@ -185,8 +205,9 @@ const ibverbx::IbvPd& CtranIbSingleton::getIbvPd(size_t idx) const {
 }
 
 IVerbsWrapper* CtranIbSingleton::getVerbsPtr() {
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
-  return s.verbsUtils->verbsPtr.get();
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
+  return s->verbsUtils->verbsPtr.get();
 }
 
 void CtranIbSingleton::recordDeviceTraffic(
@@ -238,8 +259,9 @@ void CtranIbSingleton::stopIbAsyncEventHandler() {
 
 /* static */
 bool CtranIbSingleton::getStopIbAsyncEventHandlerFlag() {
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
-  return s.stopIbAsyncEventHandlerFlag.load();
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
+  return s->stopIbAsyncEventHandlerFlag.load();
 }
 
 /*
@@ -251,16 +273,17 @@ void CtranIbSingleton::ibAsyncEventHandler(const int cudaDev) {
   FB_CUDACHECKIGNORE(cudaSetDevice(cudaDev));
   commNamedThreadStart("CTranIbAsyncEventHandler");
 
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
   auto verbsPtr = CtranIbSingleton::getVerbsPtr();
-  const auto devName = s.ibvDevices[cudaDev].device()->name;
-  const auto port = s.ibvDevices[cudaDev].port();
+  const auto devName = s->ibvDevices[cudaDev].device()->name;
+  const auto port = s->ibvDevices[cudaDev].port();
 
   auto ib = std::make_unique<IbUtils>();
   std::string errorMessage = "initialized";
 
-  while (!s.stopIbAsyncEventHandlerFlag && !ib->linkDownTimeout()) {
-    auto ibvContext = s.ibvDevices[cudaDev].context();
+  while (!s->stopIbAsyncEventHandlerFlag && !ib->linkDownTimeout()) {
+    auto ibvContext = s->ibvDevices[cudaDev].context();
     // this call will block until there is an async event or error
     if (commSuccess != ib->pollForAsyncEvent(ibvContext, verbsPtr)) {
       return;
@@ -289,9 +312,9 @@ void CtranIbSingleton::ibAsyncEventHandler(const int cudaDev) {
 
 CtranIb::CtranIb(
     CtranComm* comm,
-    CtranCtrlManager* ctrlMgr,
     std::optional<bool> enableLocalFlush,
-    std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory)
+    std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory,
+    std::optional<int> maxNumCqe)
     : comm(comm) {
   // enableLocalFlush: whether to support local flush. If true, CtranIb
   // will enable resource required for local flush.
@@ -315,12 +338,12 @@ CtranIb::CtranIb(
       comm->statex_->cudaDev(),
       comm->statex_->commHash(),
       comm->statex_->commDesc(),
-      ctrlMgr,
       enableLocalFlush_,
       BootstrapMode::kDefaultServer,
       std::nullopt,
       ::ctran::utils::createAbort(/*enabled=*/false),
-      socketFactory);
+      socketFactory,
+      maxNumCqe);
   CLOGF_SUBSYS(
       INFO,
       INIT,
@@ -334,7 +357,6 @@ CtranIb::CtranIb(
     int cudaDev,
     uint64_t commHash,
     const std::string& commDesc,
-    CtranCtrlManager* ctrlMgr,
     // FIXME: Unlike IB with comm, we require user to always specify
     // enableLocalFlush because we don't have access to statex->cudaArch() for
     // default config detection
@@ -342,19 +364,20 @@ CtranIb::CtranIb(
     const BootstrapMode bootstrapMode,
     std::optional<const SocketServerAddr*> qpServerAddr,
     std::shared_ptr<Abort> abortCtrl,
-    std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory) {
+    std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory,
+    std::optional<int> maxNumCqe) {
   init(
       nullptr,
       rank,
       cudaDev,
       commHash,
       commDesc,
-      ctrlMgr,
       enableLocalFlush,
       bootstrapMode,
       qpServerAddr,
       abortCtrl,
-      socketFactory);
+      socketFactory,
+      maxNumCqe);
 
   CLOGF_SUBSYS(
       INFO,
@@ -373,12 +396,12 @@ void CtranIb::init(
     int cudaDev,
     uint64_t commHash,
     const std::string& commDesc,
-    CtranCtrlManager* ctrlMgr,
     bool enableLocalFlush,
     const BootstrapMode bootstrapMode,
     std::optional<const SocketServerAddr*> qpServerAddr,
     std::shared_ptr<Abort> abortCtrl,
-    std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory) {
+    std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory,
+    std::optional<int> maxNumCqe) {
   bool foundPort = false;
   this->comm = comm;
   this->rank = rank;
@@ -386,7 +409,6 @@ void CtranIb::init(
   this->cudaDev = cudaDev;
   this->commHash = commHash;
   this->commDesc = commDesc;
-  this->ctrlMgr = ctrlMgr;
   this->ncclLogData = CommLogData{
       .commId = comm ? comm->logMetaData_.commId : 0,
       .commHash = commHash,
@@ -399,9 +421,10 @@ void CtranIb::init(
   this->cqs.reserve(NCCL_CTRAN_IB_DEVICES_PER_RANK);
   FB_COMMCHECKTHROW_EX(this->setPgToTrafficClassMap(), this->ncclLogData);
 
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
 
-  const bool dmaBufSupported = s.getDevToDmaBufSupport(cudaDev);
+  const bool dmaBufSupported = s->getDevToDmaBufSupport(cudaDev);
 
   if (socketFactory != nullptr) {
     socketFactory_ = socketFactory; // ISocketFactory explicitly specified.
@@ -441,10 +464,10 @@ void CtranIb::init(
 
   // assume NCCL_CTRAN_IB_DEVICES_PER_RANK contexts per cuda device
   if (cudaDev * NCCL_CTRAN_IB_DEVICES_PER_RANK * NCCL_CTRAN_IB_DEVICE_STRIDE >=
-      s.ibvDevices.size()) {
+      s->ibvDevices.size()) {
     std::string msg = "cudaDev (" + std::to_string(cudaDev) +
         ") * NCCL_CTRAN_IB_DEVICES_PER_RANK * NCCL_CTRAN_IB_DEVICE_STRIDE exceeds the number of contexts (" +
-        std::to_string(s.ibvDevices.size()) + ")";
+        std::to_string(s->ibvDevices.size()) + ")";
     CLOGF(ERR, "CTRAN-IB: {}", msg);
     throw ::ctran::utils::Exception(
         msg.c_str(),
@@ -458,8 +481,8 @@ void CtranIb::init(
     int singletonDevIdx =
         cudaDev * NCCL_CTRAN_IB_DEVICES_PER_RANK * NCCL_CTRAN_IB_DEVICE_STRIDE +
         device;
-    devices[device].ibvDevice = &s.ibvDevices[singletonDevIdx];
-    devices[device].ibvPd = &s.getIbvPd(singletonDevIdx);
+    devices[device].ibvDevice = &s->ibvDevices[singletonDevIdx];
+    devices[device].ibvPd = &s->getIbvPd(singletonDevIdx);
 
     ibverbx::ibv_device_attr devAttr;
     auto maybeDeviceAttr = devices[device].ibvDevice->queryDevice();
@@ -469,13 +492,13 @@ void CtranIb::init(
     // Found available port for the given device
     for (int port = 1; port <= devAttr.phys_port_cnt; port++) {
       ibverbx::ibv_port_attr portAttr;
-      auto maybePortAttr = s.ibvDevices[singletonDevIdx].queryPort(port);
+      auto maybePortAttr = s->ibvDevices[singletonDevIdx].queryPort(port);
       if (maybePortAttr.hasError()) {
         CLOGF(
             WARN,
             "CTRAN-IB : Unable to query port {} on device {}",
             port,
-            s.ibvDevices[singletonDevIdx].device()->name);
+            s->ibvDevices[singletonDevIdx].device()->name);
         continue;
       }
       portAttr = std::move(*maybePortAttr);
@@ -486,10 +509,10 @@ void CtranIb::init(
           portAttr.link_layer != ibverbx::IBV_LINK_LAYER_ETHERNET) {
         continue;
       }
-      if (s.ibvDevices[singletonDevIdx].port() == CTRAN_IB_ANY_PORT ||
-          port == s.ibvDevices[singletonDevIdx].port()) {
+      if (s->ibvDevices[singletonDevIdx].port() == CTRAN_IB_ANY_PORT ||
+          port == s->ibvDevices[singletonDevIdx].port()) {
         devices[device].port = port;
-        devices[device].devName = s.ibvDevices[singletonDevIdx].device()->name;
+        devices[device].devName = s->ibvDevices[singletonDevIdx].device()->name;
         foundPort = true;
         break;
       }
@@ -500,7 +523,7 @@ void CtranIb::init(
           INFO,
           INIT,
           "CTRAN-IB: using device {}, port {} commHash {:x} commDesc {}",
-          s.ibvDevices[singletonDevIdx].device()->name,
+          s->ibvDevices[singletonDevIdx].device()->name,
           devices[device].port,
           commHash,
           commDesc);
@@ -508,10 +531,10 @@ void CtranIb::init(
       CLOGF(
           WARN,
           "CTRAN-IB : No active port found on device {}. Disable IB backend.",
-          s.ibvDevices[singletonDevIdx].device()->name);
+          s->ibvDevices[singletonDevIdx].device()->name);
       throw ::ctran::utils::Exception(
           std::string("CTRAN-IB : No active port found on device ") +
-              s.ibvDevices[singletonDevIdx].device()->name,
+              s->ibvDevices[singletonDevIdx].device()->name,
           commSystemError,
           this->rank,
           this->commHash,
@@ -534,6 +557,24 @@ void CtranIb::init(
     maxCqe = devAttr.max_cqe;
 #endif
 
+    // Cap CQ size to avoid excessive memory usage.
+    // Per-transport maxNumCqe takes precedence over env
+    // NCCL_CTRAN_IB_MAX_NUM_CQE. Default -1 (or nullopt) to use the
+    // device-reported maximum.
+    const int cqeCap = maxNumCqe.value_or(NCCL_CTRAN_IB_MAX_NUM_CQE);
+    if (cqeCap > 0 && maxCqe > cqeCap) {
+      CLOGF(
+          INFO,
+          "CTRAN-IB: Capping CQ size from {} to {} ({}) to reduce memory overhead",
+          maxCqe,
+          cqeCap,
+          maxNumCqe.has_value() ? "per-transport"
+                                : "NCCL_CTRAN_IB_MAX_NUM_CQE");
+      maxCqe = cqeCap;
+    } else {
+      CLOGF(INFO, "CTRAN-IB: CQ size is {}", maxCqe);
+    }
+
     // Skip lock for cq and localVc in constructor since no other thread can
     // access it yet.
     auto maybeCq =
@@ -550,7 +591,7 @@ void CtranIb::init(
 
   // Record reference to CtranIbSingleton
   if (comm) {
-    s.commRef(comm);
+    s->commRef(comm);
     // TODO: we would need track non-comm transport usage and its leak as well.
     // It is because, e.g., if FTAR doesn't release transport at failure,
     // ibv_destroy_pd will fail.
@@ -685,10 +726,6 @@ void CtranIb::bootstrapStart(
   this->listenThread = std::thread{bootstrapAccept, this};
 }
 
-void CtranIb::regCtrlCb(std::unique_ptr<CtranCtrlManager>& ctrlMgr) {
-  // no control message callback to register; no-op.
-}
-
 std::string CtranIb::getIbDevName(int device) const {
   return std::string(this->devices.at(device).devName);
 }
@@ -698,7 +735,8 @@ int CtranIb::getIbDevPort(int device) const {
 }
 
 CtranIb::~CtranIb(void) {
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
 
   if (bootstrapMode != BootstrapMode::kExternal) {
     listenSocket->shutdown();
@@ -717,7 +755,7 @@ CtranIb::~CtranIb(void) {
 
   // this comm is being destroyed, thus dereference from CtranIbSingleton
   if (this->comm) {
-    s.commDeref(this->comm);
+    s->commDeref(this->comm);
   }
 
   // Do not throw exception in destructor to avoid early termination in stack
@@ -803,8 +841,9 @@ commResult_t CtranIb::regMem(
     return commSystemError;
   }
 
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
-  const auto dmaBufSupport = s.getDevToDmaBufSupport(cudaDev);
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
+  const auto dmaBufSupport = s->getDevToDmaBufSupport(cudaDev);
 
   bool useDmaBuf = dmaBufSupport && NCCL_CTRAN_IB_DMABUF_ENABLE;
 
@@ -826,7 +865,7 @@ commResult_t CtranIb::regMem(
     const auto pdIdx =
         cudaDev * NCCL_CTRAN_IB_DEVICES_PER_RANK * NCCL_CTRAN_IB_DEVICE_STRIDE +
         device;
-    const auto& pd = s.getIbvPd(pdIdx);
+    const auto& pd = s->getIbvPd(pdIdx);
     int dmaBufFd = useDmaBuf
         ? ctran::utils::getCuMemDmaBufFd(buf, len, pd.useDataDirect())
         : -1;
@@ -872,7 +911,7 @@ commResult_t CtranIb::regMem(
   }
 
   *ibRegElem = reinterpret_cast<void*>(mrs);
-  s.incActiveRegCount();
+  s->incActiveRegCount();
 
   return res;
 
@@ -883,8 +922,9 @@ fail:
 commResult_t CtranIb::deregMem(void* ibRegElem) {
   auto mrs = reinterpret_cast<std::vector<ibverbx::IbvMr>*>(ibRegElem);
 
-  CtranIbSingleton& s = CtranIbSingleton::getInstance();
-  s.decActiveRegCount();
+  auto s = CtranIbSingleton::getInstance();
+  CHECK_VALID_IB_SINGLETON(s);
+  s->decActiveRegCount();
 
   delete mrs;
 
@@ -985,9 +1025,6 @@ commResult_t CtranIb::initRemoteTransStates(void) {
     std::unique_lock<std::mutex> lock(localVcMutex);
     localVc = std::make_unique<LocalVirtualConn>(devices, ncclLogData);
   }
-
-  cqMutex.unlock();
-  localVcMutex.unlock();
 
   return commSuccess;
 }
@@ -1385,7 +1422,7 @@ std::shared_ptr<CtranIbVirtualConn> CtranIb::createVc(int peerRank) {
   }
   // Create a new VC and assign
   it.first->second = std::make_shared<CtranIbVirtualConn>(
-      devices, peerRank, comm, ctrlMgr, getPgToTrafficClassValue(), cudaDev);
+      devices, peerRank, comm, getPgToTrafficClassValue(), cudaDev);
   return it.first->second;
 }
 

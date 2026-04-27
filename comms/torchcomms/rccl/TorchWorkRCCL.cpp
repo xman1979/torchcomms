@@ -2,8 +2,9 @@
 
 #include "comms/torchcomms/rccl/TorchWorkRCCL.hpp"
 #include <ATen/hip/HIPContext.h> // @manual
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/rccl/TorchCommRCCL.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/TracingGuard.hpp"
 
 namespace torch::comms {
 
@@ -134,7 +135,8 @@ TorchWorkRCCL::WorkStatus TorchWorkRCCL::checkStatus() {
 
     // Check if the operation has timed out
     if (elapsed_milliseconds > timeout_ms_) {
-      // Operation has timed out
+      TC_LOG(ERROR, comm_.get()) << "Operation timed out after "
+                                 << elapsed_milliseconds.count() << " ms";
       setStatus(WorkStatus::TIMEDOUT);
     }
   } else {
@@ -145,6 +147,8 @@ TorchWorkRCCL::WorkStatus TorchWorkRCCL::checkStatus() {
 }
 
 void TorchWorkRCCL::wait() {
+  runWaitHooks();
+
   // If already completed, return immediately
   WorkStatus local_state = status();
   if (local_state == WorkStatus::COMPLETED ||
@@ -152,7 +156,7 @@ void TorchWorkRCCL::wait() {
     return;
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       std::string(comm_->getCommName()),
       comm_->getSize(),
       "wait",
@@ -160,8 +164,7 @@ void TorchWorkRCCL::wait() {
 
   // Get the current stream using the device from the comm object
   hipStream_t current_stream =
-      comm_->getHipApi()->getCurrentHIPStreamMasqueradingAsCUDA(
-          comm_->device_.index());
+      comm_->getHipApi()->getCurrentCUDAStream(comm_->device_.index());
 
   // Add a dependency from the work's stream to the current stream
   // This makes the current stream wait for the end_event_ recorded on the

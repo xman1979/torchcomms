@@ -114,59 +114,19 @@ class IbgdaBenchmarkFixture : public MpiBaseTestFixture {
     return ss.str();
   }
 
-  // Run put_signal_non_adaptive + wait_local benchmark using batched kernel
-  // Returns bandwidth, excludes kernel launch overhead
-  float runPutSignalNonAdaptiveBenchmark(
+  // Run put + signal + counter benchmark using batched kernel. Populates
+  // latencyUs, excludes kernel launch overhead.
+  void runPutSignalBenchmark(
       P2pIbgdaTransportDevice* deviceTransportPtr,
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
+      const IbgdaRemoteBuffer& remoteSignalBuf,
+      const IbgdaLocalBuffer& localCounterBuf,
       const IbgdaBenchmarkConfig& config,
       unsigned long long* d_totalCycles,
       float& latencyUs) {
     constexpr int kSignalId = 0;
-
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-
-    // Only rank 0 (sender) runs the batched benchmark
-    if (globalRank == 0) {
-      launchIbgdaPutSignalNonAdaptiveWaitLocalBatch(
-          deviceTransportPtr,
-          localBuf,
-          remoteBuf,
-          config.nBytes,
-          kSignalId,
-          kIbgdaBatchIters,
-          d_totalCycles,
-          stream_);
-      CUDA_CHECK(cudaStreamSynchronize(stream_));
-
-      unsigned long long totalCycles;
-      CUDA_CHECK(cudaMemcpy(
-          &totalCycles,
-          d_totalCycles,
-          sizeof(unsigned long long),
-          cudaMemcpyDeviceToHost));
-
-      latencyUs = cyclesToUs(totalCycles) / kIbgdaBatchIters;
-    }
-
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-
-    // Unidirectional bandwidth
-    float bandwidth_GBps = (config.nBytes / 1e9f) / (latencyUs / 1e6f);
-    return bandwidth_GBps;
-  }
-
-  // Run put_signal (adaptive-safe) + wait_local benchmark using batched kernel
-  // Returns bandwidth, excludes kernel launch overhead
-  float runPutSignalBenchmark(
-      P2pIbgdaTransportDevice* deviceTransportPtr,
-      const IbgdaLocalBuffer& localBuf,
-      const IbgdaRemoteBuffer& remoteBuf,
-      const IbgdaBenchmarkConfig& config,
-      unsigned long long* d_totalCycles,
-      float& latencyUs) {
-    constexpr int kSignalId = 0;
+    constexpr int kCounterId = 0;
 
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
@@ -177,14 +137,17 @@ class IbgdaBenchmarkFixture : public MpiBaseTestFixture {
           localBuf,
           remoteBuf,
           config.nBytes,
+          remoteSignalBuf,
           kSignalId,
+          localCounterBuf,
+          kCounterId,
           kIbgdaBatchIters,
           d_totalCycles,
           stream_);
-      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      CUDA_CHECK_VOID(cudaStreamSynchronize(stream_));
 
       unsigned long long totalCycles;
-      CUDA_CHECK(cudaMemcpy(
+      CUDA_CHECK_VOID(cudaMemcpy(
           &totalCycles,
           d_totalCycles,
           sizeof(unsigned long long),
@@ -194,10 +157,6 @@ class IbgdaBenchmarkFixture : public MpiBaseTestFixture {
     }
 
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-
-    // Unidirectional bandwidth
-    float bandwidth_GBps = (config.nBytes / 1e9f) / (latencyUs / 1e6f);
-    return bandwidth_GBps;
   }
 
   void printResultsTable(
@@ -264,10 +223,87 @@ class IbgdaBenchmarkFixture : public MpiBaseTestFixture {
 
   cudaStream_t stream_{};
   float clockRateGHz_{0.0f};
+
+  // Verify that a put+signal+counter method correctly transfers data to the
+  // remote peer. Fills the sender's buffer with fillPattern, zeros the
+  // receiver's buffer, runs exactly one put+signal+counter, then checks the
+  // receiver's buffer.
+  template <typename LaunchFn>
+  void verifyPutDataCorrectness(
+      LaunchFn launchFn,
+      P2pIbgdaTransportDevice* deviceTransportPtr,
+      void* localBufferPtr,
+      const IbgdaLocalBuffer& localBuf,
+      const IbgdaRemoteBuffer& remoteBuf,
+      std::size_t nbytes,
+      const IbgdaRemoteBuffer& remoteSignalBuf,
+      const IbgdaLocalBuffer& localCounterBuf,
+      uint8_t fillPattern,
+      const std::string& methodName) {
+    constexpr int kSignalId = 0;
+    constexpr int kCounterId = 0;
+
+    // Sender: fill source buffer with pattern
+    // Receiver: zero destination buffer
+    if (globalRank == 0) {
+      CUDA_CHECK_VOID(cudaMemset(localBufferPtr, fillPattern, nbytes));
+    } else {
+      CUDA_CHECK_VOID(cudaMemset(localBufferPtr, 0, nbytes));
+    }
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    // Sender: exactly one put+signal+counter (no warmup, no loop). The
+    // sender resets its local counter to 0 first so the kernel's spin sees
+    // the fresh increment.
+    if (globalRank == 0) {
+      CUDA_CHECK_VOID(
+          cudaMemsetAsync(localCounterBuf.ptr, 0, sizeof(uint64_t), stream_));
+      launchFn(
+          deviceTransportPtr,
+          localBuf,
+          remoteBuf,
+          nbytes,
+          remoteSignalBuf,
+          kSignalId,
+          localCounterBuf,
+          kCounterId,
+          stream_);
+      CUDA_CHECK_VOID(cudaStreamSynchronize(stream_));
+    }
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    // Receiver: verify data arrived correctly
+    if (globalRank == 1) {
+      std::vector<uint8_t> hostBuf(nbytes);
+      CUDA_CHECK_VOID(cudaMemcpy(
+          hostBuf.data(), localBufferPtr, nbytes, cudaMemcpyDeviceToHost));
+      bool correct = true;
+      for (std::size_t i = 0; i < nbytes; i++) {
+        if (hostBuf[i] != fillPattern) {
+          XLOGF(
+              ERR,
+              "{}: data mismatch at byte {}: expected 0x{:02X}, got 0x{:02X}",
+              methodName,
+              i,
+              fillPattern,
+              hostBuf[i]);
+          correct = false;
+          break;
+        }
+      }
+      EXPECT_TRUE(correct) << methodName
+                           << ": put data correctness check failed";
+      if (correct) {
+        XLOGF(INFO, "{}: data correctness OK ({} bytes)", methodName, nbytes);
+      }
+    }
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  }
 };
 
 TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
-  // Measures raw RDMA Write latency (put + wait_local)
+  // Measures raw RDMA Write latency (put + counter wait via companion QP)
   if (numRanks != 2) {
     XLOGF(INFO, "Skipping test: requires exactly 2 ranks, got {}", numRanks);
     return;
@@ -275,6 +311,7 @@ TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
 
   int peerRank = (globalRank == 0) ? 1 : 0;
   auto configs = getFullConfigs();
+  constexpr int kCounterId = 0;
 
   std::size_t maxBufferSize = 0;
   for (const auto& config : configs) {
@@ -285,8 +322,8 @@ TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
 
   try {
     MultipeerIbgdaTransportConfig transportConfig{
+        .numCounterSlots = 1,
         .cudaDevice = localRank,
-        .signalCount = 1,
     };
 
     auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
@@ -301,6 +338,13 @@ TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
     auto remoteDataBufs = transport.exchangeBuffer(localDataBuf);
     int peerIndex = (peerRank < globalRank) ? peerRank : (peerRank - 1);
     auto remoteDataBuf = remoteDataBufs[peerIndex];
+
+    // Counter buffer (local only — companion QP atomically increments via
+    // loopback when each put completes at the NIC).
+    DeviceBuffer counterBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, sizeof(uint64_t)));
+    auto localCounterBuf =
+        transport.registerBuffer(counterBuffer.get(), sizeof(uint64_t));
 
     P2pIbgdaTransportDevice* deviceTransportPtr =
         transport.getP2pTransportDevice(peerRank);
@@ -318,6 +362,13 @@ TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
     for (const auto& config : configs) {
       MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
+      // Reset counter buffer before each size — kernel uses an absolute
+      // expected sequence (1, 2, 3, ...) starting from 0.
+      if (globalRank == 0) {
+        CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, sizeof(uint64_t)));
+        CUDA_CHECK_VOID(cudaDeviceSynchronize());
+      }
+
       // Only rank 0 sends
       if (globalRank == 0) {
         launchIbgdaPutWaitLocalBatch(
@@ -325,6 +376,8 @@ TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
             localDataBuf,
             remoteDataBuf,
             config.nBytes,
+            localCounterBuf,
+            kCounterId,
             kIbgdaBatchIters,
             d_totalCycles,
             stream_);
@@ -367,7 +420,7 @@ TEST_F(IbgdaBenchmarkFixture, PutWaitLocal) {
 }
 
 TEST_F(IbgdaBenchmarkFixture, PutSignalWaitLocal) {
-  // Measures RDMA Write + atomic signal latency (put_signal + wait_local)
+  // Measures RDMA Write + atomic signal latency (put + signal + counter wait)
   if (numRanks != 2) {
     XLOGF(INFO, "Skipping test: requires exactly 2 ranks, got {}", numRanks);
     return;
@@ -376,6 +429,7 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalWaitLocal) {
   int peerRank = (globalRank == 0) ? 1 : 0;
   auto configs = getFullConfigs();
   constexpr int kSignalId = 0;
+  constexpr int kCounterId = 0;
 
   std::size_t maxBufferSize = 0;
   for (const auto& config : configs) {
@@ -386,8 +440,8 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalWaitLocal) {
 
   try {
     MultipeerIbgdaTransportConfig transportConfig{
+        .numCounterSlots = 1,
         .cudaDevice = localRank,
-        .signalCount = 1,
     };
 
     auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
@@ -402,6 +456,21 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalWaitLocal) {
     auto remoteDataBufs = transport.exchangeBuffer(localDataBuf);
     int peerIndex = (peerRank < globalRank) ? peerRank : (peerRank - 1);
     auto remoteDataBuf = remoteDataBufs[peerIndex];
+
+    // Allocate and exchange signal buffer (1 signal slot)
+    DeviceBuffer signalBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(signalBuffer.get(), 0, sizeof(uint64_t)));
+    auto localSignalBuf =
+        transport.registerBuffer(signalBuffer.get(), sizeof(uint64_t));
+    auto remoteSignalBufs = transport.exchangeBuffer(localSignalBuf);
+    auto remoteSignalBuf = remoteSignalBufs[peerIndex];
+
+    // Counter buffer (local only — companion QP atomically increments via
+    // loopback when each put+signal completes at the NIC).
+    DeviceBuffer counterBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, sizeof(uint64_t)));
+    auto localCounterBuf =
+        transport.registerBuffer(counterBuffer.get(), sizeof(uint64_t));
 
     P2pIbgdaTransportDevice* deviceTransportPtr =
         transport.getP2pTransportDevice(peerRank);
@@ -419,6 +488,13 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalWaitLocal) {
     for (const auto& config : configs) {
       MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
+      // Reset counter buffer before each size — kernel uses an absolute
+      // expected sequence (1, 2, 3, ...) starting from 0.
+      if (globalRank == 0) {
+        CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, sizeof(uint64_t)));
+        CUDA_CHECK_VOID(cudaDeviceSynchronize());
+      }
+
       // Only rank 0 sends
       if (globalRank == 0) {
         launchIbgdaPutSignalWaitLocalBatch(
@@ -426,7 +502,10 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalWaitLocal) {
             localDataBuf,
             remoteDataBuf,
             config.nBytes,
+            remoteSignalBuf,
             kSignalId,
+            localCounterBuf,
+            kCounterId,
             kIbgdaBatchIters,
             d_totalCycles,
             stream_);
@@ -481,14 +560,24 @@ TEST_F(IbgdaBenchmarkFixture, SignalOnly) {
 
   try {
     MultipeerIbgdaTransportConfig transportConfig{
+        .numCounterSlots = 1,
         .cudaDevice = localRank,
-        .signalCount = 1,
     };
 
     auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
     MultipeerIbgdaTransport transport(
         globalRank, numRanks, bootstrap, transportConfig);
     transport.exchange();
+
+    int peerIndex = (peerRank < globalRank) ? peerRank : (peerRank - 1);
+
+    // Allocate and exchange signal buffer (1 signal slot)
+    DeviceBuffer signalBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(signalBuffer.get(), 0, sizeof(uint64_t)));
+    auto localSignalBuf =
+        transport.registerBuffer(signalBuffer.get(), sizeof(uint64_t));
+    auto remoteSignalBufs = transport.exchangeBuffer(localSignalBuf);
+    auto remoteSignalBuf = remoteSignalBufs[peerIndex];
 
     P2pIbgdaTransportDevice* deviceTransportPtr =
         transport.getP2pTransportDevice(peerRank);
@@ -511,6 +600,7 @@ TEST_F(IbgdaBenchmarkFixture, SignalOnly) {
     if (globalRank == 0) {
       launchIbgdaSignalOnlyBatch(
           deviceTransportPtr,
+          remoteSignalBuf,
           kSignalId,
           kIbgdaBatchIters,
           d_totalCycles,
@@ -545,7 +635,8 @@ TEST_F(IbgdaBenchmarkFixture, SignalOnly) {
   }
 }
 
-// Benchmark comparing put_signal (adaptive-safe) vs put_signal_non_adaptive
+// put+signal+counter latency benchmark
+// Counter = put + signal + companion-QP counter loopback + local poll
 TEST_F(IbgdaBenchmarkFixture, PutSignalComparison) {
   if (numRanks != 2) {
     XLOGF(INFO, "Skipping test: requires exactly 2 ranks, got {}", numRanks);
@@ -554,8 +645,10 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalComparison) {
 
   int peerRank = (globalRank == 0) ? 1 : 0;
 
-  // Test a subset of sizes for comparison
+  // Test a range of sizes for comparison
   std::vector<IbgdaBenchmarkConfig> configs;
+  configs.push_back(
+      {.nBytes = 8, .numBlocks = 1, .numThreads = 32, .name = "8B"});
   configs.push_back(
       {.nBytes = 64, .numBlocks = 1, .numThreads = 32, .name = "64B"});
   configs.push_back(
@@ -577,8 +670,8 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalComparison) {
 
   try {
     MultipeerIbgdaTransportConfig transportConfig{
+        .numCounterSlots = 1,
         .cudaDevice = localRank,
-        .signalCount = 1,
     };
 
     auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
@@ -593,6 +686,20 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalComparison) {
     int peerIndex = (peerRank < globalRank) ? peerRank : (peerRank - 1);
     auto remoteDataBuf = remoteDataBufs[peerIndex];
 
+    // Allocate and exchange signal buffer (1 signal slot)
+    DeviceBuffer signalBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(signalBuffer.get(), 0, sizeof(uint64_t)));
+    auto localSignalBuf =
+        transport.registerBuffer(signalBuffer.get(), sizeof(uint64_t));
+    auto remoteSignalBufs = transport.exchangeBuffer(localSignalBuf);
+    auto remoteSignalBuf = remoteSignalBufs[peerIndex];
+
+    // Counter buffer (local only — companion QP loopback target).
+    DeviceBuffer counterBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, sizeof(uint64_t)));
+    auto localCounterBuf =
+        transport.registerBuffer(counterBuffer.get(), sizeof(uint64_t));
+
     P2pIbgdaTransportDevice* deviceTransportPtr =
         transport.getP2pTransportDevice(peerRank);
 
@@ -600,66 +707,66 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalComparison) {
     unsigned long long* d_totalCycles;
     CUDA_CHECK_VOID(cudaMalloc(&d_totalCycles, sizeof(unsigned long long)));
 
+    // --- Data correctness verification (before performance measurement) ---
+    for (std::size_t ci = 0; ci < configs.size(); ci++) {
+      auto& cfg = configs[ci];
+      // Different base pattern per size, offset by method index
+      uint8_t basePattern = static_cast<uint8_t>((ci + 1) * 3);
+
+      if (globalRank == 0) {
+        XLOGF(INFO, "Verifying put data correctness ({})...", cfg.name);
+      }
+
+      verifyPutDataCorrectness(
+          launchIbgdaPutSignalSingle,
+          deviceTransportPtr,
+          dataBuffer.get(),
+          localDataBuf,
+          remoteDataBuf,
+          cfg.nBytes,
+          remoteSignalBuf,
+          localCounterBuf,
+          static_cast<uint8_t>(basePattern + 1),
+          "put+signal+counter [" + cfg.name + "]");
+    }
+
     if (globalRank == 0) {
       XLOGF(
           INFO,
           "\n================================================================================");
-      XLOGF(INFO, "        put_signal vs put_signal_non_adaptive Comparison");
-      XLOGF(
-          INFO, "        (Using batched kernels - no kernel launch overhead)");
+      XLOGF(INFO, "    put+signal+counter latency");
+      XLOGF(INFO, "    (Using batched kernels - no kernel launch overhead)");
       XLOGF(
           INFO,
           "================================================================================");
-      XLOGF(
-          INFO,
-          "{:>10} {:>15} {:>15} {:>15} {:>15}",
-          "Size",
-          "Adaptive BW",
-          "NonAdapt BW",
-          "Adapt Lat",
-          "NonAdapt Lat");
-      XLOGF(
-          INFO,
-          "{:>10} {:>15} {:>15} {:>15} {:>15}",
-          "",
-          "(GB/s)",
-          "(GB/s)",
-          "(us)",
-          "(us)");
+      XLOGF(INFO, "{:>10} {:>18}", "Size", "Counter Lat (us)");
       XLOGF(
           INFO,
           "--------------------------------------------------------------------------------");
     }
 
     for (const auto& config : configs) {
-      float adaptiveLatency = 0.0f;
-      float nonAdaptiveLatency = 0.0f;
+      float counterLatency = 0.0f;
 
-      float adaptiveBw = runPutSignalBenchmark(
+      // Reset counter buffer before each size — kernel uses an absolute
+      // expected sequence (1, 2, 3, ...) starting from 0.
+      if (globalRank == 0) {
+        CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, sizeof(uint64_t)));
+        CUDA_CHECK_VOID(cudaDeviceSynchronize());
+      }
+
+      runPutSignalBenchmark(
           deviceTransportPtr,
           localDataBuf,
           remoteDataBuf,
+          remoteSignalBuf,
+          localCounterBuf,
           config,
           d_totalCycles,
-          adaptiveLatency);
-
-      float nonAdaptiveBw = runPutSignalNonAdaptiveBenchmark(
-          deviceTransportPtr,
-          localDataBuf,
-          remoteDataBuf,
-          config,
-          d_totalCycles,
-          nonAdaptiveLatency);
+          counterLatency);
 
       if (globalRank == 0) {
-        XLOGF(
-            INFO,
-            "{:>10} {:>15.2f} {:>15.2f} {:>15.1f} {:>15.1f}",
-            config.name,
-            adaptiveBw,
-            nonAdaptiveBw,
-            adaptiveLatency,
-            nonAdaptiveLatency);
+        XLOGF(INFO, "{:>10} {:>18.2f}", config.name, counterLatency);
       }
     }
 
@@ -667,20 +774,236 @@ TEST_F(IbgdaBenchmarkFixture, PutSignalComparison) {
       XLOGF(
           INFO,
           "================================================================================");
-      XLOGF(INFO, "Adaptive = put_signal (safe for adaptive routing networks)");
       XLOGF(
           INFO,
-          "NonAdaptive = put_signal_non_adaptive (faster, but unsafe with adaptive routing)");
+          "Counter = put + signal + counter (companion-QP loopback) + local poll");
       XLOGF(
           INFO,
           "================================================================================\n");
     }
+
+    CUDA_CHECK_VOID(cudaFree(d_totalCycles));
 
   } catch (const std::exception& e) {
     GTEST_SKIP() << "IBGDA transport not available: " << e.what();
   }
 }
 
+// Multi-peer counter fan-out: validates O(1) amortized scaling.
+//
+// Each rank puts to ALL other peers simultaneously.
+// Serial:   put()+signal()+counter to each peer with its OWN counter slot,
+//           then wait_counter on each slot serially — O(N) wait_counter calls
+// FanOut:   put() with signal+counter to all peers (all companion QPs
+//           atomically increment the SAME counter slot via loopback), then
+//           single wait_counter until slot reaches numPeers — O(1) wait
+//
+// Expected: FanOut per-iter latency stays roughly constant as numPeers grows,
+//           while Serial scales linearly with numPeers.
+TEST_F(IbgdaBenchmarkFixture, MultiPeerCounterFanOut) {
+  const int numPeers = numRanks - 1;
+  if (numPeers < 1) {
+    XLOGF(INFO, "Skipping test: requires >= 2 ranks, got {}", numRanks);
+    return;
+  }
+
+  constexpr std::size_t kDataSize = 64 * 1024; // 64KB per peer
+  constexpr int kSignalId = 0;
+  constexpr int kSharedCounterId = 0;
+
+  try {
+    MultipeerIbgdaTransportConfig transportConfig{
+        .numCounterSlots = 1,
+        .cudaDevice = localRank,
+    };
+
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    MultipeerIbgdaTransport transport(
+        globalRank, numRanks, bootstrap, transportConfig);
+    transport.exchange();
+
+    // Data buffer
+    DeviceBuffer dataBuffer(kDataSize);
+    auto localDataBuf = transport.registerBuffer(dataBuffer.get(), kDataSize);
+    auto remoteDataBufsVec = transport.exchangeBuffer(localDataBuf);
+
+    // Per-peer signal buffers (1 slot each)
+    DeviceBuffer signalBuffer(sizeof(uint64_t));
+    CUDA_CHECK_VOID(cudaMemset(signalBuffer.get(), 0, sizeof(uint64_t)));
+    auto localSignalBuf =
+        transport.registerBuffer(signalBuffer.get(), sizeof(uint64_t));
+    auto remoteSignalBufsVec = transport.exchangeBuffer(localSignalBuf);
+
+    // Counter buffer (local only). Sized for numPeers slots: the Serial path
+    // uses one slot per peer; the FanOut path uses slot 0 only (all
+    // companion QPs increment the same slot via loopback).
+    const std::size_t counterBytes = numPeers * sizeof(uint64_t);
+    DeviceBuffer counterBuffer(counterBytes);
+    CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, counterBytes));
+    auto localCounterBuf =
+        transport.registerBuffer(counterBuffer.get(), counterBytes);
+
+    // Copy per-peer remote buffer arrays to device memory
+    DeviceBuffer remoteDataBufsDevice(numPeers * sizeof(IbgdaRemoteBuffer));
+    CUDA_CHECK_VOID(cudaMemcpy(
+        remoteDataBufsDevice.get(),
+        remoteDataBufsVec.data(),
+        numPeers * sizeof(IbgdaRemoteBuffer),
+        cudaMemcpyHostToDevice));
+
+    DeviceBuffer remoteSignalBufsDevice(numPeers * sizeof(IbgdaRemoteBuffer));
+    CUDA_CHECK_VOID(cudaMemcpy(
+        remoteSignalBufsDevice.get(),
+        remoteSignalBufsVec.data(),
+        numPeers * sizeof(IbgdaRemoteBuffer),
+        cudaMemcpyHostToDevice));
+
+    P2pIbgdaTransportDevice* transportsBase = transport.getDeviceTransportPtr();
+    // Compute transport element stride from the base pointer returned by
+    // getP2pTransportDevice(). peerIndex 0 starts at transportsBase, so the
+    // distance from base to peerIndex=1 gives the element stride.
+    // For numPeers >= 2 we can measure it; for numPeers == 1, the stride is
+    // not used (only index [0] accessed) so any value is fine.
+    std::size_t transportStride = 0;
+    {
+      // peerIndexToRank(0) is rank 0 if globalRank > 0, else rank 1
+      int peerIdx0Rank = (0 < globalRank) ? 0 : 1;
+      auto* ptr0 = transport.getP2pTransportDevice(peerIdx0Rank);
+      transportStride = static_cast<std::size_t>(
+          reinterpret_cast<char*>(ptr0) -
+          reinterpret_cast<char*>(transportsBase));
+      if (transportStride == 0 && numPeers >= 2) {
+        // peerIdx0 == base; use peerIdx 1 instead
+        int peerIdx1Rank = (1 < globalRank) ? 1 : 2;
+        transportStride = static_cast<std::size_t>(
+            reinterpret_cast<char*>(
+                transport.getP2pTransportDevice(peerIdx1Rank)) -
+            reinterpret_cast<char*>(ptr0));
+      }
+    }
+
+    unsigned long long* d_totalCycles;
+    CUDA_CHECK_VOID(cudaMalloc(&d_totalCycles, sizeof(unsigned long long)));
+
+    // --- Run Serial (per-peer counter) path ---
+    float serialLatency = 0.0f;
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    if (globalRank == 0) {
+      launchMultiPeerSerialCounterFanOutBatch(
+          transportsBase,
+          transportStride,
+          numPeers,
+          localDataBuf,
+          static_cast<IbgdaRemoteBuffer*>(remoteDataBufsDevice.get()),
+          kDataSize,
+          static_cast<IbgdaRemoteBuffer*>(remoteSignalBufsDevice.get()),
+          kSignalId,
+          localCounterBuf,
+          kIbgdaBatchIters,
+          d_totalCycles,
+          stream_);
+      CUDA_CHECK_VOID(cudaStreamSynchronize(stream_));
+
+      unsigned long long totalCycles;
+      CUDA_CHECK_VOID(cudaMemcpy(
+          &totalCycles,
+          d_totalCycles,
+          sizeof(unsigned long long),
+          cudaMemcpyDeviceToHost));
+      serialLatency = cyclesToUs(totalCycles) / kIbgdaBatchIters;
+    }
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    // Reset counter buffer (Serial path used slots 0..numPeers-1; FanOut
+    // path uses slot 0 starting from 0)
+    CUDA_CHECK_VOID(cudaMemset(counterBuffer.get(), 0, counterBytes));
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    // --- Run shared counter fan-out path ---
+    float fanOutLatency = 0.0f;
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    if (globalRank == 0) {
+      launchMultiPeerCounterFanOutBatch(
+          transportsBase,
+          transportStride,
+          numPeers,
+          localDataBuf,
+          static_cast<IbgdaRemoteBuffer*>(remoteDataBufsDevice.get()),
+          kDataSize,
+          static_cast<IbgdaRemoteBuffer*>(remoteSignalBufsDevice.get()),
+          kSignalId,
+          localCounterBuf,
+          kSharedCounterId,
+          kIbgdaBatchIters,
+          d_totalCycles,
+          stream_);
+      CUDA_CHECK_VOID(cudaStreamSynchronize(stream_));
+
+      unsigned long long totalCycles;
+      CUDA_CHECK_VOID(cudaMemcpy(
+          &totalCycles,
+          d_totalCycles,
+          sizeof(unsigned long long),
+          cudaMemcpyDeviceToHost));
+      fanOutLatency = cyclesToUs(totalCycles) / kIbgdaBatchIters;
+    }
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    if (globalRank == 0) {
+      float delta = fanOutLatency - serialLatency;
+      XLOGF(
+          INFO,
+          "\n================================================================================");
+      XLOGF(
+          INFO,
+          "    Multi-Peer Counter Fan-Out ({} peers, {} per peer)",
+          numPeers,
+          formatSize(kDataSize));
+      XLOGF(
+          INFO,
+          "================================================================================");
+      XLOGF(
+          INFO, "  Serial (N wait_counter calls): {:>8.2f} us", serialLatency);
+      XLOGF(
+          INFO, "  FanOut (1 wait_counter call):  {:>8.2f} us", fanOutLatency);
+      XLOGF(INFO, "  Delta (FanOut - Serial):       {:>+8.2f} us", delta);
+      XLOGF(
+          INFO,
+          "  Serial / peer:                 {:>8.2f} us",
+          serialLatency / numPeers);
+      XLOGF(
+          INFO,
+          "  FanOut / peer (amortized):     {:>8.2f} us",
+          fanOutLatency / numPeers);
+      XLOGF(
+          INFO,
+          "--------------------------------------------------------------------------------");
+      XLOGF(
+          INFO,
+          "  Serial:  put+signal+counter (per-peer slot) + wait_counter per peer (O(N))");
+      XLOGF(
+          INFO,
+          "  FanOut:  put+signal+counter (shared slot) + single wait_counter (O(1))");
+      XLOGF(
+          INFO,
+          "  Batch iterations: {}, GPU clock: {:.2f} GHz",
+          kIbgdaBatchIters,
+          clockRateGHz_);
+      XLOGF(
+          INFO,
+          "================================================================================\n");
+    }
+
+    CUDA_CHECK_VOID(cudaFree(d_totalCycles));
+
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+}
 } // namespace comms::pipes::benchmark
 
 int main(int argc, char* argv[]) {

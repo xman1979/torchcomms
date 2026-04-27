@@ -2,7 +2,7 @@
 #include <oneapi/ccl.hpp>
 #include <stdexcept>
 #include <string>
-#include "comms/torchcomms/TorchCommLogging.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
 #include "comms/torchcomms/xccl/TorchCommXCCL.hpp"
 
 namespace torch::comms {
@@ -160,8 +160,8 @@ TorchCommXCCL::RedOpRAII TorchCommXCCL::getXcclReduceOp(
   }
 }
 
-void TorchCommXCCL::checkWorkQueue(bool isMainThread) {
-  TorchWorkXCCL::WorkStatus status = workq_.garbageCollect(isMainThread);
+void TorchCommXCCL::checkWorkQueue() {
+  TorchWorkXCCL::WorkStatus status = workq_.garbageCollect();
 
   switch (status) {
     case TorchWorkXCCL::WorkStatus::TIMEDOUT:
@@ -195,7 +195,10 @@ void TorchCommXCCL::timeoutWatchdog() noexcept {
     }
 
     // Check work objects for completion or timeout
-    checkWorkQueue(false);
+    checkWorkQueue();
+    if (shutdown_) {
+      break;
+    }
     if (comm_state_ != CommState::NORMAL &&
         options_.abort_process_on_timeout_or_error) {
       // Log the error and abort the process.  We cannot abort the XCCL
@@ -223,7 +226,7 @@ void TorchCommXCCL::checkInitialized() const {
 
 void TorchCommXCCL::checkAndAbortIfTimedOutOrError() {
   // First, check work queue status
-  checkWorkQueue(true);
+  checkWorkQueue();
 
   if (comm_state_ == CommState::TIMEOUT) {
     //    abortXcclComm(); // cannot abort oneCCL communicator
@@ -254,7 +257,17 @@ c10::intrusive_ptr<TorchWorkXCCL> TorchCommXCCL::createWork(
     const std::vector<at::Tensor>& inputTensors) {
   // Only create the work object without enqueuing it
   auto work = c10::make_intrusive<TorchWorkXCCL>(
-      shared_from_this(), stream, timeout, inputTensors, tracing_);
+      shared_from_this(), stream, timeout, inputTensors);
+  return work;
+}
+
+c10::intrusive_ptr<TorchWorkXCCL> TorchCommXCCL::createWork(
+    xpuStream_t stream,
+    std::chrono::milliseconds timeout,
+    const at::Tensor& inputTensor) {
+  // Single-tensor overload to avoid vector allocation
+  auto work = c10::make_intrusive<TorchWorkXCCL>(
+      shared_from_this(), stream, timeout, inputTensor);
   return work;
 }
 

@@ -1,10 +1,12 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include <string.h>
+#include <algorithm>
 #include <memory>
 
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/CtranAlgoConsts.h"
 #include "comms/ctran/utils/Alloc.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/TmpBufSegManager.h"
@@ -352,7 +354,7 @@ commResult_t CtranAlgo::initKernelResources() {
   comms::pipes::P2pNvlTransportOptions options{
       .dataBufferSize = NCCL_CTRAN_P2P_NVL_SHARED_DEVBUF_SIZE /
           NCCL_CTRAN_P2P_NVL_COPY_PIPELINE_DEPTH,
-      .chunkSize = 1024 * 512, // TODO: tune this
+      .chunkSize = NCCL_CTRAN_PIPES_NVL_CHUNK_SIZE,
       .pipelineDepth = NCCL_CTRAN_P2P_NVL_COPY_PIPELINE_DEPTH};
 
   for (int peer = 0; peer < nLocalRanks; peer++) {
@@ -363,13 +365,13 @@ commResult_t CtranAlgo::initKernelResources() {
 
     comms::pipes::LocalState localState{
         .dataBuffer = static_cast<char*>(devState_.localStagingBufsMap[peer]),
-        .stateBuffer = DeviceSpan<ChunkState>(
+        .receiverStateBuffer = DeviceSpan<ChunkState>(
             static_cast<ChunkState*>(devState_.localChunkStatesMap[peer]),
             CTRAN_P2P_NVL_DEVMEM_MAX_CHUNKS)};
 
     comms::pipes::RemoteState remoteState{
         .dataBuffer = static_cast<char*>(devState_.remoteStagingBufsMap[peer]),
-        .stateBuffer = DeviceSpan<ChunkState>(
+        .receiverStateBuffer = DeviceSpan<ChunkState>(
             static_cast<ChunkState*>(devState_.remoteChunkStatesMap[peer]),
             CTRAN_P2P_NVL_DEVMEM_MAX_CHUNKS)};
 
@@ -480,11 +482,8 @@ CtranAlgo::SharedResource::SharedResource(CtranComm* comm) {
         comm->logMetaData_);
   }
 
-  // Exchange IPC handle with all local ranks
-  // Note allGatherIntraNode can support allgather from all ranks in the same
-  // nvl Domain even if they are cross node. TODO: maybe rename
-  // allGatherIntraNode or create a new wrapper name to better reflect this.
-  auto resFuture = comm_->bootstrap_->allGatherIntraNode(
+  // Exchange IPC handle with all ranks in the NVL domain
+  auto resFuture = comm_->bootstrap_->allGatherNvlDomain(
       ipcDescs.data(),
       sizeof(ctran::utils::CtranIpcDesc),
       localRank,
@@ -517,7 +516,7 @@ CtranAlgo::SharedResource::SharedResource(CtranComm* comm) {
   // Ensure all local ranks have imported remote memory.
   // This is required to ensure no one destroys the local memory handle while
   // other ranks are still importing, which may fail.
-  resFuture = comm_->bootstrap_->barrierIntraNode(
+  resFuture = comm_->bootstrap_->barrierNvlDomain(
       localRank, nLocalRanks, statex->localRankToRanks());
   FB_COMMCHECKTHROW_EX(
       static_cast<commResult_t>(std::move(resFuture).get()),
@@ -631,14 +630,20 @@ static const std::unordered_map<std::string, enum NCCL_ALLGATHER_ALGO>
         {"ctdirect", NCCL_ALLGATHER_ALGO::ctdirect},
         {"ctring", NCCL_ALLGATHER_ALGO::ctring},
         {"ctrd", NCCL_ALLGATHER_ALGO::ctrd},
-        {"ctbrucks", NCCL_ALLGATHER_ALGO::ctbrucks}};
+        {"ctbrucks", NCCL_ALLGATHER_ALGO::ctbrucks},
+        {"ctgraph", NCCL_ALLGATHER_ALGO::ctgraph},
+        {"ctgraph_pipeline", NCCL_ALLGATHER_ALGO::ctgraph_pipeline},
+        {"ctgraph_ring", NCCL_ALLGATHER_ALGO::ctgraph_ring},
+        {"ctgraph_rd", NCCL_ALLGATHER_ALGO::ctgraph_rd}};
 
+// FIXME: consolidate ctranConfigCommAlgoOverride with the algo config
 commResult_t ctranConfigCommAlgoOverride(CtranComm* comm) {
   if (!ctranInitialized(comm)) {
     return commSuccess;
   }
 
-  if (std::strcmp(comm->config_.ncclAllGatherAlgo, "undefined") == 0) {
+  if (comm->config_.ncclAllGatherAlgo == nullptr ||
+      std::strcmp(comm->config_.ncclAllGatherAlgo, "undefined") == 0) {
     return commSuccess;
   }
 
@@ -809,14 +814,18 @@ commResult_t CtranAlgo::initTmpBufs() {
       TmpbufType::RECVCOUNTS_TMPBUF,
       sizeof(size_t) * all2allvDynamicMaxSendcounts);
 
-  segmentManager.insert(
-      TmpbufType::RING_TMP_SEND_BUF,
-      NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_NUM_CHUNKS *
-          NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_CHUNK_SIZE);
-  segmentManager.insert(
-      TmpbufType::RING_TMP_RECV_BUF,
-      NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_NUM_CHUNKS *
-          NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_CHUNK_SIZE);
+  // Ring buffer sizing: delegates to deriveBufSize() which applies
+  // CVAR priority (chunk override > STAGING_BUF_SIZE > kStagingBufSize).
+  size_t ringBufSize = ctran::allreduce::ring::getStagingBufSize();
+  segmentManager.insert(TmpbufType::RING_TMP_SEND_BUF, ringBufSize);
+  segmentManager.insert(TmpbufType::RING_TMP_RECV_BUF, ringBufSize);
+
+  // Reverse direction buffers for bi-directional AllGather (use same size as
+  // forward). Only allocate if bidir AG is not explicitly disabled.
+  if (NCCL_CTRAN_ALLREDUCE_RING_BIDIR_AG_MAX_SIZE != 0) {
+    segmentManager.insert(TmpbufType::RING_TMP_SEND_BUF_REV, ringBufSize);
+    segmentManager.insert(TmpbufType::RING_TMP_RECV_BUF_REV, ringBufSize);
+  }
 
   // request slab buffer from memory pool
   if (comm_->memCache_) {

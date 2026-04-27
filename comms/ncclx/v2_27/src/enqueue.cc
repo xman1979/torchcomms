@@ -5,8 +5,8 @@
  ************************************************************************/
 
 #include "enqueue.h"
+#include "meta/NcclxConfig.h" // @manual
 #include "argcheck.h"
-#include "coll_net.h"
 #include "gdrwrap.h"
 #include "bootstrap.h"
 #include "channel.h"
@@ -299,6 +299,9 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     }
     ncclRegisterCollBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
 
+    // NCCLX specific changes
+    devWork.quantizeRandomSeedPtr = task->quantizeRandomSeedPtr; // [NCCLX-Deq]
+
     devWork.sendbuff = (void*)task->sendbuff;
     devWork.recvbuff = (void*)task->recvbuff;
     devWork.sendbuffOffset = task->sendbuffOffset;
@@ -497,6 +500,10 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
 
     if (task->algorithm == NCCL_ALGO_NVLS_TREE || task->algorithm == NCCL_ALGO_NVLS) {
       struct ncclDevWorkColl devWork = {};
+
+      // NCCLX specific changes
+      devWork.quantizeRandomSeedPtr = task->quantizeRandomSeedPtr;
+
       devWork.sendbuff = (void*)task->sendbuff;
       devWork.recvbuff = (void*)task->recvbuff;
       devWork.sendbuffOffset = task->sendbuffOffset;
@@ -1433,6 +1440,13 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
 
   if (planner->nTasksColl + planner->nTasksP2p != 0) {
     do {
+      // Bump opCount before creating proxy ops for this plan, so that
+      // ProxyTrace and CollTrace both capture the same opCount value.
+      // Previously opCount was incremented in doLaunches (group.cc) after
+      // each kernel launch, but proxy ops are created here in Prepare
+      // before any launches, causing PT to capture a stale value.
+      comm->opCount++;
+
       memset(&planner->wipPlan, 0, sizeof(planner->wipPlan));
 
       struct ncclKernelPlan* plan = ncclMemoryPoolAlloc<struct ncclKernelPlan>(&comm->memPool_ncclKernelPlan, &comm->memPermanent);
@@ -1811,6 +1825,12 @@ static ncclResult_t updateCollCostTable(
   }
 
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+    // NCCLX Specific: ReduceScatterQuantize currently only supports PAT. All
+    // other algorithms are ignored.
+    // TODO: Switch to Min's infoExt approach.
+    if (info->quantizeRandomSeedPtr != nullptr && a != NCCL_ALGO_PAT) {
+      continue;
+    }
     if ((a == NCCL_ALGO_COLLNET_DIRECT || a == NCCL_ALGO_COLLNET_CHAIN) && collNetSupport != 1) continue;
     // CollNetDirect is only supported for up to 8 local GPUs
     if (a == NCCL_ALGO_COLLNET_DIRECT && comm->maxLocalRanks > NCCL_MAX_DIRECT_ARITY+1) continue;
@@ -1820,6 +1840,13 @@ static ncclResult_t updateCollCostTable(
     if (a == NCCL_ALGO_PAT && info->func == ncclFuncReduceScatter
         && (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv)) continue;
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+      // NCCLX Specific: ReduceScatterQuantize currently only supports Simple. All
+      // other protocols are ignored.
+      // TODO: Switch to Min's infoExt approach.
+      if (info->quantizeRandomSeedPtr != nullptr && p != NCCL_PROTO_SIMPLE) {
+        continue;
+      }
+
       NCCLCHECK(ncclTopoGetAlgoTime(comm, info->func, a, p, nBytes, numPipeOps, &table[a][p]));
       // Relegate fp8 reduction trees of sufficient depth that they incur precision loss
       // to be least preferred.
@@ -2033,6 +2060,15 @@ static ncclResult_t calcCollChunking(
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
+
+  // [NCCLX-Quantized]
+  // Quantized collectives (e.g., ReduceScatterQuantize) transport data in a
+  // smaller type (BF16, 2 bytes) than the input type (FP32, 4 bytes). The
+  // transport buffer step can hold 2x more elements, so double the chunk size
+  // to fully utilize the transport buffer and halve the number of PAT steps.
+  if (info->quantizeRandomSeedPtr != nullptr) {
+    chunkSize *= 2;
+  }
 
   if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {
     // Optimize chunkSize / nSteps
@@ -2421,6 +2457,11 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       t->sliceSteps = info->sliceSteps;
       t->eActivationMask = __atomic_load_n(&ncclProfilerEventMask, __ATOMIC_RELAXED);
 
+      // NCCLX specific fields
+      t->quantizeRandomSeedPtr = info->randomSeed;
+      // For non-quant ops, we will juse use the input/output datatype
+      t->transportType = info->transportType.value_or(t->datatype);
+
       planner->nTasksColl += 1;
       ncclTaskCollSorterInsert(&planner->collSorter, t, t->trafficBytes);
     }
@@ -2470,7 +2511,7 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
 
   INFO(NCCL_COLL,"%s: opCount %lx sendbuff %p recvbuff %p count %zu datatype %d op %d root %d comm %p commHash %lx commDesc %s [nranks=%d, nNodes=%d] stream %p",
         info->opName, info->comm->opCount, info->sendbuff, info->recvbuff, info->count,
-        info->datatype, info->op, info->root, info->comm, info->comm->commHash, info->comm->config.commDesc, info->comm->nRanks, info->comm->nNodes, info->stream);
+        info->datatype, info->op, info->root, info->comm, info->comm->commHash, NCCLX_CONFIG_FIELD(info->comm->config, commDesc).c_str(), info->comm->nRanks, info->comm->nNodes, info->stream);
   TRACE_CALL("nccl%s(%" PRIx64 ",%" PRIx64 ",%zu,%d,%d,%d,%p,%p)", info->opName, reinterpret_cast<int64_t>(info->sendbuff), reinterpret_cast<int64_t>(info->recvbuff), info->count, info->datatype, info->op, info->root, info->comm, info->stream);
 
   NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);

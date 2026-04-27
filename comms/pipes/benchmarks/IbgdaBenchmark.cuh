@@ -20,31 +20,10 @@ __global__ void ibgdaPutSignalWaitLocalKernel(
     IbgdaLocalBuffer localBuf,
     IbgdaRemoteBuffer remoteBuf,
     std::size_t nbytes,
+    IbgdaRemoteBuffer remoteSignalBuf,
     int signalId,
-    uint64_t signalVal);
-
-__global__ void ibgdaPutSignalNonAdaptiveWaitLocalKernel(
-    P2pIbgdaTransportDevice* transport,
-    IbgdaLocalBuffer localBuf,
-    IbgdaRemoteBuffer remoteBuf,
-    std::size_t nbytes,
-    int signalId,
-    uint64_t signalVal);
-
-__global__ void ibgdaWaitSignalKernel(
-    P2pIbgdaTransportDevice* transport,
-    int signalId,
-    IbgdaCmpOp cmpOp,
-    uint64_t expectedSignal);
-
-__global__ void ibgdaSignalOnlyKernel(
-    P2pIbgdaTransportDevice* transport,
-    int signalId,
-    uint64_t signalVal);
-
-__global__ void ibgdaResetSignalKernel(
-    P2pIbgdaTransportDevice* transport,
-    int signalId);
+    IbgdaLocalBuffer localCounterBuf,
+    int counterId);
 
 __global__ void ibgdaPutWaitLocalKernel(
     P2pIbgdaTransportDevice* transport,
@@ -57,6 +36,8 @@ __global__ void ibgdaPutWaitLocalBatchKernel(
     IbgdaLocalBuffer localBuf,
     IbgdaRemoteBuffer remoteBuf,
     std::size_t nbytes,
+    IbgdaLocalBuffer localCounterBuf,
+    int counterId,
     int numIters,
     unsigned long long* totalCycles);
 
@@ -65,13 +46,46 @@ __global__ void ibgdaPutSignalWaitLocalBatchKernel(
     IbgdaLocalBuffer localBuf,
     IbgdaRemoteBuffer remoteBuf,
     std::size_t nbytes,
+    IbgdaRemoteBuffer remoteSignalBuf,
     int signalId,
+    IbgdaLocalBuffer localCounterBuf,
+    int counterId,
     int numIters,
     unsigned long long* totalCycles);
 
 __global__ void ibgdaSignalOnlyBatchKernel(
     P2pIbgdaTransportDevice* transport,
+    IbgdaRemoteBuffer remoteSignalBuf,
     int signalId,
+    int numIters,
+    unsigned long long* totalCycles);
+
+// Multi-peer kernels for counter fan-out validation
+
+__global__ void ibgdaMultiPeerSerialCounterFanOutBatchKernel(
+    P2pIbgdaTransportDevice* transportsBase,
+    std::size_t transportStride,
+    int numPeers,
+    IbgdaLocalBuffer localBuf,
+    const IbgdaRemoteBuffer* remoteDataBufs,
+    std::size_t nbytes,
+    const IbgdaRemoteBuffer* remoteSignalBufs,
+    int signalId,
+    IbgdaLocalBuffer localCounterBuf,
+    int numIters,
+    unsigned long long* totalCycles);
+
+__global__ void ibgdaMultiPeerCounterFanOutBatchKernel(
+    P2pIbgdaTransportDevice* transportsBase,
+    std::size_t transportStride,
+    int numPeers,
+    IbgdaLocalBuffer localBuf,
+    const IbgdaRemoteBuffer* remoteDataBufs,
+    std::size_t nbytes,
+    const IbgdaRemoteBuffer* remoteSignalBufs,
+    int signalId,
+    IbgdaLocalBuffer localCounterBuf,
+    int counterId,
     int numIters,
     unsigned long long* totalCycles);
 

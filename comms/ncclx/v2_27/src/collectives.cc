@@ -93,15 +93,9 @@ ncclResult_t ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcoun
   NVTX3_FUNC_WITH_PARAMS(AllGather, NcclNvtxParamsAllGather,
     NVTX3_PAYLOAD(comm ? comm->commHash : 0, msgsize));
 
-  // Set algo to global config
-  auto algo = NCCL_ALLGATHER_ALGO;
-  // Override algo if comm config is set
-  if (ctranInitialized(comm->ctranComm_.get())) {
-    algo = comm->ctranComm_->ctran_->algo->getAllGatherAlgo();
-  }
+  auto algo = ncclx::algoconf::getAllGatherAlgo();
 
-  // Use ctran allgather if user specified and ctran is supported
-  if (algo != NCCL_ALLGATHER_ALGO::orig && ctranAllGatherSupport(comm->ctranComm_.get(), algo)) {
+  if (algo != NCCL_ALLGATHER_ALGO::orig && ctranAllGatherSupport(comm->ctranComm_.get(), algo, stream)) {
     return metaCommToNccl(ctranAllGather(
         sendbuff, recvbuff, sendcount, ncclToMetaComm(datatype), comm->ctranComm_.get(), stream, algo));
   }
@@ -225,8 +219,9 @@ ncclResult_t ncclSend(const void* sendbuff, size_t count, ncclDataType_t datatyp
   }
   SetCudaDevRAII setCudaDev(comm->cudaDev);
 
-  if ((ncclx::algoconf::getSendRecvAlgo() != NCCL_SENDRECV_ALGO::orig) &&
-      ctranSendRecvSupport(peer, comm->ctranComm_.get())) {
+  auto algo = ncclx::algoconf::getSendRecvAlgo();
+  if ((algo != NCCL_SENDRECV_ALGO::orig) &&
+      ctranSendRecvSupport(peer, comm->ctranComm_.get(), algo, stream)) {
     // ctran send/recvs are enqueued within ctran wherease other non-ctran ones
     // are enqueued in the original queue. When reaching group end, these two
     // groups of ops will be issued separately.
@@ -267,8 +262,9 @@ ncclResult_t ncclRecv(void* recvbuff, size_t count, ncclDataType_t datatype, int
   }
   SetCudaDevRAII setCudaDev(comm->cudaDev);
 
-  if ((ncclx::algoconf::getSendRecvAlgo() != NCCL_SENDRECV_ALGO::orig) &&
-      ctranSendRecvSupport(peer, comm->ctranComm_.get())) {
+  auto algo = ncclx::algoconf::getSendRecvAlgo();
+  if ((algo != NCCL_SENDRECV_ALGO::orig) &&
+      ctranSendRecvSupport(peer, comm->ctranComm_.get(), algo, stream)) {
     // ctran send/recvs are enqueued within ctran wherease other non-ctran ones
     // are enqueued in the original queue. When reaching group end, these two
     // groups of ops will be issued separately.
@@ -429,6 +425,53 @@ ncclResult_t ncclAllToAllv(
   NCCLCHECK(ncclGroupEnd());
   return ncclSuccess;
 }
+
+#if defined(ENABLE_PIPES)
+__attribute__((visibility("default")))
+ncclResult_t ncclx::deviceAllToAllv(
+    const void* sendbuff,
+    void* recvbuff,
+    const int64_t* sendcounts_d,
+    const int64_t* recvcounts_d,
+    ncclDataType_t datatype,
+    ncclComm_t comm,
+    cudaStream_t stream,
+    int64_t sendcountsMultiplier,
+    int64_t recvcountsMultiplier,
+    const std::unordered_map<std::string, std::string>& hints) {
+  if (!ctranDeviceAllToAllvSupport(comm->ctranComm_.get())) {
+    FB_ERRORRETURN(
+        ncclInvalidUsage,
+        "deviceAllToAllv requires ctran with pipes transport support");
+  }
+  return metaCommToNccl(ctranDeviceAllToAllv(
+      sendbuff,
+      recvbuff,
+      sendcounts_d,
+      recvcounts_d,
+      ncclToMetaComm(datatype),
+      comm->ctranComm_.get(),
+      stream,
+      sendcountsMultiplier,
+      recvcountsMultiplier,
+      hints));
+}
+#else
+__attribute__((visibility("default")))
+ncclResult_t ncclx::deviceAllToAllv(
+    const void* /*sendbuff*/,
+    void* /*recvbuff*/,
+    const int64_t* /*sendcounts_d*/,
+    const int64_t* /*recvcounts_d*/,
+    ncclDataType_t /*datatype*/,
+    ncclComm_t /*comm*/,
+    cudaStream_t /*stream*/,
+    int64_t /*sendcountsMultiplier*/,
+    int64_t /*recvcountsMultiplier*/,
+    const std::unordered_map<std::string, std::string>& /*hints*/) {
+  return ncclInvalidUsage;
+}
+#endif // ENABLE_PIPES
 
 __attribute__((visibility("default")))
 ncclResult_t ncclx::alltoallvDynamic(

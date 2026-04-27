@@ -2,14 +2,29 @@
 
 #include "comms/torchcomms/TorchWork.hpp"
 
+#include <c10/core/DeviceGuard.h> // @manual=//caffe2:c10
+
 namespace torch::comms {
+
+void TorchWork::markCompleted(
+    c10::intrusive_ptr<c10::ivalue::Future> future_,
+    std::vector<at::Tensor> outputTensors_) {
+  TORCH_CHECK(
+      outputTensors_.size() > 0, "Atleast one tensor should be present");
+  // CUDA: resolve immediately. Future records a CUDA event on the current
+  // stream via markCompleted(). Device guard ensures getCurrentStream()
+  // returns the correct device's stream.
+  const auto device = outputTensors_[0].device();
+  c10::OptionalDeviceGuard guard(device);
+  future_->markCompleted(c10::IValue(outputTensors_));
+}
 
 TorchWorkCompleted::TorchWorkCompleted() {
   setStatus(WorkStatus::COMPLETED);
 }
 
 void TorchWorkCompleted::wait() {
-  return;
+  runWaitHooks();
 }
 
 TorchWorkThread::TorchWorkThread(std::function<void()> fn)
@@ -24,6 +39,8 @@ TorchWorkThread::TorchWorkThread(std::function<void()> fn)
       })) {}
 
 void TorchWorkThread::wait() {
+  runWaitHooks();
+
   if (!future_.valid()) {
     // already waited on
     return;

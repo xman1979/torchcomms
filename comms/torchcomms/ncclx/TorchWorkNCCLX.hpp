@@ -14,9 +14,9 @@
 #include <ATen/ATen.h>
 #include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
 #include <vector>
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/TorchWork.hpp"
 #include "comms/torchcomms/ncclx/TorchCommNCCLXPersistentRequest.hpp"
+#include "comms/torchcomms/utils/TracingGuard.hpp"
 
 namespace torch::comms {
 
@@ -68,11 +68,19 @@ class TorchWorkNCCLX : public TorchWork {
     persistent_request_ = std::move(request);
   }
 
+  // Set CPU tensors that need to be kept alive for the lifetime of this
+  // work object. Used for CPU tensors (e.g., pointer arrays) that must outlive
+  // the async operation, especially during CUDA graph replay.
+  void setCPUTensors(std::vector<at::Tensor> tensors) {
+    cpuTensors_ = std::move(tensors);
+  }
+
  protected:
   void recordStart(std::string_view coll_name);
   void recordEnd();
 
   friend class TorchCommNCCLX;
+  friend class GraphEventTracker;
   template <typename B>
   friend class TorchCommWindowNCCLX;
   friend class TorchWorkNCCLXQueue;
@@ -90,10 +98,47 @@ class TorchWorkNCCLX : public TorchWork {
   std::vector<at::Tensor> inputTensors_;
   at::Tensor inputTensor_;
 
+  // CPU tensors that need to be kept alive for the lifetime of this
+  // work object. Unlike inputTensors_ which are cleared in wait(), these
+  // tensors remain alive until the work object is destroyed. This is used
+  // for CPU tensors (e.g., pointer arrays) that must outlive the async
+  // operation, especially during CUDA graph replay.
+  std::vector<at::Tensor> cpuTensors_;
+
+  void initEvents();
+  void releaseEvents();
+
+  // Record a cudaEventRecordExternal on the graph-monitor side stream
+  // (fork/rejoin pattern) if available, falling back to recording directly
+  // on stream_. Used by both recordStart() and recordEnd() to keep the
+  // external event's release fence off the main stream's critical path.
+  void recordExternalEventViaSideStream(
+      cudaEvent_t event,
+      const char* event_label);
+
   std::shared_ptr<TorchCommNCCLX> comm_;
-  cudaEvent_t start_event_;
-  cudaEvent_t end_event_;
+  cudaEvent_t start_event_{};
+  // Completion detection event. In both eager and graph modes, this event is
+  // recorded after the NCCL operation completes. In eager mode, it is also
+  // used as the join point for work.wait(). In graph mode, it is recorded
+  // with cudaEventRecordExternal (host-queryable for watchdog timeout
+  // detection) and ownership is transferred to GraphWorkEntry.
+  cudaEvent_t end_event_{};
+  // Stream synchronization event for graph mode only. Recorded with regular
+  // cudaEventRecord to serve as a valid join point for work.wait()
+  // (cudaStreamWaitEvent). nullptr in eager mode.
+  //
+  // In graph mode, all three events (start, end, sync) are ad-hoc created
+  // (NOT from the event pool). start_event_ and end_event_ ownership is
+  // transferred to GraphWorkEntry in enqueueWork(), which sets them to
+  // nullptr. sync_event_ is destroyed in the work destructor.
+  cudaEvent_t sync_event_{};
   cudaStream_t stream_; // stream is not owned by this class
+
+  // Whether this work was created during CUDA graph capture. Controls
+  // event lifecycle: in graph mode, all events are ad-hoc created;
+  // in non-graph mode, start_event_ and end_event_ are from the pool.
+  bool graph_capture_mode_{false};
 
   std::chrono::milliseconds timeout_ms_;
 

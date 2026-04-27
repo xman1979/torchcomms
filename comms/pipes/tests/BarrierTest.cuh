@@ -51,12 +51,12 @@ void testReadBarrierExpectedCounter(
 
 // =============================================================================
 // P2pNvlTransportDevice barrier API test helpers
-// These test barrier_sync_threadgroup() with 2-GPU P2P communication
+// These test barrier_sync() with 2-GPU P2P communication
 // =============================================================================
 
 // Barrier sync operation using P2pNvlTransportDevice
 void testDeviceBarrierSync(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t barrierId,
     int numBlocks,
     int blockSize,
@@ -64,7 +64,7 @@ void testDeviceBarrierSync(
 
 // Multiple barrier syncs in sequence
 void testDeviceBarrierSyncMultiple(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t barrierId,
     int numSyncs,
     int numBlocks,
@@ -79,7 +79,7 @@ void testDeviceBarrierSyncMultiple(
 
 // Write data to remote buffer using put() API, then barrier sync
 void testBarrierWriteData(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     char* remoteDataBuffer,
     const char* localSrcBuffer,
     size_t dataSize,
@@ -89,7 +89,7 @@ void testBarrierWriteData(
 
 // Barrier sync, then verify local data matches expected value
 void testBarrierVerifyData(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint8_t* localDataBuffer,
     size_t dataSize,
     uint8_t expectedValue,

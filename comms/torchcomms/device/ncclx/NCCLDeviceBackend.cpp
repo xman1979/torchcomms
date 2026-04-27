@@ -1,17 +1,19 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // NCCL Device Backend - Static Method Implementations
 
-#include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/device/DeviceBackendTraits.hpp"
 #include "comms/torchcomms/device/TorchCommDeviceWindow.hpp"
+#include "comms/torchcomms/device/cuda/CudaApi.hpp"
 #include "comms/torchcomms/ncclx/NcclxApi.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
 
-#include <cuda_runtime.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
 
 namespace torchcomms::device {
+
+using torch::comms::RegisteredBuffer;
 
 // =============================================================================
 // DeviceWindowDeleter Implementation
@@ -22,7 +24,8 @@ void NCCLDeviceBackend::DeviceWindowDeleter::operator()(
   // Only free the device memory - caller is responsible for calling
   // ncclDevCommDestroy using the dev_comm stored in this deleter
   if (ptr != nullptr) {
-    cudaFree(ptr);
+    CUDA_CHECK_IGNORE(
+        cuda_api, cuda_api->free(ptr), "Failed to free device window");
   }
 }
 
@@ -33,6 +36,7 @@ void NCCLDeviceBackend::DeviceWindowDeleter::operator()(
 NCCLDeviceBackend::Ptr NCCLDeviceBackend::create_device_window(
     ncclComm_t nccl_comm,
     torch::comms::NcclxApi* nccl_api,
+    torch::comms::CudaApi* cuda_api,
     const DeviceBackendConfig& config,
     Window host_window,
     void* base,
@@ -44,6 +48,10 @@ NCCLDeviceBackend::Ptr NCCLDeviceBackend::create_device_window(
   if (nccl_api == nullptr) {
     throw std::runtime_error(
         "[NCCLDeviceBackend::create_device_window]: NCCL API cannot be null");
+  }
+  if (cuda_api == nullptr) {
+    throw std::runtime_error(
+        "[NCCLDeviceBackend::create_device_window]: CUDA API cannot be null");
   }
   if (base == nullptr && size > 0) {
     throw std::runtime_error(
@@ -69,23 +77,32 @@ NCCLDeviceBackend::Ptr NCCLDeviceBackend::create_device_window(
     signal_resource_reqs.outGinCounterStart = nullptr;
   }
 
-  // Set up ncclDevCommRequirements with GIN enabled using designated
-  // initializers
-  ncclDevCommRequirements reqs = {
-      .resourceRequirementsList =
-          (signal_buffer_size > 0) ? &signal_resource_reqs : nullptr,
-      .teamRequirementsList = nullptr,
-      .lsaMultimem = false,
-      .barrierCount = config.barrier_count,
-      .lsaBarrierCount = 0,
-      .railGinBarrierCount = config.barrier_count,
-      .lsaLLA2ABlockCount = 0,
-      .lsaLLA2ASlotCount = 0,
-      .ginForceEnable = true,
-      .ginContextCount = 1,
-      .ginSignalCount = config.signal_count,
-      .ginCounterCount = config.counter_count,
-  };
+  // Initialize ncclDevCommRequirements. NCCLx 2.29+ prepends size/magic/version
+  // fields and validates them in ncclDevCommCreate, so we must use the
+  // NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER macro when available.
+#ifdef NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER
+  ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+#else
+  ncclDevCommRequirements reqs = {};
+#endif
+  reqs.resourceRequirementsList =
+      (signal_buffer_size > 0) ? &signal_resource_reqs : nullptr;
+  reqs.teamRequirementsList = nullptr;
+
+  // Mirror NCCL's internal gating (sym_kernels.cc): only request NVLS
+  // multicast when the LSA team has more than 2 members.  Without this
+  // check ncclDevCommCreate returns ncclInvalidArgument on topologies
+  // where multicast is unavailable (e.g. 1x2 configurations).
+  reqs.lsaMultimem = nccl_api->teamLsa(nccl_comm).nRanks > 2;
+  reqs.barrierCount = config.barrier_count;
+  reqs.lsaBarrierCount = config.barrier_count;
+  reqs.railGinBarrierCount = config.barrier_count;
+  reqs.lsaLLA2ABlockCount = 0;
+  reqs.lsaLLA2ASlotCount = 0;
+  reqs.ginForceEnable = true;
+  reqs.ginContextCount = 1;
+  reqs.ginSignalCount = 0;
+  reqs.ginCounterCount = config.counter_count;
 
   // Create NCCL device communicator with GIN state
   ncclDevComm nccl_dev_comm{};
@@ -109,38 +126,143 @@ NCCLDeviceBackend::Ptr NCCLDeviceBackend::create_device_window(
 
   // Allocate device memory for the window struct
   TorchCommDeviceWindow<NCCLDeviceBackend>* device_ptr = nullptr;
-  cudaError_t cuda_result =
-      cudaMalloc(&device_ptr, sizeof(TorchCommDeviceWindow<NCCLDeviceBackend>));
+  cudaError_t cuda_result = cuda_api->malloc(
+      reinterpret_cast<void**>(&device_ptr),
+      sizeof(TorchCommDeviceWindow<NCCLDeviceBackend>));
   if (cuda_result != cudaSuccess) {
     // Cleanup ncclDevComm before throwing
     nccl_api->devCommDestroy(nccl_comm, &nccl_dev_comm);
     throw std::runtime_error(
         "[NCCLDeviceBackend::create_device_window]: Failed to allocate device memory for window. "
         "CUDA error: " +
-        std::string(cudaGetErrorString(cuda_result)));
+        std::string(cuda_api->getErrorString(cuda_result)));
   }
 
   // Copy the window struct to device memory
-  cuda_result = cudaMemcpy(
+  // device_ptr is non-null here (cuda_api->malloc succeeded above)
+  // NOLINTNEXTLINE(facebook-hte-NullableDereference,facebook-security-vulnerable-memcpy)
+  cuda_result = cuda_api->memcpy(
       device_ptr,
       &host_dev_window,
       sizeof(TorchCommDeviceWindow<NCCLDeviceBackend>),
       cudaMemcpyHostToDevice);
   if (cuda_result != cudaSuccess) {
     // Cleanup on error
-    cudaFree(device_ptr);
+    // NOLINTNEXTLINE(facebook-hte-NullableDereference)
+    CUDA_CHECK_IGNORE(
+        cuda_api,
+        cuda_api->free(device_ptr),
+        "Failed to free device window during error cleanup");
     nccl_api->devCommDestroy(nccl_comm, &nccl_dev_comm);
     throw std::runtime_error(
         "[NCCLDeviceBackend::create_device_window]: Failed to copy window to device memory. "
         "CUDA error: " +
-        std::string(cudaGetErrorString(cuda_result)));
+        std::string(cuda_api->getErrorString(cuda_result)));
   }
 
-  // Create custom deleter that stores nccl_comm, nccl_api, and dev_comm
-  // The caller accesses dev_comm via get_deleter() for ncclDevCommDestroy
-  DeviceWindowDeleter deleter(nccl_comm, nccl_api, nccl_dev_comm);
+  // Create custom deleter that stores nccl_comm, nccl_api, cuda_api, and
+  // dev_comm. The caller accesses dev_comm via get_deleter() for
+  // ncclDevCommDestroy.
+  DeviceWindowDeleter deleter(nccl_comm, nccl_api, cuda_api, nccl_dev_comm);
 
   return Ptr(device_ptr, deleter);
+}
+
+// =============================================================================
+// Backend-specific hooks
+// =============================================================================
+
+void NCCLDeviceBackend::register_extra_window(
+    torch::comms::NcclxApi* nccl_api,
+    ncclComm_t nccl_comm,
+    ncclWindow_t* out_win,
+    void* ptr,
+    size_t size) {
+  if (*out_win != nullptr) {
+    return;
+  }
+  CHECK_EQ(
+      nccl_api->commWindowRegister(
+          ptr, size, nccl_comm, out_win, NCCL_WIN_DEVICE_API),
+      ncclSuccess)
+      << "[NCCLDeviceBackend]: Extra window registration failed";
+}
+
+void NCCLDeviceBackend::deregister_extra_window(
+    torch::comms::NcclxApi* nccl_api,
+    ncclComm_t nccl_comm,
+    ncclWindow_t* win) {
+  if (*win != nullptr) {
+    auto result = nccl_api->commWindowDeregister(nccl_comm, *win);
+    if (result != ncclSuccess) {
+      TC_LOG(ERROR) << "NCCLX orig window deregister failed";
+    }
+    *win = nullptr;
+  }
+}
+
+RegisteredBuffer NCCLDeviceBackend::register_local_buffer(
+    torch::comms::NcclxApi* nccl_api,
+    ncclComm_t nccl_comm,
+    void* ptr,
+    size_t size) {
+  ncclWindow_t local_win = nullptr;
+  CHECK_EQ(
+      nccl_api->commWindowRegister(
+          ptr,
+          size,
+          nccl_comm,
+          &local_win,
+          NCCL_WIN_DEVICE_API | NCCL_WIN_LOCAL_ONLY),
+      ncclSuccess)
+      << "[NCCLDeviceBackend]: Local buffer registration failed";
+
+  // GIN put uses backend_window (ncclWindow_t) for RDMA/NVLink transfers.
+  // lkeys are unused by GIN — only the Pipes (IBGDA) backend needs them.
+  // Default-constructed RegisteredBuffer zero-initializes the lkeys array.
+  RegisteredBuffer buf;
+  buf.base_ptr = ptr;
+  buf.size = size;
+  buf.backend_window = static_cast<void*>(local_win);
+  return buf;
+}
+
+void NCCLDeviceBackend::deregister_local_buffer(
+    torch::comms::NcclxApi* nccl_api,
+    ncclComm_t nccl_comm,
+    RegisteredBuffer& buf) {
+  if (buf.backend_window == nullptr) {
+    return;
+  }
+  auto result = nccl_api->commWindowDeregister(
+      nccl_comm, static_cast<ncclWindow_t>(buf.backend_window));
+  if (result != ncclSuccess) {
+    TC_LOG(ERROR) << "[NCCLDeviceBackend]: Failed to deregister local buffer";
+  }
+
+  // ncclCommWindowDeregister may leave a sticky CUDA error in the runtime
+  // error queue. Consume it to prevent the next CUDA API call from failing.
+  cudaDeviceSynchronize();
+  cudaGetLastError();
+
+  buf.backend_window = nullptr;
+  buf.base_ptr = nullptr;
+  buf.size = 0;
+}
+
+void NCCLDeviceBackend::destroy_device_comm(Ptr& device_window) {
+  if (!device_window) {
+    return;
+  }
+  auto& deleter = device_window.get_deleter();
+  if (deleter.nccl_comm != nullptr && deleter.nccl_api != nullptr) {
+    auto nccl_result =
+        deleter.nccl_api->devCommDestroy(deleter.nccl_comm, &deleter.dev_comm);
+    if (nccl_result != ncclSuccess) {
+      TC_LOG(ERROR) << "Failed to destroy NCCL device communicator: "
+                    << deleter.nccl_api->getErrorString(nccl_result);
+    }
+  }
 }
 
 } // namespace torchcomms::device

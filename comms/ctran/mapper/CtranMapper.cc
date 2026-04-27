@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include <unistd.h>
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <fstream>
@@ -9,7 +10,6 @@
 #include <sstream>
 #include <string>
 
-#include "comms/ctran/backends/CtranCtrl.h"
 #include "comms/ctran/colltrace/MapperTrace.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
@@ -61,6 +61,34 @@ std::vector<CtranMapperBackend> getToEnableBackends(
 
   return enableBackends;
 }
+struct ExtraPacketInfo {
+  int numExtraPackets;
+  int numExtraSegments;
+};
+
+ExtraPacketInfo computeExtraPacketInfo(
+    int totalSegments,
+    int inlineSegments,
+    int segsPerPacket) {
+  ExtraPacketInfo info;
+  info.numExtraSegments =
+      (totalSegments > inlineSegments) ? totalSegments - inlineSegments : 0;
+  info.numExtraPackets = (info.numExtraSegments > 0)
+      ? (info.numExtraSegments + segsPerPacket - 1) / segsPerPacket
+      : 0;
+  return info;
+}
+
+void computePacketSlice(
+    int pktIdx,
+    int segsPerPacket,
+    int numExtra,
+    int& startIdx,
+    int& count) {
+  startIdx = pktIdx * segsPerPacket;
+  count = std::min(segsPerPacket, numExtra - startIdx);
+}
+
 } // namespace
 
 CtranMapper::CtranMapper(CtranComm* comm) {
@@ -75,13 +103,28 @@ CtranMapper::CtranMapper(CtranComm* comm) {
       statex->rank(),
       statex->nRanks()};
 
-  // Initialize IpcRegCache singleton (idempotent - only initializes once)
-  ctran::IpcRegCache::getInstance()->init();
-
   this->comm = comm;
 
-  // AllGather IPC server addresses after comm is set
-  FB_COMMCHECKTHROW_EX(allGatherIpcServerAddrs(), comm->logMetaData_);
+  if (NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET) {
+    CLOGF_SUBSYS(
+        INFO,
+        INIT,
+        "CTRAN-MAPPER: IpcRegCache socket server enabled, initializing");
+    // Initialize IpcRegCache singleton (idempotent - only initializes once)
+    ctran::IpcRegCache::getInstance()->init();
+
+    // Register this mapper as an IpcExportClient so globalDeregister
+    // can iterate all active mappers to send remote releases.
+    ctran::IpcRegCache::getInstance()->registerExportClient(this);
+
+    // AllGather IPC server addresses after comm is set
+    FB_COMMCHECKTHROW_EX(allGatherIpcServerAddrs(), comm->logMetaData_);
+  } else {
+    CLOGF_SUBSYS(
+        INFO,
+        INIT,
+        "CTRAN-MAPPER: IpcRegCache socket server disabled via NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET=0, skipping init");
+  }
 
   auto backendsToEnable = getToEnableBackends(comm->config_.backends);
 
@@ -110,14 +153,10 @@ CtranMapper::CtranMapper(CtranComm* comm) {
         "CTRAN-MAPPER: TCPDM can not be enabled with IB, NVL or Socket backends");
   }
 
-  this->ctrlMgr = std::make_unique<CtranCtrlManager>();
-
   /* enable available backends */
   if (enableBackends_[CtranMapperBackend::IB]) {
     try {
-      this->ctranIb =
-          std::make_unique<class CtranIb>(comm, this->ctrlMgr.get());
-      this->ctranIb->regCtrlCb(this->ctrlMgr);
+      this->ctranIb = std::make_unique<class CtranIb>(comm);
     } catch ([[maybe_unused]] const std::bad_alloc& e) {
       ctranIb = nullptr;
       enableBackends_[CtranMapperBackend::IB] = false;
@@ -126,8 +165,7 @@ CtranMapper::CtranMapper(CtranComm* comm) {
   }
   if (enableBackends_[CtranMapperBackend::SOCKET]) {
     if (!this->ctranIb) {
-      this->ctranSock =
-          std::make_unique<class CtranSocket>(comm, this->ctrlMgr.get());
+      this->ctranSock = std::make_unique<class CtranSocket>(comm);
     } else {
       enableBackends_[CtranMapperBackend::SOCKET] = false;
       CLOGF_SUBSYS(
@@ -137,8 +175,7 @@ CtranMapper::CtranMapper(CtranComm* comm) {
     }
   }
   if (enableBackends_[CtranMapperBackend::TCPDM]) {
-    this->ctranTcpDm =
-        std::make_unique<class ctran::CtranTcpDm>(comm, this->ctrlMgr.get());
+    this->ctranTcpDm = std::make_unique<class ctran::CtranTcpDm>(comm);
     CLOGF(WARN, "CTRAN-MAPPER: TCPDM backend is enabled");
   }
 
@@ -396,6 +433,25 @@ CtranMapper::~CtranMapper() {
 
   this->reportProfiling(true);
 
+  // Release all remote IPC registrations tracked by this mapper.
+  // This sends kRelease to remote peers so they can decrement their refCounts
+  // and eventually unmap CUDA IPC memory. Must happen BEFORE
+  // deregisterExportClient so the mapper is still in the client list during
+  // cleanup.
+  {
+    auto entries = exportRegCache_.rlock()->dump();
+    for (auto& [regElem, _] : entries) {
+      remReleaseMem(regElem);
+    }
+  }
+
+  // Deregister from IpcRegCache so globalDeregister won't call this mapper
+  // after it's destroyed.
+  auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  if (ipcRegCache) {
+    ipcRegCache->deregisterExportClient(this);
+  }
+
   // Release any pending IPC release requests;
   // intentionally avoid progress polling in destructor to ensure it is never
   // blocked.
@@ -451,7 +507,22 @@ commResult_t CtranMapper::remReleaseMem(ctran::regcache::RegElem* regElem) {
   // Shouldn't skip it even at destruction, since imported memory is stored in
   // IpcRegCache singleton and not cleared at mapper destruction
   auto exportedNvlRanks = exportRegCache_.wlock()->remove(regElem);
-  for (auto peerRank : exportedNvlRanks) {
+
+  if (exportedNvlRanks.empty()) {
+    return commSuccess;
+  }
+
+  // If peers have imported this memory but the async socket is disabled,
+  // we cannot notify them to release. This is a fatal inconsistency.
+  if (!NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET) {
+    CLOGF(
+        FATAL,
+        "CTRAN-REGCACHE: ipcRegElem was exported to {} peers but "
+        "NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET is disabled",
+        exportedNvlRanks.size());
+  }
+
+  for (auto& [peerRank, exportCount] : exportedNvlRanks) {
     // Warning: the remote rank may release the memory after the next import,
     // becase exportMem msgs are transferred over CtranIB&CtranSocket while
     // releaseMem msgs are transferred over AsyncSocket. To prevent the remote
@@ -466,9 +537,14 @@ commResult_t CtranMapper::remReleaseMem(ctran::regcache::RegElem* regElem) {
             comm->statex_->gPid(),
             peerAddr,
             reinterpret_cast<ctran::regcache::IpcRegElem*>(regElem->ipcRegElem),
-            req.get()));
+            req.get(),
+            exportCount));
 
-    CLOGF_TRACE(COLL, "CTRAN-MAPPER: Posted IPC release to rank {}", peerRank);
+    CLOGF_TRACE(
+        COLL,
+        "CTRAN-MAPPER: Posted IPC release to rank {} with exportCount {}",
+        peerRank,
+        exportCount);
 
     // IPC release requests will be checked in progress and erased at
     // completion. Mapper needs to free up all requests at destruction.
@@ -553,6 +629,14 @@ DevMemType CtranMapper::segmentType(void* segHdl) {
   return segment->getType();
 }
 
+const void* CtranMapper::segmentBuf(void* segHdl) {
+  auto regCache = ctran::RegCache::getInstance();
+  ctran::CHECK_VALID_REGCACHE(regCache);
+
+  ctran::regcache::Segment* segment = regCache->getSegment(segHdl);
+  return segment ? segment->range.buf : nullptr;
+}
+
 commResult_t CtranMapper::deregMem(void* segHdl, const bool skipRemRelease) {
   auto regCache = ctran::RegCache::getInstance();
   ctran::CHECK_VALID_REGCACHE(regCache);
@@ -587,8 +671,8 @@ commResult_t CtranMapper::deregMem(void* segHdl, const bool skipRemRelease) {
   //   also deregisters all associated registrations.
   // - Ownership of registrations are transferred to the last communicator to
   //   release remote registration.
-  // - If the segment no longer exists in cache, likely double dereg.
-  //   ncclInvaidUsage is returned.
+  // - If the segment no longer exists in cache (e.g. already freed by
+  //   globalDeregister), this is a no-op.
   bool freed = false, ncclManaged = false;
   std::vector<std::unique_ptr<ctran::regcache::RegElem>> regElemsFreed;
   FB_COMMCHECK(
@@ -629,6 +713,11 @@ commResult_t CtranMapper::deregDynamic(void* regHdl) {
   FB_COMMCHECK(regCache->deregDynamic(regElem));
 
   return commSuccess;
+}
+
+void CtranMapper::removeFromExportCache(void* regHdl) {
+  auto* regElem = reinterpret_cast<ctran::regcache::RegElem*>(regHdl);
+  exportRegCache_.wlock()->remove(regElem);
 }
 
 commResult_t CtranMapper::deregRemReg(struct CtranMapperRemoteAccessKey* rkey) {
@@ -888,27 +977,204 @@ commResult_t CtranMapper::allGatherCtrl(
     return commSuccess;
   }
 
-  std::vector<CtranMapperRequest> reqs(ranks.size() * 2);
-  auto numReqs = 0;
-  // If rank is in the ranks list, exchange with all others
+  // When totalSegments > CTRAN_IPC_INLINE_SEGMENTS (2), the extra segment
+  // descriptors are sent as raw CtranIpcSegDesc data packed densely into
+  // MAX_PAYLOAD_SIZE (4096 byte) packets. This reduces per-segment
+  // overhead compared to wrapping each batch in a full ControlMsg.
+  //
+  // segsPerPacket = MAX_PAYLOAD_SIZE / sizeof(CtranIpcSegDesc)
+  //
+  // Phase 1: exchange the first ControlMsg (carries first INLINE segments +
+  //          totalSegments metadata) with all peers.
+  // Phase 2: for peers with extra segments, exchange the remaining segments
+  //          packed as raw CtranIpcSegDesc arrays.
+
+  auto regElem = reinterpret_cast<ctran::regcache::RegElem*>(hdl);
+
+  constexpr int kExtraSegsPerPacket =
+      MAX_PAYLOAD_SIZE / sizeof(ctran::utils::CtranIpcSegDesc);
+  static_assert(
+      kExtraSegsPerPacket >= 1,
+      "MAX_PAYLOAD_SIZE must be large enough to hold at least one CtranIpcSegDesc");
+
+  // Build peer list and classify backends
+  std::vector<int> peerList;
+  peerList.reserve(ranks.size());
   for (auto peer : ranks) {
-    // Direct fill rank itself's buf
-    if (rank == peer) {
-      remoteBufs[peer] = const_cast<void*>(buf);
-      remoteAccessKeys[peer].backend = CtranMapperBackend::UNSET;
-      continue;
+    if (rank != peer) {
+      peerList.push_back(peer);
+    }
+  }
+  auto numPeers = peerList.size();
+
+  // Classify backends and export once per backend type
+  ControlMsg nvlSendMsg;
+  ControlMsg ibSendMsg;
+  std::vector<ctran::utils::CtranIpcSegDesc> nvlExtraSegments;
+  std::vector<CtranMapperBackend> peerBackends(numPeers);
+
+  for (int i = 0; i < numPeers; i++) {
+    peerBackends[i] = backend;
+    if (peerBackends[i] == CtranMapperBackend::UNSET) {
+      peerBackends[i] = this->queryPeerBackend(regElem, peerList[i]);
     }
 
-    // Exchange with other ranks
-    FB_COMMCHECK(irecvCtrlImpl(
-        &remoteBufs[peer], &remoteAccessKeys[peer], peer, &reqs[numReqs++]));
-    FB_COMMCHECK(isendCtrlImpl(buf, hdl, peer, &reqs[numReqs++], backend));
+    if (peerBackends[i] == CtranMapperBackend::NVL) {
+      if (nvlSendMsg.type == ControlMsgType::UNSPECIFIED) {
+        // exportMem records in exportRegCache_ for this peer
+        FB_COMMCHECK(this->exportMem(
+            peerList[i],
+            buf,
+            hdl,
+            nvlSendMsg,
+            &nvlExtraSegments,
+            peerBackends[i]));
+      } else if (NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET) {
+        // exportMem not called for this peer, record explicitly
+        exportRegCache_.wlock()->record(regElem, peerList[i]);
+      }
+    } else {
+      if (ibSendMsg.type == ControlMsgType::UNSPECIFIED) {
+        FB_COMMCHECK(this->exportMem(
+            peerList[i], buf, hdl, ibSendMsg, nullptr, peerBackends[i]));
+      }
+    }
   }
 
-  // TODO: completes all send and recv requests for now. May expose requests to
-  // algorithm for more flexible completion control
-  for (auto i = 0; i < numReqs; i++) {
-    FB_COMMCHECK(waitRequest(&reqs[i]));
+  // Fill self
+  remoteBufs[rank] = const_cast<void*>(buf);
+  remoteAccessKeys[rank].backend = CtranMapperBackend::UNSET;
+
+  // Use unique_ptr to ensure stable addresses for CtranMapperRequest objects.
+  // The IB layer stores std::reference_wrapper<CtranIbRequest> pointing to each
+  // request's ibReq member; a std::vector reallocation would invalidate those
+  // references and cause use-after-free (refCount_ < 0).
+  std::vector<std::unique_ptr<CtranMapperRequest>> recvReqs(numPeers);
+  for (auto& req : recvReqs) {
+    req = std::make_unique<CtranMapperRequest>();
+  }
+  std::vector<std::unique_ptr<CtranMapperRequest>> sendReqs;
+  std::vector<ControlMsg> recvMsgs(numPeers);
+
+  // Phase 1: Header Send + Overflow Send + Header Recv
+
+  // Receive header from the peer
+  for (int i = 0; i < numPeers; i++) {
+    FB_COMMCHECK(irecvCtrlMsgImp(
+        &recvMsgs[i], sizeof(ControlMsg), peerList[i], recvReqs[i].get()));
+  }
+  // Send header to all peers
+  for (int i = 0; i < numPeers; i++) {
+    const auto& msg =
+        (peerBackends[i] == CtranMapperBackend::NVL) ? nvlSendMsg : ibSendMsg;
+    sendReqs.push_back(std::make_unique<CtranMapperRequest>());
+    FB_COMMCHECK(isendCtrlMsgImpl(
+        &msg, sizeof(ControlMsg), peerList[i], sendReqs.back().get()));
+    // Send extra segments to NVL peers only (if any)
+    if (peerBackends[i] == CtranMapperBackend::NVL &&
+        !nvlExtraSegments.empty()) {
+      const auto extraInfo = computeExtraPacketInfo(
+          static_cast<int>(nvlExtraSegments.size()) + CTRAN_IPC_INLINE_SEGMENTS,
+          CTRAN_IPC_INLINE_SEGMENTS,
+          kExtraSegsPerPacket);
+      for (int pktIdx = 0; pktIdx < extraInfo.numExtraPackets; pktIdx++) {
+        int startIdx, count;
+        computePacketSlice(
+            pktIdx,
+            kExtraSegsPerPacket,
+            extraInfo.numExtraSegments,
+            startIdx,
+            count);
+        size_t sendSize = count * sizeof(ctran::utils::CtranIpcSegDesc);
+        sendReqs.push_back(std::make_unique<CtranMapperRequest>());
+        FB_COMMCHECK(isendCtrlMsgImpl(
+            &nvlExtraSegments[startIdx],
+            sendSize,
+            peerList[i],
+            sendReqs.back().get()));
+      }
+    }
+  }
+
+  // Phase 2: Overflow Recv + Import
+  std::vector<std::vector<ctran::utils::CtranIpcSegDesc>> allRecvExtraSegments(
+      numPeers);
+  // Flat vector of all extra recv requests for testSomeRequests
+  std::vector<std::unique_ptr<CtranMapperRequest>> extraRecvReqPtrs;
+
+  // Wait for header receives and issue all extra irecvs
+  for (int i = 0; i < numPeers; i++) {
+    FB_COMMCHECK(waitRequest(recvReqs[i].get()));
+
+    auto& firstMsg = recvMsgs[i];
+    if (firstMsg.type == ControlMsgType::NVL_EXPORT_MEM) {
+      int peerTotalSegments = firstMsg.ipcDesc.desc.totalSegments;
+
+      if (peerTotalSegments > CTRAN_IPC_INLINE_SEGMENTS) {
+        const auto extraInfo = computeExtraPacketInfo(
+            peerTotalSegments, CTRAN_IPC_INLINE_SEGMENTS, kExtraSegsPerPacket);
+
+        allRecvExtraSegments[i].resize(extraInfo.numExtraSegments);
+
+        // Issue all irecvs for this peer
+        for (int pktIdx = 0; pktIdx < extraInfo.numExtraPackets; pktIdx++) {
+          int startIdx, count;
+          computePacketSlice(
+              pktIdx,
+              kExtraSegsPerPacket,
+              extraInfo.numExtraSegments,
+              startIdx,
+              count);
+          size_t recvSize = count * sizeof(ctran::utils::CtranIpcSegDesc);
+
+          auto req = std::make_unique<CtranMapperRequest>();
+          req->peer = peerList[i];
+          FB_COMMCHECK(irecvCtrlMsgImp(
+              &allRecvExtraSegments[i][startIdx],
+              recvSize,
+              peerList[i],
+              req.get()));
+          extraRecvReqPtrs.push_back(std::move(req));
+        }
+      }
+    }
+  }
+
+  // Non-blocking check arrival of all recvs for each peer, and import if ready.
+  int numPeersImported = 0;
+  std::vector<bool> peerImported(numPeers, false);
+  while (numPeersImported < numPeers) {
+    FB_COMMCHECK(testSomeRequests(extraRecvReqPtrs));
+
+    for (int i = 0; i < numPeers; i++) {
+      if (peerImported[i]) {
+        continue;
+      }
+      // Check if any outstanding recv request still belongs to this peer
+      bool hasPending = false;
+      for (const auto& req : extraRecvReqPtrs) {
+        if (req->peer == peerList[i]) {
+          hasPending = true;
+          break;
+        }
+      }
+      if (!hasPending) {
+        FB_COMMCHECK(this->importMem(
+            peerList[i],
+            recvMsgs[i],
+            &remoteBufs[peerList[i]],
+            &remoteAccessKeys[peerList[i]],
+            allRecvExtraSegments[i]));
+        peerImported[i] = true;
+        numPeersImported++;
+      }
+    }
+  }
+
+  // Wait for all send requests to complete before returning, so that the
+  // request memory is not released/reused before data transfer completes.
+  for (auto& req : sendReqs) {
+    FB_COMMCHECK(waitRequest(req.get()));
   }
 
   return commSuccess;
@@ -970,7 +1236,7 @@ commResult_t CtranMapper::intraBarrier() {
   return commSuccess;
 }
 
-std::unordered_map<ctran::regcache::RegElem*, std::unordered_set<int>>
+std::unordered_map<ctran::regcache::RegElem*, std::unordered_map<int, int>>
 CtranMapper::dumpExportRegCache() const {
   return exportRegCache_.rlock()->dump();
 }

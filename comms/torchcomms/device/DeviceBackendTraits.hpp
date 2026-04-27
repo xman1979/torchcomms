@@ -17,14 +17,20 @@
 #include <memory>
 
 #include <nccl.h> // @manual=//comms/ncclx:nccl
-#include <nccl_device/impl/comm__types.h> // @manual=//comms/ncclx:nccl_device_api
+#include <nccl_device/impl/comm__types.h> // @manual=//comms/ncclx:nccl
 
 // Forward declarations
 namespace torch::comms {
+class CudaApi;
 class NcclxApi;
 } // namespace torch::comms
 
+#include "comms/torchcomms/RegisteredBuffer.hpp"
+
 namespace torchcomms::device {
+
+// Note: Use fully qualified torch::comms::RegisteredBuffer in declarations
+// to avoid polluting the namespace of includers.
 
 // Forward declarations
 struct DeviceBackendConfig;
@@ -50,7 +56,11 @@ class TorchCommDeviceWindow;
 
 struct NCCLDeviceBackend {
   using Comm = ncclDevComm;
+#ifdef NCCL_RMA_SUPPORTED
   using Window = ncclWindow_t;
+#else
+  using Window = void*;
+#endif
 
   // =========================================================================
   // DeviceWindowDeleter - Custom deleter for device window cleanup
@@ -60,20 +70,25 @@ struct NCCLDeviceBackend {
   // It stores the dev_comm on the host side to avoid needing cudaMemcpy
   // from device memory during destruction.
   //
-  // The deleter only calls cudaFree. The caller is responsible for calling
-  // ncclDevCommDestroy before the unique_ptr is destroyed. Access the
-  // dev_comm via unique_ptr::get_deleter().dev_comm.
+  // The deleter calls cudaFree via CudaApi. The caller is responsible for
+  // calling ncclDevCommDestroy before the unique_ptr is destroyed. Access
+  // the dev_comm via unique_ptr::get_deleter().dev_comm.
   struct DeviceWindowDeleter {
     ncclComm_t nccl_comm{nullptr};
     torch::comms::NcclxApi* nccl_api{nullptr};
+    torch::comms::CudaApi* cuda_api{nullptr};
     Comm dev_comm{};
 
     DeviceWindowDeleter() = default;
     DeviceWindowDeleter(
         ncclComm_t comm,
         torch::comms::NcclxApi* api,
+        torch::comms::CudaApi* cuda_api,
         Comm dev_comm_val)
-        : nccl_comm(comm), nccl_api(api), dev_comm(dev_comm_val) {}
+        : nccl_comm(comm),
+          nccl_api(api),
+          cuda_api(cuda_api),
+          dev_comm(dev_comm_val) {}
 
     void operator()(TorchCommDeviceWindow<NCCLDeviceBackend>* ptr) const;
   };
@@ -96,6 +111,7 @@ struct NCCLDeviceBackend {
   // Parameters:
   //   - nccl_comm: Host NCCL communicator (must not be null)
   //   - nccl_api: NCCL API abstraction (must not be null)
+  //   - cuda_api: CUDA API abstraction (must not be null)
   //   - config: Device backend configuration
   //   - host_window: Host-side NCCL window handle
   //   - base: Window base pointer (can be null only if size is 0)
@@ -103,10 +119,59 @@ struct NCCLDeviceBackend {
   static Ptr create_device_window(
       ncclComm_t nccl_comm,
       torch::comms::NcclxApi* nccl_api,
+      torch::comms::CudaApi* cuda_api,
       const DeviceBackendConfig& config,
       Window host_window,
       void* base,
       size_t size);
+
+  // =========================================================================
+  // Backend-specific hooks called from TorchCommWindowNCCLX
+  // =========================================================================
+  //
+  // These static methods encapsulate backend-specific behavior so that the
+  // shared template code can call Backend::method() instead of using
+  // if constexpr to dispatch.
+
+  // Register the NCCL baseline window needed for GIN transport.
+  // This second window is registered with NCCL_WIN_DEVICE_API flag to enable
+  // GPU-initiated networking (GIN) device API support.
+  static void register_extra_window(
+      torch::comms::NcclxApi* nccl_api,
+      ncclComm_t nccl_comm,
+      Window* out_win,
+      void* ptr,
+      size_t size);
+
+  // Deregister the NCCL baseline window used for GIN transport.
+  static void deregister_extra_window(
+      torch::comms::NcclxApi* nccl_api,
+      ncclComm_t nccl_comm,
+      Window* win);
+
+  // Destroy backend-specific device communicator (GIN ncclDevComm).
+  static void destroy_device_comm(Ptr& device_window);
+
+  // Select which window handle to use for device window creation.
+  // GIN uses nccl_orig_win_ (device API flag).
+  static Window select_device_win(Window /* win */, Window nccl_orig_win) {
+    return nccl_orig_win;
+  }
+
+  // Register a local buffer for device-side put operations (GIN path).
+  // Uses NCCL_WIN_DEVICE_API | NCCL_WIN_LOCAL_ONLY for non-collective
+  // registration with local lkey only (no rkey allGather).
+  static torch::comms::RegisteredBuffer register_local_buffer(
+      torch::comms::NcclxApi* nccl_api,
+      ncclComm_t nccl_comm,
+      void* ptr,
+      size_t size);
+
+  // Deregister a previously registered local buffer (GIN path).
+  static void deregister_local_buffer(
+      torch::comms::NcclxApi* nccl_api,
+      ncclComm_t nccl_comm,
+      torch::comms::RegisteredBuffer& buf);
 };
 
 // Type alias for backward compatibility

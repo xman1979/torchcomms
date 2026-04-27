@@ -8,8 +8,10 @@ import torch
 from torchcomms import ReduceOp
 from torchcomms.tests.integration.py.TorchCommTestHelpers import (
     create_store,
+    destroy_root_store,
     TorchCommTestWrapper,
     verify_tensor_equality,
+    wrap_prefix_store,
 )
 
 
@@ -20,12 +22,11 @@ def store_deletion_barrier(torchcomm):
     torchcomm.barrier(False)
 
     # Synchronize based on device type
-    device = torchcomm.get_device()
-    if device.type == "cuda":
+    if torch.accelerator.is_available():
         # Calculate device index as rank % num_devices and synchronize
         rank = torchcomm.get_rank()
-        device_index = rank % torch.cuda.device_count()
-        torch.cuda.current_stream(device_index).synchronize()
+        device_index = rank % torch.accelerator.device_count()
+        torch.accelerator.current_stream(device_index).synchronize()
     # For CPU devices, no synchronization needed
 
 
@@ -128,9 +129,10 @@ class MultiCommTest(unittest.TestCase):
         # Test simultaneous communication across all communicators
         self._verify_simultaneous_communication(wrappers)
 
-        # Clean up
+        # Clean up store and free MASTER_PORT for subsequent no-store tests
         store = None
         store_deletion_barrier(comms[-1])
+        destroy_root_store()
 
     def test_three_comms_separate_stores(self):
         """Test with three communicators with separate stores."""
@@ -170,9 +172,10 @@ class MultiCommTest(unittest.TestCase):
         # Test simultaneous communication across all communicators
         self._verify_simultaneous_communication(wrappers)
 
-        # Clean up
+        # Clean up store and free MASTER_PORT for subsequent no-store tests
         store = None
         store_deletion_barrier(comms[-1])
+        destroy_root_store()
 
     def test_mixed_ops_separate_stores(self):
         """Test mixed operations across multiple communicators with separate stores."""
@@ -224,21 +227,21 @@ class MultiCommTest(unittest.TestCase):
         verify_tensor_equality(input1.cpu(), expected1, "comm_0 all_reduce result")
         verify_tensor_equality(input2.cpu(), broadcast_value, "comm_1 broadcast result")
 
-        # Clean up
+        # Clean up store and free MASTER_PORT for subsequent no-store tests
         store = None
         store_deletion_barrier(comms[-1])
+        destroy_root_store()
 
     def test_two_comms_no_store(self):
         """Test with two communicators with no store."""
-        # Create two communicators
         wrappers = []
         comms = []
 
-        # Create first communicator with no store
+        # Create first communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Create second communicator with no store
+        # Create second communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
@@ -251,19 +254,18 @@ class MultiCommTest(unittest.TestCase):
 
     def test_three_comms_no_store(self):
         """Test with three communicators with no store."""
-        # Create three communicators
         wrappers = []
         comms = []
 
-        # Create first communicator with no store
+        # Create first communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Create second communicator with no store
+        # Create second communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Create third communicator with no store
+        # Create third communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
@@ -276,20 +278,18 @@ class MultiCommTest(unittest.TestCase):
 
     def test_mixed_ops_no_store(self):
         """Test mixed operations across multiple communicators with no store."""
-        # Create two communicators
         wrappers = []
         comms = []
 
-        # Create first communicator with no store
+        # Create first communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Create second communicator with no store
+        # Create second communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
         # Prepare tensors for different operations
-        # Calculate device indices as rank % num_devices
         device0 = comms[0].get_device()
         device1 = comms[1].get_device()
         options0 = {"dtype": torch.float, "device": device0}
@@ -317,23 +317,21 @@ class MultiCommTest(unittest.TestCase):
         verify_tensor_equality(input2.cpu(), broadcast_value, "comm_1 broadcast result")
 
     def test_two_comms_mixed_store(self):
-        """Test with two communicators with mixed store (one explicit, one None)."""
-        # Create two communicators
+        """Test with two communicators with mixed store (one explicit, one no-store)."""
         wrappers = []
         comms = []
 
-        # Create a store for the first communicator
-        store = create_store()
-
         # Create first communicator using explicit store
+        store = create_store()
         wrappers.append(TorchCommTestWrapper(store=store))
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Cleanup our store
+        # Destroy all store references and free MASTER_PORT
         store = None
         store_deletion_barrier(comms[0])
+        destroy_root_store()
 
-        # Create second communicator with no store
+        # Create second communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
@@ -345,27 +343,29 @@ class MultiCommTest(unittest.TestCase):
         self._verify_simultaneous_communication(wrappers)
 
     def test_three_comms_mixed_store(self):
-        """Test with three communicators with mixed store (two explicit, one None)."""
-        # Create three communicators
+        """Test with three communicators with mixed store (two explicit, one no-store)."""
         wrappers = []
         comms = []
 
-        # Create a shared store for the first two communicators
-        store1 = create_store()
-        store2 = create_store()
+        # Create first two communicators using PrefixStore wrappers
+        store = create_store()
+        store1 = wrap_prefix_store("comm1", store)
+        store2 = wrap_prefix_store("comm2", store)
 
-        # Create first communicator using the store
         wrappers.append(TorchCommTestWrapper(store=store1))
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Create second communicator using the same store
         wrappers.append(TorchCommTestWrapper(store=store2))
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Cleanup our store
+        # Destroy all store references and free MASTER_PORT
+        store1 = None
+        store2 = None
+        store = None
         store_deletion_barrier(comms[0])
+        destroy_root_store()
 
-        # Create third communicator with no store
+        # Create third communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 
@@ -378,22 +378,20 @@ class MultiCommTest(unittest.TestCase):
 
     def test_mixed_ops_mixed_store(self):
         """Test mixed operations across multiple communicators with mixed store."""
-        # Create two communicators
         wrappers = []
         comms = []
 
-        # Create a store for the first communicator
-        store = create_store()
-
         # Create first communicator using explicit store
+        store = create_store()
         wrappers.append(TorchCommTestWrapper(store=store))
         comms.append(wrappers[-1].get_torchcomm())
 
-        # Cleanup our store
+        # Destroy all store references and free MASTER_PORT
         store = None
         store_deletion_barrier(comms[0])
+        destroy_root_store()
 
-        # Create second communicator with no store
+        # Create second communicator with no store (internal bootstrap)
         wrappers.append(TorchCommTestWrapper())
         comms.append(wrappers[-1].get_torchcomm())
 

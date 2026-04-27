@@ -2,10 +2,10 @@
 
 #include "comms/torchcomms/gloo/TorchCommGloo.hpp"
 
-#include <set>
 #include <string>
 
 #include <fmt/core.h>
+
 #include <gloo/algorithm.h>
 #include <gloo/allgather.h>
 #include <gloo/allreduce.h>
@@ -25,12 +25,12 @@
 #include <gloo/transport/unbound_buffer.h>
 #include <torch/csrc/distributed/c10d/PrefixStore.hpp> // @manual
 
-#include "comms/torchcomms/StoreManager.hpp"
 #include "comms/torchcomms/TorchCommFactory.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
-#include "comms/torchcomms/TorchCommTracing.hpp"
-#include "comms/torchcomms/TorchCommUtils.hpp"
 #include "comms/torchcomms/gloo/GlooStore.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/StoreManager.hpp"
+#include "comms/torchcomms/utils/TracingGuard.hpp"
+#include "comms/torchcomms/utils/Utils.hpp"
 
 namespace torch::comms {
 
@@ -308,18 +308,23 @@ void TorchCommGloo::init(
     const std::string& name,
     const CommOptions& options) {
   TC_LOG(INFO, this) << "Initializing TorchCommGloo for device: " << device;
-  // Initialize private members
   device_ = device;
   name_ = name;
   options_ = options;
+  options_.store = nullptr;
 
-  // Only initialize once
   if (init_state_ == InitializationState::INITIALIZED) {
     throw std::runtime_error("TorchCommGloo already initialized");
   } else if (init_state_ == InitializationState::FINALIZED) {
     throw std::runtime_error("TorchCommGloo already finalized");
   }
-  init_state_ = InitializationState::INITIALIZED;
+
+  if (options.enable_reconfigure) {
+    options_.enable_reconfigure = true;
+    TC_LOG(INFO, this)
+        << "TorchCommGloo dynamic regime enabled, deferring initialization";
+    return;
+  }
 
   if (rank_ == -1 || comm_size_ == -1) {
     auto [rank, comm_size] = query_ranksize();
@@ -327,6 +332,17 @@ void TorchCommGloo::init(
     comm_size_ = comm_size;
   }
 
+  connectGlooContext(options);
+
+  init_state_ = InitializationState::INITIALIZED;
+  TracingGuard tracingGuard(name_, comm_size_, "init", rank_);
+
+  TC_LOG(INFO, this) << "TorchCommGloo initialized for rank: " << rank_;
+}
+
+void TorchCommGloo::connectGlooContext(
+    const CommOptions& options,
+    const std::string& storePrefix) {
   ::gloo::transport::tcp::attr attr;
   attr.hostname = env_to_value<std::string>("TORCHCOMM_GLOO_HOSTNAME", "");
   attr.iface = env_to_value<std::string>("TORCHCOMM_GLOO_INTERFACE", "");
@@ -344,27 +360,80 @@ void TorchCommGloo::init(
       std::make_shared<::gloo::rendezvous::Context>(rank_, comm_size_);
   context->setTimeout(options.timeout);
 
-  auto store = options.store;
-  if (!store) {
-    store = StoreManager::get().getStore(
-        TorchCommGloo::kBackendName, name, options.timeout);
+  auto prefix = storePrefix.empty() ? name_ : storePrefix;
+
+  bool persistentStore = kDefaultPersistentStore;
+  if (options.hints.contains("persistent_store")) {
+    persistentStore = string_to_bool(options.hints.at("persistent_store"));
+  }
+  c10::intrusive_ptr<c10d::Store> bootstrapStore;
+
+  if (options.store) {
+    if (persistentStore) {
+      store_ = options.store;
+    } else {
+      bootstrapStore = options.store;
+      store_ = dupPrefixStore(prefix, bootstrapStore, options.timeout);
+    }
+  } else {
+    bootstrapStore = createPrefixStore(prefix, options.timeout);
+    store_ = dupPrefixStore(prefix, bootstrapStore, options.timeout);
   }
 
   if (rank_ == 0) {
-    int64_t initCount = store->add("init_count", 1);
+    int64_t initCount = store_->add("init_count", 1);
     TORCH_INTERNAL_ASSERT(
         initCount == 1, "detected multiple communicators on same store!");
   }
 
-  auto connectStore = std::make_shared<GlooStore>(store);
+  auto connectStore = std::make_shared<GlooStore>(store_);
   context->connectFullMesh(connectStore, gloo_device);
 
   context_ = std::move(context);
-  store_ = std::move(store);
 
-  TorchCommTracingGuard tracingGuard(name_, comm_size_, "init", rank_);
+  {
+    gloo::BarrierOptions opts(context_);
+    opts.setTimeout(options.timeout);
+    gloo::barrier(opts);
+  }
+  bootstrapStore.reset();
+}
 
-  TC_LOG(INFO, this) << "TorchCommGloo initialized for rank: " << rank_;
+InitHandle TorchCommGloo::getInitHandle() const {
+  return "gloo";
+}
+
+c10::intrusive_ptr<TorchWork> TorchCommGloo::reconfigure(
+    const ReconfigureOptions& opts) {
+  context_.reset();
+  store_.reset();
+  collectiveCounter_ = 0;
+  comm_state_ = CommState::NORMAL;
+
+  comm_size_ = static_cast<int>(
+      std::visit([](const auto& h) { return h.size(); }, opts.handles));
+
+  auto [rank, envCommSize] = query_ranksize();
+  (void)envCommSize;
+  rank_ = rank;
+
+  auto reconfigureTimeout = opts.timeout.value_or(options_.timeout);
+
+  auto storePrefix = fmt::format("{}/reconfigure/{}", name_, opts.uuid);
+
+  CommOptions connectOpts = options_;
+  connectOpts.timeout = reconfigureTimeout;
+
+  connectGlooContext(connectOpts, storePrefix);
+
+  init_state_ = InitializationState::INITIALIZED;
+
+  TracingGuard tracingGuard(name_, comm_size_, "reconfigure", rank_);
+
+  TC_LOG(INFO, this) << "TorchCommGloo reconfigure completed for rank: "
+                     << rank_;
+
+  return c10::make_intrusive<TorchWorkCompleted>();
 }
 
 void TorchCommGloo::finalize() {
@@ -420,8 +489,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::send(
     throw std::runtime_error("Cannot send to self");
   }
 
-  TorchCommTracingGuard tracingGuard(
-      name_, comm_size_, "send", dst, tensor, tensor);
+  TracingGuard tracingGuard(name_, comm_size_, "send", dst, tensor, tensor);
 
   // Convert tensor to CPU for Gloo compatibility
   auto tensorCPU = tensor.to(at::kCPU);
@@ -463,8 +531,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::recv(
     throw std::runtime_error("Cannot recv from self");
   }
 
-  TorchCommTracingGuard tracingGuard(
-      name_, comm_size_, "recv", src, tensor, tensor);
+  TracingGuard tracingGuard(name_, comm_size_, "recv", src, tensor, tensor);
 
   // Convert tensor to CPU for Gloo compatibility
   auto tensorCPU = tensor.to(at::kCPU);
@@ -531,7 +598,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::batch_op_issue(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_,
       comm_size_,
       "batch_op_issue",
@@ -541,10 +608,10 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::batch_op_issue(
 
   // Prepare CPU copies of tensors and track recv operations for copy-back
   struct OpInfo {
-    BatchSendRecv::P2POp::OpType type;
+    BatchSendRecv::P2POp::OpType type{};
     at::Tensor original_tensor; // Original tensor (for copy-back)
     at::Tensor cpu_tensor; // CPU tensor for Gloo
-    int peer;
+    int peer{};
   };
   std::vector<OpInfo> op_infos;
   op_infos.reserve(ops.size());
@@ -658,7 +725,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::broadcast(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "broadcast", root, tensor, tensor);
 
   auto tensorCPU = tensor.to(at::kCPU);
@@ -699,7 +766,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_reduce(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_reduce", rank_, tensor, tensor);
 
   auto tensorCPU = tensor.to(at::kCPU);
@@ -745,8 +812,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::reduce(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
-      name_, comm_size_, "reduce", root, tensor, tensor);
+  TracingGuard tracingGuard(name_, comm_size_, "reduce", root, tensor, tensor);
 
   auto tensorCPU = tensor.to(at::kCPU);
   auto opCPU = convertReduceOpToCPU(op);
@@ -807,7 +873,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_gather(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_gather", rank_, tensor_list, {tensor});
 
   auto tensorCPU = tensor.to(at::kCPU);
@@ -878,7 +944,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_gather_v(
     ensureTensorContiguous(t);
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_gather_v", rank_, tensor_list, {tensor});
 
   auto tensorCPU = tensor.to(at::kCPU);
@@ -947,7 +1013,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_gather_single(
         "Output tensor size must be input_size * comm_size for all_gather_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_gather_single", rank_, input, output);
 
   auto inputCPU = input.to(at::kCPU);
@@ -1007,7 +1073,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::reduce_scatter(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "reduce_scatter", rank_, input_list, {output});
 
   // Concatenate input tensors
@@ -1038,7 +1104,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::reduce_scatter_v(
     ensureTensorContiguous(t);
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "reduce_scatter_v", rank_, input_list, {output});
 
   std::vector<at::Tensor> inputListCPU;
@@ -1116,7 +1182,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::reduce_scatter_single(
         "Input tensor size must be output_size * comm_size for reduce_scatter_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "reduce_scatter_single", rank_, input, output);
 
   // Convert tensors to CPU (noop if already on CPU)
@@ -1182,7 +1248,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_to_all_single(
         "Tensor size must be divisible by comm_size for all_to_all_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_to_all_single", rank_, input, output);
 
   // Convert tensors to CPU
@@ -1260,7 +1326,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_to_all_v_single(
         "Sum of output_split_sizes exceeds output tensor size for all_to_all_v_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_to_all_v_single", rank_, input, output);
 
   auto inputCPU = input.to(at::kCPU);
@@ -1338,7 +1404,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::all_to_all(
     ensureTensorContiguous(output_tensor_list[i]);
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_,
       comm_size_,
       "all_to_all",
@@ -1413,7 +1479,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::barrier(
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
 
-  TorchCommTracingGuard tracingGuard(name_, comm_size_, "barrier", rank_);
+  TracingGuard tracingGuard(name_, comm_size_, "barrier", rank_);
 
   return createWork(
       [options, context = context_, tag = nextTag()]() {
@@ -1453,7 +1519,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::scatter(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "scatter", root, input_tensor_list, {output_tensor});
 
   auto outputCPU = output_tensor.to(at::kCPU);
@@ -1529,7 +1595,7 @@ c10::intrusive_ptr<TorchWork> TorchCommGloo::gather(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "gather", root, {input_tensor}, output_tensor_list);
 
   auto inputCPU = input_tensor.to(at::kCPU);
@@ -1652,6 +1718,7 @@ std::shared_ptr<TorchCommBackend> TorchCommGloo::split(
 
   CommOptions new_options = options;
   new_options.store = new_store;
+  new_options.hints["persistent_store"] = "true";
 
   new_torchcomm->init(device_, new_name, new_options);
 

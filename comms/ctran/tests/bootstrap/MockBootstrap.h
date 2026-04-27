@@ -5,12 +5,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "comms/ctran/interfaces/IBootstrap.h"
+#include "comms/ctran/bootstrap/ICtranBootstrap.h"
 
 namespace ctran::testing {
 
-// Mock IBootstrap for testing
-class MockBootstrap : public ctran::bootstrap::IBootstrap {
+// Mock ICtranBootstrap for testing
+class MockBootstrap : public meta::comms::ICtranBootstrap {
  public:
   MOCK_METHOD(
       folly::SemiFuture<int>,
@@ -19,22 +19,22 @@ class MockBootstrap : public ctran::bootstrap::IBootstrap {
       (override));
   MOCK_METHOD(
       folly::SemiFuture<int>,
-      allGatherIntraNode,
-      (void* buf,
-       int len,
-       int localRank,
-       int localNranks,
-       std::vector<int> localRankToCommRank),
-      (override));
-  MOCK_METHOD(
-      folly::SemiFuture<int>,
       barrier,
       (int rank, int nranks),
       (override));
   MOCK_METHOD(
       folly::SemiFuture<int>,
-      barrierIntraNode,
-      (int localRank, int localNranks, std::vector<int> localRankToCommRank),
+      allGatherNvlDomain,
+      (void* buf,
+       int len,
+       int nvlLocalRank,
+       int nvlNranks,
+       std::vector<int> nvlRankToCommRank),
+      (override));
+  MOCK_METHOD(
+      folly::SemiFuture<int>,
+      barrierNvlDomain,
+      (int nvlLocalRank, int nvlNranks, std::vector<int> nvlRankToCommRank),
       (override));
   MOCK_METHOD(
       folly::SemiFuture<int>,

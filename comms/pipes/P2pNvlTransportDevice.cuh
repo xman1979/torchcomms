@@ -1,17 +1,21 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
 #pragma once
 
 #include <cuda.h>
+
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <cstring>
 #include "comms/pipes/BarrierState.cuh"
 #include "comms/pipes/ChunkState.cuh"
 #include "comms/pipes/CopyUtils.cuh"
+#include "comms/pipes/DeviceCheck.cuh"
 #include "comms/pipes/DeviceSpan.cuh"
+#include "comms/pipes/HipCompat.cuh"
 #include "comms/pipes/SignalState.cuh"
 #include "comms/pipes/ThreadGroup.cuh"
 #include "comms/pipes/Timeout.cuh"
+#include "comms/pipes/ll128/Ll128Ops.cuh"
 
 namespace comms::pipes {
 
@@ -23,12 +27,30 @@ namespace comms::pipes {
  * - Receiver reads from LocalState (own local buffers)
  *
  * This means LocalState buffers are the DESTINATION for incoming data.
+ *
+ * Chunk state buffers (usage depends on useDualStateBuffer option):
+ *
+ * SINGLE STATE MODE (useDualStateBuffer=false):
+ *   - Only receiverStateBuffer is used
+ *   - receiverStateBuffer: State to poll if I am a receiver
+ *     - Sender signals data ready via NVLink write
+ *     - Receiver waits locally, then signals ready-to-send locally
+ *   - senderStateBuffer: Not used (empty span)
+ *
+ * DUAL STATE MODE (useDualStateBuffer=true):
+ *   - Both buffers are used for fully local polling
+ *   - receiverStateBuffer: State to poll if I am a receiver (peer writes
+ *     via NVLink to signal data ready)
+ *   - senderStateBuffer: State to poll if I am a sender (peer writes
+ *     via NVLink to signal ready-to-send after reading)
  */
 struct LocalState {
   char* dataBuffer;
-  DeviceSpan<ChunkState> stateBuffer;
+  DeviceSpan<ChunkState> receiverStateBuffer;
+  DeviceSpan<ChunkState> senderStateBuffer;
   DeviceSpan<SignalState> signalBuffer;
   DeviceSpan<BarrierState> barrierBuffer;
+  Ll128Packet* ll128Buffer{nullptr};
 };
 
 /**
@@ -39,12 +61,42 @@ struct LocalState {
  * - This allows receiver to read from local memory (faster)
  *
  * These pointers are obtained via IPC and point to peer's LocalState buffers.
+ *
+ * Chunk state buffers (usage depends on useDualStateBuffer option):
+ *
+ * SINGLE STATE MODE (useDualStateBuffer=false):
+ *   - Only receiverStateBuffer is used (points to peer's receiverStateBuffer)
+ *   - receiverStateBuffer: State to signal if I am a sender (I write via
+ *     NVLink to signal data ready, or I wait via NVLink for ack)
+ *   - senderStateBuffer: Not used (empty span)
+ *
+ * DUAL STATE MODE (useDualStateBuffer=true):
+ *   - Both buffers are used for fully local polling
+ *   - receiverStateBuffer: State to signal if I am a sender (I write via
+ *     NVLink to signal data ready to peer's receiver)
+ *   - senderStateBuffer: State to signal if I am a receiver (I write via
+ *     NVLink to signal ready-to-send to peer's sender after reading)
  */
 struct RemoteState {
   char* dataBuffer;
-  DeviceSpan<ChunkState> stateBuffer;
+  DeviceSpan<ChunkState> receiverStateBuffer;
+  DeviceSpan<ChunkState> senderStateBuffer;
   DeviceSpan<SignalState> signalBuffer;
   DeviceSpan<BarrierState> barrierBuffer;
+  Ll128Packet* ll128Buffer{nullptr};
+};
+
+/**
+ * NvlinkTransportTileState — Per-peer tile protocol state.
+ *
+ * Bundled by the host transport at construction and passed to
+ * P2pNvlTransportDevice via set_tile_state(). Invisible to users.
+ */
+struct NvlinkTransportTileState {
+  DeviceSpan<int64_t> step_state;
+  int tile_max_groups{0};
+  DeviceSpan<SignalState> local_signals;
+  DeviceSpan<SignalState> remote_signals;
 };
 
 /**
@@ -55,13 +107,45 @@ struct RemoteState {
  * transfer)
  * - chunkSize: Size of each chunk for parallel processing
  * - pipelineDepth: Number of buffer slots for pipelining (typically 2-8)
+ * - useDualStateBuffer: If true, use dual chunk state buffers (one on each
+ *   side) for local polling on both sender and receiver. If false (default),
+ *   use single chunk state buffer on receiver side only.
  *
  * Total memory allocated = pipelineDepth × dataBufferSize
+ *
+ * STATE BUFFER MODES:
+ * ===================
+ * Single State (useDualStateBuffer=false, default):
+ *   - 1 ChunkState per chunk, stored on receiver side
+ *   - Sender polls over NVLink (slower), receiver polls locally (faster)
+ *   - Lower memory usage
+ *
+ * Dual State (useDualStateBuffer=true):
+ *   - 2 ChunkStates per chunk: one on receiver (receiverStateBuffer for data
+ *     ready signal), one on sender (senderStateBuffer for ready-to-send signal)
+ *   - Both sender and receiver poll locally (faster on both sides)
+ *   - Higher memory usage, better performance for high-throughput workloads
+ *   - REQUIRES for_each_item_strided for chunk distribution (see below)
+ *
+ * DUAL STATE MODE - STRIDED CHUNK ASSIGNMENT:
+ * ===========================================
+ * Dual state mode MUST use for_each_item_strided to ensure each chunk is
+ * always assigned to the same thread group within a kernel. This is required
+ * because:
+ *   - ChunkState.unready() uses a plain write with group-wise sync for
+ *     efficiency (st.release.gpu is too slow)
+ *   - This plain write from one group may not be visible to other groups
+ *     without expensive global memory barriers
+ *   - With strided assignment, chunk K is ALWAYS assigned to group
+ *     (K % total_groups), so the unready write is visible to the same group
+ *     after group.sync()
  */
 struct P2pNvlTransportOptions {
   std::size_t dataBufferSize;
   std::size_t chunkSize;
   std::size_t pipelineDepth;
+  bool useDualStateBuffer{false}; // Default to single state buffer mode
+  std::size_t ll128BufferNumPackets{0}; // 0 = no chunking
 };
 
 /**
@@ -175,38 +259,56 @@ struct P2pNvlTransportOptions {
  *   - Receiver warp can process a chunk as soon as sender warp signals it
  *   - Contiguous chunk assignment → good cache locality per warp
  *
- * STATE MACHINE (per chunk)
- * =========================
+ * STATE MACHINE (per chunk) - DUAL CHUNK STATE
+ * =============================================
  *
- * State lives in RECEIVER's local memory. Both GPUs access it:
- * - Sender accesses via NVLink (remote)
- * - Receiver accesses locally (fast)
+ * With dual chunk states, ALL waits are local (no NVLink polling):
+ * - Each GPU has two state buffers per peer:
+ *   1. receiverStateBuffer: State to poll if I am a receiver (peer writes
+ *      here to signal data ready)
+ *   2. senderStateBuffer: State to poll if I am a sender (peer writes here
+ *      to signal ready-to-send after reading)
  *
- *        ┌───────────────┐
- * init → │ READY_TO_SEND │
- *        │     (-1)      │
- *        └───────┬───────┘
- *                │
- *                │ send() waits for READY_TO_SEND, copies data,
- *                │ signals ready_to_recv(stepId)
- *                ▼
- *        ┌───────────────┐
- *    ┌─▶ │ READY_TO_RECV │
- *    │   │   (stepId)    │
- *    │   └───────┬───────┘
- *    │           │
- *    │           │ recv() waits for READY_TO_RECV, copies data,
- *    │           │ signals ready_to_send()
- *    │           ▼
- *    │   ┌───────────────┐
- *    │   │ READY_TO_SEND │
- *    │   │     (-1)      │
- *    │   └───────┬───────┘
- *    │           │
- *    │           │ send() waits for READY_TO_SEND, copies data,
- *    │           │ signals ready_to_recv(stepId)
- *    │           │
- *    └───────────┘
+ * SENDER (GPU A) FLOW:
+ * ====================
+ * 1. Wait LOCAL: localState_.senderStateBuffer for READY_TO_SEND
+ *    - Polls locally for receiver's ready-to-send signal
+ * 2. Copy data to remoteState_.dataBuffer (NVLink write)
+ * 3. Mark LOCAL senderState as UNREADY to prevent re-sending before
+ *    receiver reads (plain write + group sync)
+ * 4. Signal REMOTE: remoteState_.receiverStateBuffer = stepId
+ *    (This is peer's localState_.receiverStateBuffer)
+ *
+ * RECEIVER (GPU B) FLOW:
+ * ======================
+ * 1. Wait LOCAL: localState_.receiverStateBuffer for stepId
+ * 2. Copy data from localState_.dataBuffer (local read)
+ * 3. Mark LOCAL receiverState as UNREADY to prevent re-reading before
+ *    sender writes next (plain write + group sync)
+ * 4. Signal REMOTE: remoteState_.senderStateBuffer = READY_TO_SEND
+ *    (This is peer's localState_.senderStateBuffer - sender can send again)
+ *
+ * STATE TRANSITIONS (per pipeline slot):
+ * ======================================
+ *
+ * localState_.senderStateBuffer (sender waits here):
+ *   init: READY_TO_SEND (-1)
+ *   After sender sends: UNREADY (-2) (prevents re-send before receiver reads)
+ *   After receiver reads: READY_TO_SEND (-1) (sender can send again)
+ *
+ * localState_.receiverStateBuffer (receiver waits here):
+ *   init: UNREADY (-2) (no data)
+ *   After sender writes: stepId (data ready)
+ *   After receiver reads: UNREADY (-2) (prevents re-read before next write)
+ *
+ * WHY STRIDED CHUNK ASSIGNMENT:
+ * =============================
+ * The UNREADY state uses a plain write + group.sync() for efficiency
+ * (st.release.gpu is too slow). This plain write is only visible to
+ * the same thread group after group.sync(), not to other groups.
+ * By using for_each_item_strided, chunk K is ALWAYS assigned to
+ * group (K % total_groups), ensuring the unready write is visible
+ * to the same group in subsequent iterations.
  *
  * CHUNK DISTRIBUTION
  * ==================
@@ -231,42 +333,47 @@ struct P2pNvlTransportOptions {
  *
  *   // Kernel (sender on GPU A)
  *   __global__ void sendKernel(P2pNvlTransportDevice p2p, void* src, size_t n)
- * { auto group = make_warp_group(); p2p.send(group, src, n);  // Writes to GPU
- * B's buffers via NVLink
+ * { auto group = make_warp_group(); p2p.send_group(group, src, n);  // Writes
+ * to GPU B's buffers via NVLink
  *   }
  *
  *   // Kernel (receiver on GPU B)
  *   __global__ void recvKernel(P2pNvlTransportDevice p2p, void* dst, size_t n)
- * { auto group = make_warp_group(); p2p.recv(group, dst, n);  // Reads from own
- * local buffers
+ * { auto group = make_warp_group(); p2p.recv_group(group, dst, n);  // Reads
+ * from own local buffers
  *   }
  */
 class P2pNvlTransportDevice {
  public:
-  // Chunk index used for metadata exchange in send_one/recv_one
-  static constexpr std::size_t kMetadataChunkIndex = 0;
+  __host__ P2pNvlTransportDevice() = default;
 
-  __host__ __device__ P2pNvlTransportDevice() = default;
-  __host__ __device__ P2pNvlTransportDevice(
+  __host__ P2pNvlTransportDevice(
       int myRank,
       int peerRank,
       const P2pNvlTransportOptions& options,
       const LocalState& localState,
-      const RemoteState& remoteState)
+      const RemoteState& remoteState,
+      const NvlinkTransportTileState& tileState = {})
       : myRank_(myRank),
         peerRank_(peerRank),
         options_(options),
         localState_(localState),
-        remoteState_(remoteState) {}
+        remoteState_(remoteState),
+        tile_state_(tileState) {}
 
   __host__ __device__ ~P2pNvlTransportDevice() = default;
 
   /**
-   * send - Transfer data to peer GPU over NVLink
+   * send_group - Cooperative transfer to peer GPU over NVLink
    *
    * Sends 'nbytes' bytes from srcbuff to the peer GPU using pipelined staged
-   * transfer with fine-grained chunk-level synchronization. All threads in the
-   * group cooperate to transfer the data in parallel.
+   * transfer with fine-grained chunk-level synchronization. Multiple groups
+   * collaborate to transfer the data in parallel — work is distributed across
+   * all calling groups via for_each_item_contiguous/strided.
+   *
+   * All calling groups must pass the same src/nbytes. Unlike send(),
+   * which has each group independently send its own partition of data, this
+   * version has all groups cooperate on the entire buffer.
    *
    * ALGORITHM:
    * ==========
@@ -311,22 +418,26 @@ class P2pNvlTransportDevice {
    *   stateOffset = pipelineIdx × chunksPerStep          (into state buffer)
    *   stepOffset = stepId × dataBufferSize               (into source data)
    **/
-  __device__ __forceinline__ void send(
+  __device__ __forceinline__ void send_group(
       ThreadGroup& group,
       void* srcbuff,
       std::size_t nbytes,
-      uint32_t call_index = 0,
       const Timeout& timeout = Timeout()) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    if (options_.dataBufferSize == 0) {
+      printf(
+          "P2pNvlTransportDevice::send_group() requires staging buffer"
+          " (dataBufferSize > 0) at %s:%d\n",
+          __FILE__,
+          __LINE__);
+      __trap();
+    }
     char* src = reinterpret_cast<char*>(srcbuff);
 
-    // REMOTE-WRITE PATTERN:
-    // Sender writes data directly to RECEIVER's local buffer via NVLink.
-    // Benefits: Receiver reads from local memory (faster read, no NVLink hop)
-    // Trade-off: Sender's copy goes over NVLink
     char* sendBuffer = remoteState_.dataBuffer;
-    // Extract raw pointer to avoid aliasing issues (see DeviceSpan.cuh).
-    ChunkState* const sendStates = remoteState_.stateBuffer.data();
+    // Remote signal buffer: peer's receiverStateBuffer (NVLink write)
+    ChunkState* const remoteReceiverStates =
+        remoteState_.receiverStateBuffer.data();
 
     const std::size_t totalSteps =
         (nbytes + options_.dataBufferSize - 1) / options_.dataBufferSize;
@@ -334,52 +445,212 @@ class P2pNvlTransportDevice {
     const std::size_t chunksPerStep =
         (options_.dataBufferSize + kChunkSize - 1) / kChunkSize;
 
-    for (std::size_t stepId = 0; stepId < totalSteps; ++stepId) {
-      // Calculate pipeline slot index for this step
-      const std::size_t pipelineIdx = stepId % options_.pipelineDepth;
-      const std::size_t dataBufferOffset =
-          pipelineIdx * options_.dataBufferSize;
-      const std::size_t stateOffset = pipelineIdx * chunksPerStep;
+    if (options_.useDualStateBuffer) {
+      // =====================================================================
+      // DUAL CHUNK STATE MODE
+      // =====================================================================
+      // Uses two ChunkState buffers per peer to enable local polling:
+      //   - receiverStateBuffer: State to poll if I am a receiver (sender
+      //     writes via NVLink to signal data ready)
+      //   - senderStateBuffer: State to poll if I am a sender (receiver
+      //     signals via NVLink when ready-to-send after reading)
+      //
+      // STATE MACHINE (per chunk, showing sync points):
+      //   ┌──────────────────────────────────────────────────────────────────┐
+      //   │ SENDER (this side)              RECEIVER (peer side)            │
+      //   ├──────────────────────────────────────────────────────────────────┤
+      //   │ 1. Wait LOCAL senderState       1. Wait LOCAL receiverState     │
+      //   │    for READY_TO_SEND               for currentStep value        │
+      //   │    (ld.acquire.sys.global)         (ld.acquire.sys.global)      │
+      //   │                                                                  │
+      //   │ 2. Copy data to peer buffer     2. Copy data from local buffer  │
+      //   │    via NVLink                      (no NVLink needed)           │
+      //   │                                                                  │
+      //   │    ─── group.sync() [inside unready()] ───                      │
+      //   │ 3. Mark LOCAL senderState       3. Mark LOCAL receiverState     │
+      //   │    as UNREADY (plain write)        as UNREADY (plain write)     │
+      //   │                                                                  │
+      //   │    ─── group.sync() [inside ready_to_recv/send()] ───           │
+      //   │ 4. Signal REMOTE peer via       4. Signal REMOTE sender via     │
+      //   │    NVLink st.release.sys to        NVLink st.release.sys        │
+      //   │    receiverState (stepId)          READY_TO_SEND to senderState │
+      //   └──────────────────────────────────────────────────────────────────┘
+      //
+      // KEY INSIGHT: Both sender and receiver poll LOCAL memory, avoiding
+      // expensive NVLink round-trips for busy-wait synchronization.
+      //
+      // FORMAL CORRECTNESS — WHY TWO group.sync() CALLS ARE REQUIRED:
+      // =============================================================
+      //
+      // The two syncs (one in unready(), one in ready_to_recv/send()) serve
+      // different purposes and both are necessary:
+      //
+      // Sync #1 (inside unready(), before plain write):
+      //   Ensures all threads have finished their memcpy before the leader
+      //   writes UNREADY. Without this, some threads may stuck at
+      //   wait_ready_to_send().
+      //
+      // Sync #2 (inside ready_to_recv/send(), before release store):
+      //   Ensures all threads in the group observe the UNREADY plain write
+      //   before the leader does st.release.sys.global to the REMOTE state.
+      //   This is critical because:
+      //
+      //   - unready() writes value_ = UNREADY via a plain store (not
+      //     st.release.sys), so it is only guaranteed visible to threads
+      //     that participate in a subsequent group.sync().
+      //
+      //   - Without sync #2, a non-leader thread could loop back to
+      //     wait_ready_to_send() and do ld.acquire.sys.global on the LOCAL
+      //     senderState. This acquire load has NO acquire-release pair with
+      //     the plain write — they are on the SAME address but the write is
+      //     plain, not a release store. Nor does it pair with the release
+      //     store in ready_to_recv(), which writes to a DIFFERENT address
+      //     (the REMOTE receiverState). So the acquire load could return
+      //     the stale READY_TO_SEND value, causing the thread to re-enter
+      //     memcpy before the peer has consumed the previous data.
+      //
+      //   - sync #2 (__syncthreads) acts as a memory fence that makes the
+      //     UNREADY plain write visible to all threads in the group,
+      //     preventing them from seeing stale READY_TO_SEND.
+      //
+      // STRIDED ASSIGNMENT: Uses for_each_item_strided to ensure
+      // each chunk is always assigned to the same thread group. This is
+      // required because unready() uses plain write + group.sync() (not
+      // st.release.sys), which is only visible within the same group.
+      // =====================================================================
+      ChunkState* const localSenderStates =
+          localState_.senderStateBuffer.data();
 
-      const std::size_t stepOffset = stepId * options_.dataBufferSize;
-      const std::size_t stepBytes =
-          (stepOffset + options_.dataBufferSize <= nbytes)
-          ? options_.dataBufferSize
-          : nbytes - stepOffset;
-      const std::size_t numChunksThisStep =
-          (stepBytes + kChunkSize - 1) / kChunkSize;
+      for (std::size_t stepId = 0; stepId < totalSteps; ++stepId) {
+        const std::size_t pipelineIdx = stepId % options_.pipelineDepth;
+        const std::size_t dataBufferOffset =
+            pipelineIdx * options_.dataBufferSize;
+        const std::size_t stateOffset = pipelineIdx * chunksPerStep;
 
-      group.for_each_item_contiguous(numChunksThisStep, [&](uint32_t chunkIdx) {
-        const std::size_t chunkOffset = chunkIdx * kChunkSize;
-        const std::size_t chunkBytes = (chunkOffset + kChunkSize <= stepBytes)
-            ? kChunkSize
-            : stepBytes - chunkOffset;
+        const std::size_t stepOffset = stepId * options_.dataBufferSize;
+        const std::size_t stepBytes =
+            (stepOffset + options_.dataBufferSize <= nbytes)
+            ? options_.dataBufferSize
+            : nbytes - stepOffset;
+        const std::size_t numChunksThisStep =
+            (stepBytes + kChunkSize - 1) / kChunkSize;
 
-        if (chunkBytes == 0) {
-          return;
-        }
+        group.for_each_item_strided(numChunksThisStep, [&](uint32_t chunkIdx) {
+          const std::size_t chunkOffset = chunkIdx * kChunkSize;
+          const std::size_t chunkBytes = (chunkOffset + kChunkSize <= stepBytes)
+              ? kChunkSize
+              : stepBytes - chunkOffset;
 
-        ChunkState& chunkState = sendStates[stateOffset + chunkIdx];
+          if (chunkBytes == 0) {
+            return;
+          }
 
-        chunkState.wait_ready_to_send(group, timeout);
+          const std::size_t chunkStateIdx = stateOffset + chunkIdx;
 
-        memcpy_vectorized(
-            sendBuffer + dataBufferOffset + chunkOffset,
-            src + stepOffset + chunkOffset,
-            chunkBytes,
-            group);
+          // Wait on LOCAL senderStateBuffer for ready-to-send signal
+          // (fast local poll - receiver signals when done reading)
+          ChunkState& localSenderState = localSenderStates[chunkStateIdx];
 
-        chunkState.ready_to_recv(group, stepId, call_index);
-      });
+          localSenderState.wait_ready_to_send(group, timeout);
+
+          // Copy data to peer's buffer via NVLink
+          memcpy_vectorized(
+              sendBuffer + dataBufferOffset + chunkOffset,
+              src + stepOffset + chunkOffset,
+              chunkBytes,
+              group);
+
+          // Sync #1 + plain write: barrier all threads, then leader
+          // writes UNREADY to local senderState (see correctness note above)
+          localSenderState.unready(group);
+
+          // Sync #2 + release store: barrier all threads (flushes the
+          // UNREADY plain write), then leader does st.release.sys.global
+          // to peer's receiverState via NVLink (see correctness note above)
+          ChunkState& remoteReceiverState = remoteReceiverStates[chunkStateIdx];
+          remoteReceiverState.ready_to_recv(group, stepId);
+        });
+      }
+    } else {
+      // =====================================================================
+      // SINGLE CHUNK STATE MODE (Original Design)
+      // =====================================================================
+      // Uses one ChunkState buffer per peer (simpler but more NVLink latency):
+      //   - receiverStateBuffer: Both wait and signal happen here via NVLink
+      //
+      // STATE MACHINE (per chunk):
+      //   ┌──────────────────────────────────────────────────────────────────┐
+      //   │ SENDER (this side)              RECEIVER (peer side)            │
+      //   ├──────────────────────────────────────────────────────────────────┤
+      //   │ 1. Wait REMOTE receiverState    1. Wait LOCAL receiverState     │
+      //   │    for READY_TO_SEND (-1)          for stepId value             │
+      //   │    (NVLink round-trip)             (fast local poll)            │
+      //   │                                                                  │
+      //   │ 2. Copy data to peer buffer     2. Copy data from local buffer  │
+      //   │    via NVLink                      (no NVLink needed)           │
+      //   │                                                                  │
+      //   │ 3. Signal peer via NVLink       3. Signal LOCAL receiverState   │
+      //   │    write with stepId               with READY_TO_SEND (-1)      │
+      //   └──────────────────────────────────────────────────────────────────┘
+      //
+      // TRADE-OFF: Simpler (no call_index tracking needed) but sender's
+      // busy-wait polls remote memory via NVLink, adding latency.
+      // =====================================================================
+
+      for (std::size_t stepId = 0; stepId < totalSteps; ++stepId) {
+        const std::size_t pipelineIdx = stepId % options_.pipelineDepth;
+        const std::size_t dataBufferOffset =
+            pipelineIdx * options_.dataBufferSize;
+        const std::size_t stateOffset = pipelineIdx * chunksPerStep;
+
+        const std::size_t stepOffset = stepId * options_.dataBufferSize;
+        const std::size_t stepBytes =
+            (stepOffset + options_.dataBufferSize <= nbytes)
+            ? options_.dataBufferSize
+            : nbytes - stepOffset;
+        const std::size_t numChunksThisStep =
+            (stepBytes + kChunkSize - 1) / kChunkSize;
+
+        group.for_each_item_contiguous(
+            numChunksThisStep, [&](uint32_t chunkIdx) {
+              const std::size_t chunkOffset = chunkIdx * kChunkSize;
+              const std::size_t chunkBytes =
+                  (chunkOffset + kChunkSize <= stepBytes)
+                  ? kChunkSize
+                  : stepBytes - chunkOffset;
+
+              if (chunkBytes == 0) {
+                return;
+              }
+
+              const std::size_t chunkStateIdx = stateOffset + chunkIdx;
+
+              // Wait on REMOTE receiverStateBuffer via NVLink (slower)
+              ChunkState& remoteReceiverState =
+                  remoteReceiverStates[chunkStateIdx];
+              remoteReceiverState.wait_ready_to_send(group, timeout);
+
+              // Copy data to peer's buffer via NVLink
+              memcpy_vectorized(
+                  sendBuffer + dataBufferOffset + chunkOffset,
+                  src + stepOffset + chunkOffset,
+                  chunkBytes,
+                  group);
+
+              // Signal peer's receiverStateBuffer via NVLink write
+              remoteReceiverState.ready_to_recv(group, stepId);
+            });
+      }
     }
 #endif
   }
 
   /**
-   * recv - Receive data from peer GPU over NVLink
+   * recv_group - Receive data from peer GPU over NVLink
    *
-   * Receives 'nbytes' bytes into dstbuff from the peer GPU's send() call.
-   * Must be called simultaneously with peer's send() for the same byte count.
+   * Receives 'nbytes' bytes into dstbuff from the peer GPU's send_group()
+   * call. Must be called simultaneously with peer's send_group() for the same
+   * byte count.
    *
    * ALGORITHM:
    * ==========
@@ -414,21 +685,26 @@ class P2pNvlTransportDevice {
    *                                   copy data to dst
    *                                   state = -1 ────────▶ [sender unblocks]
    */
-  __device__ __forceinline__ void recv(
+  __device__ __forceinline__ void recv_group(
       ThreadGroup& group,
       void* dstbuff,
       std::size_t nbytes,
-      uint32_t call_index = 0,
       const Timeout& timeout = Timeout()) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    if (options_.dataBufferSize == 0) {
+      printf(
+          "P2pNvlTransportDevice::recv_group() requires staging buffer"
+          " (dataBufferSize > 0) at %s:%d\n",
+          __FILE__,
+          __LINE__);
+      __trap();
+    }
     char* dst = reinterpret_cast<char*>(dstbuff);
 
-    // REMOTE-WRITE PATTERN:
-    // Receiver reads from LOCAL buffer (sender wrote here via NVLink).
-    // Benefits: Local memory read is faster than reading over NVLink
     char* recvBuffer = localState_.dataBuffer;
-    // Extract raw pointer to avoid aliasing issues (see DeviceSpan.cuh).
-    ChunkState* const recvStates = localState_.stateBuffer.data();
+    // Local wait buffer: my state (sender writes here via NVLink)
+    ChunkState* const localReceiverStates =
+        localState_.receiverStateBuffer.data();
 
     const std::size_t totalSteps =
         (nbytes + options_.dataBufferSize - 1) / options_.dataBufferSize;
@@ -436,359 +712,135 @@ class P2pNvlTransportDevice {
     const std::size_t chunksPerStep =
         (options_.dataBufferSize + kChunkSize - 1) / kChunkSize;
 
-    for (std::size_t stepId = 0; stepId < totalSteps; stepId++) {
-      // Calculate pipeline slot index for this step
-      const std::size_t pipelineIdx = stepId % options_.pipelineDepth;
-      const std::size_t dataBufferOffset =
-          pipelineIdx * options_.dataBufferSize;
-      const std::size_t stateOffset = pipelineIdx * chunksPerStep;
+    if (options_.useDualStateBuffer) {
+      // =====================================================================
+      // DUAL CHUNK STATE MODE (Receiver side)
+      // =====================================================================
+      // See send_group() for detailed state machine, correctness analysis, and
+      // explanation of why two group.sync() calls are required.
+      //
+      // Receiver steps per chunk:
+      // 1. Wait LOCAL receiverState for sender's signal (ld.acquire.sys)
+      // 2. Copy data from local buffer
+      //    ─── group.sync() [inside unready()] ───
+      // 3. Mark LOCAL receiverState as UNREADY (plain write)
+      //    ─── group.sync() [inside ready_to_send()] ───
+      // 4. Signal REMOTE senderState via NVLink (st.release.sys)
+      //
+      // STRIDED ASSIGNMENT: Uses for_each_item_strided to ensure
+      // each chunk is always assigned to the same thread group. This is
+      // required because unready() uses plain write + group.sync() (not
+      // st.release.sys), which is only visible within the same group.
+      // =====================================================================
+      ChunkState* const remoteSenderStates =
+          remoteState_.senderStateBuffer.data();
 
-      const std::size_t stepOffset = stepId * options_.dataBufferSize;
-      const std::size_t stepBytes =
-          (stepOffset + options_.dataBufferSize <= nbytes)
-          ? options_.dataBufferSize
-          : nbytes - stepOffset;
-      const std::size_t numChunksThisStep =
-          (stepBytes + kChunkSize - 1) / kChunkSize;
+      for (std::size_t stepId = 0; stepId < totalSteps; stepId++) {
+        const std::size_t pipelineIdx = stepId % options_.pipelineDepth;
+        const std::size_t dataBufferOffset =
+            pipelineIdx * options_.dataBufferSize;
+        const std::size_t stateOffset = pipelineIdx * chunksPerStep;
 
-      group.for_each_item_contiguous(numChunksThisStep, [&](uint32_t chunkIdx) {
-        const std::size_t chunkOffset = chunkIdx * kChunkSize;
-        const std::size_t chunkBytes = (chunkOffset + kChunkSize <= stepBytes)
-            ? kChunkSize
-            : stepBytes - chunkOffset;
+        const std::size_t stepOffset = stepId * options_.dataBufferSize;
+        const std::size_t stepBytes =
+            (stepOffset + options_.dataBufferSize <= nbytes)
+            ? options_.dataBufferSize
+            : nbytes - stepOffset;
+        const std::size_t numChunksThisStep =
+            (stepBytes + kChunkSize - 1) / kChunkSize;
 
-        if (chunkBytes == 0) {
-          return;
-        }
+        group.for_each_item_strided(numChunksThisStep, [&](uint32_t chunkIdx) {
+          const std::size_t chunkOffset = chunkIdx * kChunkSize;
+          const std::size_t chunkBytes = (chunkOffset + kChunkSize <= stepBytes)
+              ? kChunkSize
+              : stepBytes - chunkOffset;
 
-        ChunkState& chunkState = recvStates[stateOffset + chunkIdx];
+          if (chunkBytes == 0) {
+            return;
+          }
 
-        chunkState.wait_ready_to_recv(group, stepId, call_index, timeout);
+          const std::size_t chunkStateIdx = stateOffset + chunkIdx;
 
-        memcpy_vectorized(
-            dst + stepOffset + chunkOffset,
-            recvBuffer + dataBufferOffset + chunkOffset,
-            chunkBytes,
-            group);
+          // Wait on LOCAL receiverStateBuffer for sender's signal
+          // (fast local poll - sender signals when data is ready)
+          ChunkState& localReceiverState = localReceiverStates[chunkStateIdx];
+          localReceiverState.wait_ready_to_recv(group, stepId, timeout);
 
-        chunkState.ready_to_send(group);
-      });
-    }
-#endif
-  }
+          // Copy data from local buffer
+          memcpy_vectorized(
+              dst + stepOffset + chunkOffset,
+              recvBuffer + dataBufferOffset + chunkOffset,
+              chunkBytes,
+              group);
 
-  /**
-   * send_one - Send a single chunk with metadata
-   *
-   * Sends a single data chunk to the peer GPU along with metadata.
-   * Thread-group 0 writes metadata (nbytes, offset, has_more) to the
-   * receiver's first ChunkState before the data transfer begins.
-   * The metadata is communicated through ChunkState fields and becomes
-   * visible to the receiver when ready_to_recv is signaled (via release-store).
-   *
-   * INPUTS:
-   * @param group ThreadGroup for cooperative processing (all threads
-   *              participate)
-   * @param src Source data pointer (device memory, can be nullptr if nbytes=0)
-   * @param nbytes Number of bytes to send (can be 0 for metadata-only signal)
-   * @param call_index Call index for disambiguating multiple send_one calls
-   *                  in the same kernel (default: 0)
-   * @param offset_in_output Offset in the receiver's output buffer where this
-   *                         chunk should be placed (default: 0)
-   * @param has_more Whether more chunks are coming after this one
-   *                 (default: false for single chunk transfers)
-   */
-  __device__ void send_one(
-      ThreadGroup& group,
-      const void* src,
-      std::size_t nbytes,
-      uint32_t call_index = 0,
-      std::size_t offset_in_output = 0,
-      bool has_more = false,
-      const Timeout& timeout = Timeout()) {
-#ifdef __CUDA_ARCH__
-    ChunkState* const sendStates = remoteState_.stateBuffer.data();
+          // Sync #1 + plain write: barrier all threads, then leader
+          // writes UNREADY to local receiverState (see send_group()
+          // correctness note for why two syncs are required)
+          localReceiverState.unready(group);
 
-    // same as send(), wait for previous recv_one() to complete
-    sendStates[kMetadataChunkIndex].wait_ready_to_send(group, timeout);
-
-    // Thread-group 0 writes metadata to receiver's chunk kMetadataChunkIndex
-    // This happens before send() starts, so receiver can read it
-    if (group.group_id == 0) {
-      sendStates[kMetadataChunkIndex].write_metadata(
-          group, nbytes, offset_in_output, has_more);
-    }
-
-    // empty data transfer, just do the signaling
-    if (nbytes == 0) {
-      if (group.group_id == 0) {
-        sendStates[kMetadataChunkIndex].ready_to_recv(
-            group, kMetadataChunkIndex, call_index);
+          // Sync #2 + release store: barrier all threads (flushes the
+          // UNREADY plain write), then leader does st.release.sys.global
+          // READY_TO_SEND to peer's senderState via NVLink
+          ChunkState& remoteSenderState = remoteSenderStates[chunkStateIdx];
+          remoteSenderState.ready_to_send(group);
+        });
       }
-      return;
-    }
+    } else {
+      // =====================================================================
+      // SINGLE CHUNK STATE MODE (Original Design)
+      // =====================================================================
+      // See send_group() for detailed state machine documentation.
+      //
+      // Receiver side:
+      // 1. Wait LOCAL receiverStateBuffer for sender's signal (stepId)
+      // 2. Copy data from local buffer (sender wrote via NVLink)
+      // 3. Signal LOCAL receiverStateBuffer with READY_TO_SEND (-1)
+      // =====================================================================
 
-    // Now call regular send() to transfer the data
-    // send() will handle all the pipelining and synchronization
-    send(group, const_cast<void*>(src), nbytes, call_index, timeout);
-#endif
-  }
+      for (std::size_t stepId = 0; stepId < totalSteps; stepId++) {
+        const std::size_t pipelineIdx = stepId % options_.pipelineDepth;
+        const std::size_t dataBufferOffset =
+            pipelineIdx * options_.dataBufferSize;
+        const std::size_t stateOffset = pipelineIdx * chunksPerStep;
 
-  /**
-   * recv_one - Receive a single chunk with metadata
-   *
-   * Receives a single data chunk from the peer GPU along with metadata.
-   * All thread-groups first wait for ChunkState[kMetadataChunkIndex] to receive
-   * metadata from sender, then call regular recv() to receive the data.
-   * The metadata (nbytes, offset, has_more) is read from
-   * ChunkState[kMetadataChunkIndex] which was pre-written by the sender's
-   * thread-group 0.
-   *
-   * INPUTS:
-   * @param group ThreadGroup for cooperative processing (all threads
-   *              participate)
-   * @param dst_base Base pointer to the destination buffer (device memory)
-   *
-   * OUTPUTS:
-   * @param nbytes Receives number of bytes in this chunk (required)
-   *
-   * OPTIONAL INPUTS:
-   * @param call_index Call index for disambiguating multiple recv_one calls
-   *                  in the same kernel (default: 0)
-   *
-   * OPTIONAL OUTPUTS (pass nullptr to ignore):
-   * @param offset_in_output Receives offset in dst_base where this chunk
-   *                         was placed (default: nullptr)
-   * @param has_more Receives whether more chunks are coming after this one
-   *                 (default: nullptr)
-   */
-  __device__ void recv_one(
-      ThreadGroup& group,
-      void* dst_base,
-      std::size_t* nbytes,
-      uint32_t call_index = 0,
-      std::size_t* offset_in_output = nullptr,
-      bool* has_more = nullptr,
-      const Timeout& timeout = Timeout()) {
-#ifdef __CUDA_ARCH__
-    ChunkState* const recvStates = localState_.stateBuffer.data();
+        const std::size_t stepOffset = stepId * options_.dataBufferSize;
+        const std::size_t stepBytes =
+            (stepOffset + options_.dataBufferSize <= nbytes)
+            ? options_.dataBufferSize
+            : nbytes - stepOffset;
+        const std::size_t numChunksThisStep =
+            (stepBytes + kChunkSize - 1) / kChunkSize;
 
-    // ALL thread-groups wait for chunk kMetadataChunkIndex's ready_to_recv to
-    // get metadata Step kMetadataChunkIndex is used for the metadata exchange
-    recvStates[kMetadataChunkIndex].wait_ready_to_recv(
-        group, kMetadataChunkIndex, call_index, timeout);
+        group.for_each_item_contiguous(
+            numChunksThisStep, [&](uint32_t chunkIdx) {
+              const std::size_t chunkOffset = chunkIdx * kChunkSize;
+              const std::size_t chunkBytes =
+                  (chunkOffset + kChunkSize <= stepBytes)
+                  ? kChunkSize
+                  : stepBytes - chunkOffset;
 
-    // ALL threads read metadata from chunk kMetadataChunkIndex
-    // (all threads need nbytes_val to call recv())
-    std::size_t nbytes_val, offset_val;
-    bool has_more_val;
-    recvStates[kMetadataChunkIndex].read_metadata(
-        group, nbytes_val, offset_val, has_more_val);
+              if (chunkBytes == 0) {
+                return;
+              }
 
-    // Calculate destination pointer using offset
-    char* dst = reinterpret_cast<char*>(dst_base) + offset_val;
+              const std::size_t chunkStateIdx = stateOffset + chunkIdx;
 
-    // nbytes is always written (required output)
-    *nbytes = nbytes_val;
-    if (offset_in_output != nullptr) {
-      *offset_in_output = offset_val;
-    }
-    if (has_more != nullptr) {
-      *has_more = has_more_val;
-    }
+              // Wait on LOCAL receiverStateBuffer for sender's signal (stepId)
+              ChunkState& localReceiverState =
+                  localReceiverStates[chunkStateIdx];
+              localReceiverState.wait_ready_to_recv(group, stepId, timeout);
 
-    // empty data transfer, just do the signaling
-    if (nbytes_val == 0) {
-      if (group.group_id == 0) {
-        recvStates[kMetadataChunkIndex].ready_to_send(group);
+              // Copy data from local buffer
+              memcpy_vectorized(
+                  dst + stepOffset + chunkOffset,
+                  recvBuffer + dataBufferOffset + chunkOffset,
+                  chunkBytes,
+                  group);
+
+              // Signal LOCAL receiverStateBuffer with READY_TO_SEND
+              localReceiverState.ready_to_send(group);
+            });
       }
-      return;
-    }
-
-    // Now call regular recv() to receive the data
-    // recv() will handle all the pipelining and synchronization
-    // and will signal ready_to_send() for ChunkState[kMetadataChunkIndex] after
-    // completion
-    recv(group, dst, nbytes_val, call_index, timeout);
-#endif
-  }
-
-  /**
-   * send_multiple - Transfer multiple chunks with varying sizes to peer GPU
-   *
-   * Sends multiple data chunks specified by indices from srcbuff to the peer
-   * GPU. First sends complete chunk sizes array via regular send(), then
-   * transfers actual data chunks using send_one() which handles metadata.
-   *
-   * INPUTS:
-   * @param group ThreadGroup for cooperative processing
-   * @param srcbuff_d Source buffer containing all chunks laid out sequentially
-   * @param chunk_sizes DeviceSpan of ALL chunk sizes
-   * @param chunk_indices DeviceSpan of indices of chunks to send to this peer
-   *
-   * EXAMPLE:
-   *   srcbuff_d layout: [chunk0: 100B][chunk1: 200B][chunk2: 150B][chunk3: 50B]
-   *   chunk_sizes = {100, 200, 150, 50}
-   *   chunk_indices = {1, 3}
-   *   -> Sends chunk1 (200B) and chunk3 (50B) to peer
-   *
-   * PROTOCOL:
-   * Phase 1: Send complete chunk sizes array (regular send)
-   * Phase 2: For each chunk, use send_one() to transfer data with metadata
-   *          - has_more=true for all chunks except the last
-   *          - has_more=false for the last chunk (or if no chunks)
-   */
-  __device__ __forceinline__ void send_multiple(
-      ThreadGroup& group,
-      const void* srcbuff_d,
-      DeviceSpan<const std::size_t> chunk_sizes,
-      DeviceSpan<const std::size_t> chunk_indices,
-      const Timeout& timeout = Timeout()) {
-#ifdef __CUDA_ARCH__
-    // Extract raw pointers before loops to avoid aliasing issues
-    // (see DeviceSpan.cuh "Lambda Capture and Aliasing" note)
-    const std::size_t* const chunk_sizes_ptr = chunk_sizes.data();
-    const std::size_t* const chunk_indices_ptr = chunk_indices.data();
-    const std::size_t chunk_sizes_count = chunk_sizes.size();
-    const std::size_t chunk_indices_count = chunk_indices.size();
-
-    // Phase 1: Send complete chunk sizes array
-    send(
-        group,
-        const_cast<void*>(reinterpret_cast<const void*>(chunk_sizes_ptr)),
-        chunk_sizes_count * sizeof(std::size_t),
-        0,
-        timeout);
-
-    // Phase 2: Send each data chunk with metadata
-    // Special case: If chunk_indices is empty, send has_more=false signal
-    if (chunk_indices_count == 0) {
-      // Send empty signal with has_more=false so receiver knows to stop
-      send_one(
-          group,
-          nullptr, // No data
-          0, // nbytes = 0
-          1, // callIndex = 1
-          0, // offset = 0
-          false, // has_more = false (no more chunks)
-          timeout);
-      return;
-    }
-
-    // Track cumulative offset to avoid recalculating from 0 for each chunk
-    // Assumes chunk_indices are sorted in increasing order
-    std::size_t cumulative_offset = 0;
-    std::size_t cumulative_idx =
-        0; // Offset computed for chunks [0, cumulative_idx)
-
-    for (std::size_t i = 0; i < chunk_indices_count; i++) {
-      std::size_t chunk_idx = chunk_indices_ptr[i];
-      std::size_t chunk_size = chunk_sizes_ptr[chunk_idx];
-
-      // Extend cumulative_offset to cover chunks [cumulative_idx, chunk_idx)
-      while (cumulative_idx < chunk_idx) {
-        cumulative_offset += chunk_sizes_ptr[cumulative_idx];
-        cumulative_idx++;
-      }
-
-      // Send this chunk with metadata
-      // has_more = true for all chunks except the last one
-      const char* src_ptr =
-          reinterpret_cast<const char*>(srcbuff_d) + cumulative_offset;
-      bool has_more = (i < chunk_indices_count - 1);
-      send_one(
-          group,
-          src_ptr,
-          chunk_size,
-          static_cast<uint32_t>(i + 1), // callIndex increments for each call
-          cumulative_offset, // offset in output buffer
-          has_more,
-          timeout);
-    }
-#endif
-  }
-
-  /**
-   * recv_multiple - Receive multiple chunks with varying sizes from peer GPU
-   *
-   * Receives multiple data chunks into recvbuff. First receives complete chunk
-   * sizes array via regular recv(), then receives actual data chunks using
-   * recv_one() which reads metadata.
-   *
-   * INPUTS:
-   * @param group ThreadGroup for cooperative processing
-   *
-   * OUTPUTS:
-   * @param recvbuff Destination buffer where chunks are written at their
-   *                 original offsets (based on chunk_sizes)
-   * @param chunk_sizes DeviceSpan populated with received chunk sizes
-   *
-   * EXAMPLE:
-   *   Sender sends chunk1 (200B) and chunk3 (50B) from 4-chunk buffer
-   *   chunk_sizes.size() = 4
-   *   -> chunk_sizes receives {100, 200, 150, 50}
-   *   -> recvbuff written at: offset 100 (200B), offset 450 (50B)
-   *
-   * PROTOCOL:
-   * Phase 1: Receive complete chunk sizes array (regular recv)
-   * Phase 2: Use recv_one() to receive chunks until has_more=false
-   *          - If first chunk has nbytes=0 and has_more=false, no data chunks
-   *          - Otherwise, keep receiving until has_more=false
-   */
-  __device__ void recv_multiple(
-      ThreadGroup& group,
-      void* recvbuff,
-      DeviceSpan<std::size_t> chunk_sizes,
-      const Timeout& timeout = Timeout()) {
-#ifdef __CUDA_ARCH__
-    // Extract raw pointer before use (see DeviceSpan.cuh "Lambda Capture and
-    // Aliasing" note)
-    std::size_t* const chunk_sizes_ptr = chunk_sizes.data();
-    const std::size_t chunk_sizes_count = chunk_sizes.size();
-
-    // Phase 1: Receive complete chunk sizes array
-    uint32_t call_index = 0;
-    recv(
-        group,
-        reinterpret_cast<void*>(chunk_sizes_ptr),
-        chunk_sizes_count * sizeof(std::size_t),
-        call_index,
-        timeout);
-
-    // Phase 2: Receive chunks until has_more=false
-    char* dst_base = reinterpret_cast<char*>(recvbuff);
-
-    std::size_t nbytes_val = 0;
-    std::size_t offset_val = 0;
-    bool has_more = false;
-
-    // Receive first chunk
-    call_index++;
-    recv_one(
-        group,
-        dst_base,
-        &nbytes_val,
-        call_index,
-        &offset_val,
-        &has_more,
-        timeout);
-
-    // If nbytes=0 and has_more=false, this is the empty signal (no chunks)
-    if (nbytes_val == 0 && !has_more) {
-      return;
-    }
-
-    // Keep receiving while there are more chunks
-    while (has_more) {
-      call_index++;
-      recv_one(
-          group,
-          dst_base,
-          &nbytes_val,
-          call_index,
-          &offset_val,
-          &has_more,
-          timeout);
     }
 #endif
   }
@@ -803,31 +855,39 @@ class P2pNvlTransportDevice {
     return remoteState_;
   }
 
+  __host__ __device__ size_t get_ll128_buffer_num_packets() const {
+    return options_.ll128BufferNumPackets;
+  }
+
   /**
-   * put - Direct local memory copy using vectorized operations
+   * put_group - Cooperative local memory copy using vectorized operations
    *
-   * Performs a high-performance vectorized copy from src_d to dst_d using
-   * memcpy_vectorized. The work is distributed across ALL thread groups
-   * using for_each_item_contiguous, so each group processes only its portion
-   * of the data.
+   * Performs a high-performance vectorized copy from src_d to dst_d.
+   * Multiple groups collaborate on the same src/dst/nbytes — work is
+   * distributed across all calling groups via for_each_item_contiguous
+   * by global group_id.
    *
-   * The chunk size is computed dynamically as (nbytes / total_groups) to
-   * ensure good parallelism, with a minimum of 16 bytes per chunk for
-   * vectorized access efficiency.
+   * All calling groups must pass the same src/dst/nbytes. Unlike put(),
+   * which has each group independently copy its own partition of data, this
+   * version has all groups cooperate on the entire buffer.
    *
-   * NOTE: only support no overlap copy for now
+   * Contrast with send_group(): send_group() writes to the peer GPU's staging
+   * buffer via NVLink with pipelined flow control. put_group() copies within
+   * local memory without any signaling or flow control.
    *
    * @param group ThreadGroup for cooperative processing
    * @param dst_d Destination pointer (device memory)
    * @param src_d Source pointer (device memory)
-   * @param nbytes Number of bytes to write
+   * @param nbytes Number of bytes to copy
    *
    * @return Number of bytes written by the current thread group
    */
-  __device__ __forceinline__ std::size_t
-  put(ThreadGroup& group, char* dst_d, const char* src_d, std::size_t nbytes) {
-#ifdef __CUDA_ARCH__
-    // Early return for no-op cases
+  __device__ __forceinline__ std::size_t put_group(
+      [[maybe_unused]] ThreadGroup& group,
+      [[maybe_unused]] char* dst_d,
+      [[maybe_unused]] const char* src_d,
+      [[maybe_unused]] std::size_t nbytes) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     if (nbytes == 0) {
       return 0;
     }
@@ -847,10 +907,10 @@ class P2pNvlTransportDevice {
 
     // Distribute chunks across all groups using for_each_item_contiguous
     // Each group processes its assigned contiguous range of chunks
-    std::size_t chunkBytes = 0;
+    std::size_t totalBytesWritten = 0;
     group.for_each_item_contiguous(numChunks, [&](uint32_t chunkIdx) {
       const std::size_t chunkOffset = chunkIdx * alignedChunkSize;
-      chunkBytes += (chunkOffset + alignedChunkSize <= nbytes)
+      const std::size_t chunkBytes = (chunkOffset + alignedChunkSize <= nbytes)
           ? alignedChunkSize
           : nbytes - chunkOffset;
 
@@ -860,15 +920,49 @@ class P2pNvlTransportDevice {
             src_d + chunkOffset, // src_base
             chunkBytes, // chunk_bytes
             group);
+        totalBytesWritten += chunkBytes;
       }
     });
-    return chunkBytes;
+    return totalBytesWritten;
 #endif
     return 0;
   }
 
   /**
-   * signal_threadgroup - Signal peer GPU via NVLink
+   * put - Independent per-group local memory copy
+   *
+   * Performs a vectorized copy from src_d to dst_d using only threads within
+   * the calling group. Each group operates independently on its own data,
+   * so different groups can call put() with different src/dst/nbytes.
+   *
+   * Unlike put_group(), which has all groups cooperate on the same buffer,
+   * put() has each group work on its own partition independently.
+   *
+   * Contrast with send(): send() writes to the peer GPU's staging
+   * buffer via NVLink with pipelined flow control and signaling. put()
+   * copies within local memory without any signaling or flow control.
+   *
+   * @param group ThreadGroup for cooperative processing (group-local)
+   * @param dst_d Destination pointer (device memory)
+   * @param src_d Source pointer (device memory)
+   * @param nbytes Number of bytes to copy
+   */
+  __device__ __forceinline__ void put(
+      ThreadGroup& group,
+      char* __restrict__ dst_d,
+      const char* __restrict__ src_d,
+      std::size_t nbytes) {
+#ifdef __CUDA_ARCH__
+    if (nbytes == 0) {
+      return;
+    }
+    assert_buffer_non_overlap(dst_d, src_d, nbytes);
+    memcpy_vectorized(dst_d, src_d, nbytes, group);
+#endif
+  }
+
+  /**
+   * signal - Signal peer GPU via NVLink
    *
    * Sends a signal to the peer's Signal object at the specified index.
    * Only the group leader performs the signal after synchronizing all threads.
@@ -883,16 +977,13 @@ class P2pNvlTransportDevice {
    * @param op SIGNAL_SET to store value, SIGNAL_ADD to atomically add value
    * @param value The value to set or add to peer's signal counter
    */
-  __device__ __forceinline__ void signal_threadgroup(
-      ThreadGroup& group,
-      uint64_t signal_id,
-      SignalOp op,
-      uint64_t value) {
+  __device__ __forceinline__ void
+  signal(ThreadGroup& group, uint64_t signal_id, SignalOp op, uint64_t value) {
     remoteState_.signalBuffer[signal_id].signal(group, op, value);
   }
 
   /**
-   * wait_signal_until_threadgroup - Wait for signal from peer GPU
+   * wait_signal_until - Wait for signal from peer GPU
    *
    * Waits until the local Signal object at the specified index satisfies
    * the given condition. All threads in the group poll the signal.
@@ -907,7 +998,7 @@ class P2pNvlTransportDevice {
    * @param op The comparison operation (CMP_EQ, CMP_GE, etc.)
    * @param value The value to compare against
    */
-  __device__ __forceinline__ void wait_signal_until_threadgroup(
+  __device__ __forceinline__ void wait_signal_until(
       ThreadGroup& group,
       uint64_t signal_id,
       CmpOp op,
@@ -917,7 +1008,29 @@ class P2pNvlTransportDevice {
   }
 
   /**
-   * barrier_sync_threadgroup - Two-sided barrier synchronization with peer GPU
+   * reset_signal - Reset a local signal slot to zero
+   *
+   * Resets the local signal counter at the specified index to zero.
+   * This is safe to call from the receiver side after processing the signal,
+   * since the receiver owns the local inbox buffer.
+   *
+   * The caller must ensure the signal has already been consumed (waited on)
+   * before resetting, and that no peer is concurrently signaling the same slot.
+   *
+   * @param group ThreadGroup for cooperative thread synchronization
+   * @param signal_id Index into the signalBuffer array
+   */
+  __device__ __forceinline__ void reset_signal(
+      ThreadGroup& group,
+      uint64_t signal_id) {
+    if (group.is_leader()) {
+      localState_.signalBuffer[signal_id].store(0);
+    }
+    group.sync();
+  }
+
+  /**
+   * barrier_sync - Two-sided barrier synchronization with peer GPU
    *
    * Performs a full barrier synchronization between this GPU and the peer GPU
    * over NVLink. Both sides must call this function to complete the barrier.
@@ -937,7 +1050,7 @@ class P2pNvlTransportDevice {
    * All threads in the group must call this function (collective operation).
    * Both GPUs must call with the same barrier_id to synchronize.
    */
-  __device__ __forceinline__ void barrier_sync_threadgroup(
+  __device__ __forceinline__ void barrier_sync(
       ThreadGroup& group,
       uint64_t barrier_id,
       const Timeout& timeout = Timeout()) {
@@ -958,12 +1071,385 @@ class P2pNvlTransportDevice {
     group.sync();
   }
 
+  // ===========================================================================
+  // LL128 Protocol Operations
+  // ===========================================================================
+
+  /**
+   * ll128_send_group — Send data to peer's LL128 buffer via NVLink.
+   *
+   * Packs user data into LL128 packets and volatile-stores them to the
+   * peer's LL128 buffer with inline flag signaling.
+   *
+   * PRECONDITION: ll128BufferSize > 0 in transport config.
+   *
+   * @param group   ThreadGroup (auto-converted to warp scope)
+   * @param src     Local source buffer (16-byte aligned)
+   * @param nbytes  Total bytes (must be a multiple of 16)
+   * @param timeout Timeout for flag polling
+   */
+  __device__ __forceinline__ void ll128_send_group(
+      const ThreadGroup& group,
+      const char* src,
+      size_t nbytes,
+      const Timeout& timeout = Timeout()) {
+#ifdef __CUDA_ARCH__
+    PIPES_DEVICE_CHECK(remoteState_.ll128Buffer != nullptr);
+    PIPES_DEVICE_CHECK(can_use_ll128(src, nbytes));
+
+    comms::pipes::ll128_send(
+        group,
+        src,
+        nbytes,
+        remoteState_.ll128Buffer,
+        timeout,
+        options_.ll128BufferNumPackets);
+#endif
+  }
+
+  /**
+   * ll128_recv_group — Receive data from local LL128 buffer.
+   *
+   * Polls the local LL128 buffer (written remotely by peer), reads
+   * payload to output buffer, and ACKs with READY_TO_WRITE.
+   *
+   * PRECONDITION: ll128BufferSize > 0 in transport config.
+   *
+   * @param group   ThreadGroup (auto-converted to warp scope)
+   * @param dst     Local output buffer (16-byte aligned)
+   * @param nbytes  Total bytes (must be a multiple of 16)
+   * @param timeout Timeout for flag polling
+   */
+  __device__ __forceinline__ void ll128_recv_group(
+      const ThreadGroup& group,
+      char* dst,
+      size_t nbytes,
+      const Timeout& timeout = Timeout()) {
+#ifdef __CUDA_ARCH__
+    PIPES_DEVICE_CHECK(localState_.ll128Buffer != nullptr);
+    PIPES_DEVICE_CHECK(can_use_ll128(dst, nbytes));
+
+    comms::pipes::ll128_recv(
+        group,
+        dst,
+        nbytes,
+        localState_.ll128Buffer,
+        timeout,
+        options_.ll128BufferNumPackets);
+#endif
+  }
+
+  /**
+   * ll128_forward_group — Receive from predecessor and forward to successor.
+   *
+   * Reads from this transport's local LL128 buffer (predecessor wrote here),
+   * forwards to successor_transport's remote LL128 buffer, copies payload
+   * to local output, and ACKs predecessor.
+   *
+   * PRECONDITION: ll128BufferSize > 0 in both this and successor transport.
+   *
+   * @param group                ThreadGroup (auto-converted to warp scope)
+   * @param dst                  Local output buffer (16-byte aligned)
+   * @param nbytes               Total bytes (must be a multiple of 16)
+   * @param successor_transport  Transport for the successor peer
+   * @param timeout              Timeout for flag polling
+   */
+  __device__ __forceinline__ void ll128_forward_group(
+      const ThreadGroup& group,
+      char* dst,
+      size_t nbytes,
+      const P2pNvlTransportDevice& successor_transport,
+      const Timeout& timeout = Timeout()) {
+#ifdef __CUDA_ARCH__
+    PIPES_DEVICE_CHECK(localState_.ll128Buffer != nullptr);
+    PIPES_DEVICE_CHECK(successor_transport.remoteState_.ll128Buffer != nullptr);
+    PIPES_DEVICE_CHECK(can_use_ll128(dst, nbytes));
+
+    // Use the minimum packet count of local and successor buffers.
+    // 0 means uncapped (legacy path where buffer is pre-sized to fit).
+    const size_t my_packets = options_.ll128BufferNumPackets;
+    const size_t succ_packets =
+        successor_transport.options_.ll128BufferNumPackets;
+    size_t effective_packets = 0;
+    if (my_packets > 0 && succ_packets > 0) {
+      effective_packets =
+          (my_packets < succ_packets) ? my_packets : succ_packets;
+    } else if (my_packets > 0) {
+      effective_packets = my_packets;
+    } else {
+      effective_packets = succ_packets;
+    }
+
+    comms::pipes::ll128_forward(
+        group,
+        dst,
+        nbytes,
+        localState_.ll128Buffer,
+        successor_transport.remoteState_.ll128Buffer,
+        timeout,
+        effective_packets);
+#endif
+  }
+
+  /**
+   * send - Independent per-group transfer to peer GPU over NVLink
+   *
+   * Each group independently sends its own tile of data to the peer GPU's
+   * staging buffer via NVLink, with per-group pipelined flow control and
+   * signaling. Different groups can call send() with different
+   * src/nbytes.
+   *
+   * Unlike send_group(), which has all groups cooperate on the same buffer,
+   * send() has each group work on its own partition independently.
+   *
+   * @param active_blocks Number of blocks calling send concurrently.
+   *   0 means use tile_max_groups from transport config.
+   * @param max_signal_bytes Hint for max bytes between DATA_READY signals.
+   *   0 means one signal per slot fill. Capped at per_block_slot_size.
+   */
+  __device__ __forceinline__ void send(
+      ThreadGroup& group,
+      const void* __restrict__ src,
+      std::size_t nbytes,
+      int active_blocks = 0,
+      std::size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout()) {
+#ifdef __CUDA_ARCH__
+    if (nbytes == 0) {
+      return;
+    }
+
+    const int max_groups = tile_state_.tile_max_groups;
+    const int groupId = group.group_id;
+    const int effActive = active_blocks > 0 ? active_blocks : max_groups;
+
+    if (effActive > max_groups) {
+      printf(
+          "send: active_blocks=%d > tile_max_groups=%d. "
+          "Signal and step_state arrays would be accessed out of bounds.\n",
+          effActive,
+          max_groups);
+      __trap();
+    }
+
+    if (groupId >= effActive) {
+      printf(
+          "send: groupId=%d >= active_blocks=%d. "
+          "Too many groups calling send.\n",
+          groupId,
+          effActive);
+      __trap();
+    }
+
+    const char* __restrict__ srcPtr = reinterpret_cast<const char*>(src);
+    char* __restrict__ stagBuf = remoteState_.dataBuffer;
+
+    const std::size_t slotSize = options_.dataBufferSize;
+    const std::size_t perBlockSlotSize = (slotSize / effActive) & ~15ULL;
+    if (perBlockSlotSize == 0) {
+      printf(
+          "send/recv: perBlockSlotSize is 0 "
+          "(dataBufferSize=%llu, active_blocks=%d). "
+          "Increase dataBufferSize or decrease active_blocks.\n",
+          (unsigned long long)slotSize,
+          effActive);
+      __trap();
+    }
+    const std::size_t stagingOff = groupId * perBlockSlotSize;
+
+    const std::size_t chunkSize =
+        max_signal_bytes > 0 && max_signal_bytes < perBlockSlotSize
+        ? (max_signal_bytes & ~15ULL)
+        : perBlockSlotSize;
+    const std::size_t effectiveChunk =
+        chunkSize > 0 ? chunkSize : perBlockSlotSize;
+
+    const std::size_t totalSteps =
+        (nbytes + effectiveChunk - 1) / effectiveChunk;
+    const std::size_t stepsPerSlot =
+        (perBlockSlotSize + effectiveChunk - 1) / effectiveChunk;
+
+    const uint64_t tailSignalId = groupId;
+    const uint64_t headSignalId = max_groups + groupId;
+
+    int64_t step = tile_state_.step_state[groupId];
+
+    for (std::size_t s = 0; s < totalSteps; ++s) {
+      const std::size_t slotStep = s / stepsPerSlot;
+      const std::size_t subStep = s % stepsPerSlot;
+      const std::size_t slot = slotStep % options_.pipelineDepth;
+      const std::size_t slotOff = slot * slotSize;
+      const std::size_t chunkOff = subStep * effectiveChunk;
+
+      const std::size_t dataOff = s * effectiveChunk;
+      const std::size_t copyBytes = (dataOff + effectiveChunk <= nbytes)
+          ? effectiveChunk
+          : (dataOff < nbytes ? nbytes - dataOff : 0);
+
+      if (subStep == 0 &&
+          step >= static_cast<int64_t>(stepsPerSlot * options_.pipelineDepth)) {
+        tile_state_.local_signals[headSignalId].wait_until(
+            group,
+            CmpOp::CMP_GE,
+            static_cast<uint64_t>(
+                step - stepsPerSlot * options_.pipelineDepth + 1),
+            timeout);
+      }
+
+      if (copyBytes > 0) {
+        memcpy_vectorized(
+            stagBuf + slotOff + stagingOff + chunkOff,
+            srcPtr + dataOff,
+            copyBytes,
+            group);
+      }
+
+      group.sync();
+      if (group.is_leader()) {
+        tile_state_.remote_signals[tailSignalId].signal(
+            SignalOp::SIGNAL_SET, static_cast<uint64_t>(step + 1));
+      }
+
+      step++;
+    }
+
+    if (group.is_leader()) {
+      tile_state_.step_state[groupId] = step;
+    }
+    group.sync();
+#endif
+  }
+
+  __device__ __forceinline__ void recv(
+      ThreadGroup& group,
+      void* __restrict__ dst,
+      std::size_t nbytes,
+      int active_blocks = 0,
+      std::size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout()) {
+#ifdef __CUDA_ARCH__
+    if (nbytes == 0) {
+      return;
+    }
+
+    const int max_groups = tile_state_.tile_max_groups;
+    const int groupId = group.group_id;
+    const int effActive = active_blocks > 0 ? active_blocks : max_groups;
+
+    if (effActive > max_groups) {
+      printf(
+          "recv: active_blocks=%d > tile_max_groups=%d. "
+          "Signal and step_state arrays would be accessed out of bounds.\n",
+          effActive,
+          max_groups);
+      __trap();
+    }
+
+    if (groupId >= effActive) {
+      printf(
+          "recv: groupId=%d >= active_blocks=%d. "
+          "Too many groups calling recv.\n",
+          groupId,
+          effActive);
+      __trap();
+    }
+
+    char* __restrict__ dstPtr = reinterpret_cast<char*>(dst);
+    char* __restrict__ stagBuf = localState_.dataBuffer;
+
+    const std::size_t slotSize = options_.dataBufferSize;
+    const std::size_t perBlockSlotSize = (slotSize / effActive) & ~15ULL;
+    if (perBlockSlotSize == 0) {
+      printf(
+          "send/recv: perBlockSlotSize is 0 "
+          "(dataBufferSize=%llu, active_blocks=%d). "
+          "Increase dataBufferSize or decrease active_blocks.\n",
+          (unsigned long long)slotSize,
+          effActive);
+      __trap();
+    }
+    const std::size_t stagingOff = groupId * perBlockSlotSize;
+
+    const std::size_t chunkSize =
+        max_signal_bytes > 0 && max_signal_bytes < perBlockSlotSize
+        ? (max_signal_bytes & ~15ULL)
+        : perBlockSlotSize;
+    const std::size_t effectiveChunk =
+        chunkSize > 0 ? chunkSize : perBlockSlotSize;
+
+    const std::size_t totalSteps =
+        (nbytes + effectiveChunk - 1) / effectiveChunk;
+    const std::size_t stepsPerSlot =
+        (perBlockSlotSize + effectiveChunk - 1) / effectiveChunk;
+
+    const uint64_t tailSignalId = groupId;
+    const uint64_t headSignalId = max_groups + groupId;
+
+    int64_t step = tile_state_.step_state[max_groups + groupId];
+
+    for (std::size_t s = 0; s < totalSteps; ++s) {
+      const std::size_t slotStep = s / stepsPerSlot;
+      const std::size_t subStep = s % stepsPerSlot;
+      const std::size_t slot = slotStep % options_.pipelineDepth;
+      const std::size_t slotOff = slot * slotSize;
+      const std::size_t chunkOff = subStep * effectiveChunk;
+
+      const std::size_t dataOff = s * effectiveChunk;
+      const std::size_t copyBytes = (dataOff + effectiveChunk <= nbytes)
+          ? effectiveChunk
+          : (dataOff < nbytes ? nbytes - dataOff : 0);
+
+      tile_state_.local_signals[tailSignalId].wait_until(
+          group, CmpOp::CMP_GE, static_cast<uint64_t>(step + 1), timeout);
+
+      if (copyBytes > 0) {
+        memcpy_vectorized(
+            dstPtr + dataOff,
+            stagBuf + slotOff + stagingOff + chunkOff,
+            copyBytes,
+            group);
+      }
+
+      group.sync();
+      if (group.is_leader()) {
+        if (subStep == stepsPerSlot - 1 || s == totalSteps - 1) {
+          tile_state_.remote_signals[headSignalId].signal(
+              SignalOp::SIGNAL_SET, static_cast<uint64_t>(step + 1));
+        }
+      }
+
+      step++;
+    }
+
+    if (group.is_leader()) {
+      tile_state_.step_state[max_groups + groupId] = step;
+    }
+    group.sync();
+#endif
+  }
+
+  __host__ __device__ const NvlinkTransportTileState& tile_state() const {
+    return tile_state_;
+  }
+
+  // Device accessors for 2D tile kernel (inlined pipeline)
+  __host__ __device__ const P2pNvlTransportOptions& options() const {
+    return options_;
+  }
+  __device__ LocalState& local_state() {
+    return localState_;
+  }
+  __device__ RemoteState& remote_state() {
+    return remoteState_;
+  }
+
  private:
   const int myRank_{-1};
   const int peerRank_{-1};
   const P2pNvlTransportOptions options_;
   LocalState localState_;
   RemoteState remoteState_;
+  NvlinkTransportTileState tile_state_;
 };
 
 } // namespace comms::pipes

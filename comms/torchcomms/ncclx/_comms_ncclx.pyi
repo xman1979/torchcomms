@@ -1,24 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-strict
 
-from typing import Any, List, Union
+from typing import List
 
 import torch
+from torchcomms._comms import TorchCommWindow
 
-class TorchCommWindowNCCLXGin:
-    def tensor_register(self, tensor: torch.Tensor) -> None: ...
-    def tensor_deregister(self) -> None: ...
-    def get_device_window(
-        self,
-        signal_count: int = -1,
-        counter_count: int = -1,
-        barrier_count: int = 1,
-    ) -> int: ...
-    def get_nccl_window(self) -> int: ...
+class TorchCommWindowNCCLXGin(TorchCommWindow):
+    def get_nvlink_address(self, peer: int, offset: int = 0) -> int: ...
+    def get_multimem_address(self, offset: int = 0) -> int: ...
 
-def cast_to_ncclx_window(
-    base_window: Union[TorchCommWindowNCCLXGin, Any],
-) -> TorchCommWindowNCCLXGin: ...
+class TorchCommWindowNCCLXPipes(TorchCommWindow): ...
 
 class TorchWork:
     def is_completed(self) -> bool: ...
@@ -28,6 +20,14 @@ class TorchCommNCCLXPersistentRequest:
     def map_remote_tensor(self) -> torch.Tensor: ...
 
 class TorchCommNCCLX:
+    def device_alltoallv_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_split_sizes: torch.Tensor,
+        input_split_sizes: torch.Tensor,
+        async_op: bool,
+    ) -> TorchWork: ...
     def alltoallv_dynamic_dispatch(
         self,
         output_tensor_list: List[torch.Tensor],
@@ -78,3 +78,15 @@ class TorchCommNCCLX:
         request: TorchCommNCCLXPersistentRequest,
         async_op: bool,
     ) -> TorchWork: ...
+    def reduce_scatter_quantized(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        op: torch.distributed.ReduceOp,
+        seed: torch.Tensor,
+        async_op: bool,
+    ) -> TorchWork: ...
+    def comm_dump(self) -> dict[str, str]: ...
+
+def comm_dump_all() -> dict[str, dict[str, str]]: ...
+def init_caching_allocator_hook() -> None: ...

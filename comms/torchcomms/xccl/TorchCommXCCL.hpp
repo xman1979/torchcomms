@@ -18,14 +18,18 @@
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/device/xpu/XpuApi.hpp"
+#include "comms/torchcomms/utils/TracingGuard.hpp"
 #include "comms/torchcomms/xccl/TorchWorkXCCL.hpp"
 #include "comms/torchcomms/xccl/XcclApi.hpp"
 
 namespace torch::comms {
 
-constexpr size_t kMaxEventPoolSize = 1000;
+// Hint key names for XCCL backend configuration
+constexpr std::string_view kHintHighPriorityStream = "high_priority_stream";
+constexpr std::string_view kHintMaxEventPoolSize = "max_event_pool_size";
+
+constexpr size_t kDefaultMaxEventPoolSize = 1000;
 
 // Custom exception class for better error handling
 class XCCLException : public std::exception {
@@ -65,6 +69,7 @@ class TorchCommXCCL : public TorchCommBackend,
   int getRank() const override;
   int getSize() const override;
   std::string_view getBackendName() const override;
+  std::string_view getBackendVersion() const override;
   std::string_view getCommName() const override;
 
   // Point-to-Point Operations
@@ -226,7 +231,11 @@ class TorchCommXCCL : public TorchCommBackend,
   c10::intrusive_ptr<TorchWorkXCCL> createWork(
       xpuStream_t stream,
       std::chrono::milliseconds timeout,
-      const std::vector<at::Tensor>& inputTensors);
+      const std::vector<at::Tensor>& inputTensors = {});
+  c10::intrusive_ptr<TorchWorkXCCL> createWork(
+      xpuStream_t stream,
+      std::chrono::milliseconds timeout,
+      const at::Tensor& inputTensor);
 
  private:
   // Helper that automatically cleans up premul sums.
@@ -268,7 +277,7 @@ class TorchCommXCCL : public TorchCommBackend,
   void timeoutWatchdog() noexcept;
   void checkInitialized() const;
   void checkAndAbortIfTimedOutOrError();
-  void checkWorkQueue(bool isMainThread);
+  void checkWorkQueue();
   void enqueueWork(c10::intrusive_ptr<TorchWorkXCCL> work, xpuStream_t stream);
   xpuStream_t getOperationStream(bool async_op);
   void ensureTensorContiguous(const at::Tensor& tensor);
@@ -309,9 +318,9 @@ class TorchCommXCCL : public TorchCommBackend,
   std::condition_variable timeout_cv_;
   std::mutex timeout_mutex_;
 
-  std::shared_ptr<TorchCommTracing> tracing_;
   bool high_priority_stream_{false};
   std::string name_;
+  std::string backend_version_{"unknown"};
 };
 
 } // namespace torch::comms

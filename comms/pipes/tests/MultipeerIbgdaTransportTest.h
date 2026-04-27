@@ -17,20 +17,12 @@ class P2pIbgdaTransportDevice;
 namespace comms::pipes::test {
 
 /**
- * Test kernel: Send data via put_signal_non_adaptive
+ * Test kernel: Put data + signal remote (thread-scope, slot-index)
  *
- * Uses the fused put+signal operation (single compound WQE) instead of
- * the split put + signal used by testPutSignal. Faster but ordering
- * depends on NIC (not safe with adaptive routing).
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param localBuf Local source buffer (with lkey)
- * @param remoteBuf Remote destination buffer (with rkey)
- * @param nbytes Number of bytes to transfer
- * @param signalId Signal slot index
- * @param signalVal Signal value to send
+ * Uses thread-scope put() with slot-index signal to write data and signal
+ * completion via the transport's owned signal buffer.
  */
-void testPutSignalNonAdaptive(
+void testPutAndSignal(
     P2pIbgdaTransportDevice* deviceTransportPtr,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -41,19 +33,9 @@ void testPutSignalNonAdaptive(
     int blockSize);
 
 /**
- * Test kernel: Send data via put_signal
- *
- * Sender fills local buffer with pattern and uses put_signal to transfer
- * data to remote peer, signaling completion.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param localBuf Local source buffer (with lkey)
- * @param remoteBuf Remote destination buffer (with rkey)
- * @param nbytes Number of bytes to transfer
- * @param signalId Signal slot index
- * @param signalVal Signal value to send
+ * Test kernel: Group-collaborative put + signal (warp group, slot-index)
  */
-void testPutSignal(
+void testPutAndSignalGroup(
     P2pIbgdaTransportDevice* deviceTransportPtr,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -64,36 +46,45 @@ void testPutSignal(
     int blockSize);
 
 /**
- * Test kernel: Wait for signal
- *
- * Receiver waits for the signal value to arrive, indicating data is ready.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param signalId Signal slot index
- * @param cmp Comparison operation
- * @param expectedSignal Signal value to wait for
+ * Test kernel: Multi-warp group-collaborative put + signal (slot-index)
+ */
+void testPutAndSignalGroupMultiWarp(
+    P2pIbgdaTransportDevice* deviceTransportPtr,
+    const IbgdaLocalBuffer& localBuf,
+    const IbgdaRemoteBuffer& remoteBuf,
+    std::size_t nbytes,
+    int signalId,
+    uint64_t signalVal,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: Block-scope group-collaborative put + signal (slot-index)
+ */
+void testPutAndSignalGroupBlock(
+    P2pIbgdaTransportDevice* deviceTransportPtr,
+    const IbgdaLocalBuffer& localBuf,
+    const IbgdaRemoteBuffer& remoteBuf,
+    std::size_t nbytes,
+    int signalId,
+    uint64_t signalVal,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: Wait for signal via slot-index on transport's local inbox
  */
 void testWaitSignal(
-    P2pIbgdaTransportDevice* deviceTransportPtr,
+    P2pIbgdaTransportDevice* transport,
     int signalId,
-    IbgdaCmpOp cmp,
     uint64_t expectedSignal,
     int numBlocks,
     int blockSize);
 
 /**
- * Test kernel: Multiple put_signal operations in sequence
- *
- * Performs multiple put_signal operations, each with a unique signal value.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param localBuf Local source buffer
- * @param remoteBuf Remote destination buffer
- * @param bytesPerPut Bytes per put operation
- * @param signalId Signal slot index
- * @param numPuts Number of put operations
+ * Test kernel: Multiple put + signal operations in sequence (slot-index)
  */
-void testMultiplePutSignal(
+void testMultiplePutAndSignal(
     P2pIbgdaTransportDevice* deviceTransportPtr,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -104,14 +95,7 @@ void testMultiplePutSignal(
     int blockSize);
 
 /**
- * Test kernel: Send signal only (no data)
- *
- * Sends an atomic signal to the remote peer without any data transfer.
- * Useful for pure synchronization scenarios.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param signalId Signal slot index
- * @param signalVal Signal value to send
+ * Test kernel: Send signal only (no data, slot-index)
  */
 void testSignalOnly(
     P2pIbgdaTransportDevice* deviceTransportPtr,
@@ -121,30 +105,7 @@ void testSignalOnly(
     int blockSize);
 
 /**
- * Test kernel: Reset remote signal to zero
- *
- * Resets the remote peer's signal buffer at the specified slot to zero.
- * Used to prepare for the next iteration of signaling.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param signalId Signal slot index
- */
-void testResetSignal(
-    P2pIbgdaTransportDevice* deviceTransportPtr,
-    int signalId,
-    int numBlocks,
-    int blockSize);
-
-/**
  * Test kernel: Put data without signal
- *
- * Performs an RDMA write from local buffer to remote buffer without
- * any signaling. Caller must use other means to synchronize.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param localBuf Local source buffer
- * @param remoteBuf Remote destination buffer
- * @param nbytes Number of bytes to transfer
  */
 void testPutOnly(
     P2pIbgdaTransportDevice* deviceTransportPtr,
@@ -155,29 +116,7 @@ void testPutOnly(
     int blockSize);
 
 /**
- * Test kernel: Read current signal value
- *
- * Non-blocking read of the local signal buffer value.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param signalId Signal slot index
- * @param d_result Output: signal value read (device pointer)
- */
-void testReadSignal(
-    P2pIbgdaTransportDevice* deviceTransportPtr,
-    int signalId,
-    uint64_t* d_result,
-    int numBlocks,
-    int blockSize);
-
-/**
  * Fill a device buffer with a pattern based on index
- *
- * Each byte is set to (baseValue + (index % 256))
- *
- * @param buffer Device buffer pointer
- * @param nbytes Number of bytes to fill
- * @param baseValue Base value for the pattern
  */
 void fillBufferWithPattern(
     void* buffer,
@@ -188,13 +127,6 @@ void fillBufferWithPattern(
 
 /**
  * Verify a device buffer matches expected pattern
- *
- * Returns the count of mismatched bytes.
- *
- * @param buffer Device buffer pointer
- * @param nbytes Number of bytes to verify
- * @param expectedBaseValue Expected base value of pattern
- * @param errorCount Output: number of errors found (device pointer)
  */
 void verifyBufferPattern(
     const void* buffer,
@@ -205,21 +137,9 @@ void verifyBufferPattern(
     int blockSize);
 
 /**
- * Test kernel: Wait for ready signal, then put data with signal
- *
- * Sender waits for the receiver to signal that its buffer is ready,
- * then performs put_signal to transfer data.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param localBuf Local source buffer (with lkey)
- * @param remoteBuf Remote destination buffer (with rkey)
- * @param nbytes Number of bytes to transfer
- * @param readySignalId Signal slot index to wait on for ready
- * @param readySignalVal Signal value to wait for indicating ready
- * @param dataSignalId Signal slot index to signal data completion
- * @param dataSignalVal Signal value to send with data
+ * Test kernel: Wait for ready signal, then put data with signal (slot-index)
  */
-void testWaitReadyThenPutSignal(
+void testWaitReadyThenPutAndSignal(
     P2pIbgdaTransportDevice* deviceTransportPtr,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -232,22 +152,9 @@ void testWaitReadyThenPutSignal(
     int blockSize);
 
 /**
- * Test kernel: Bidirectional put and wait in single kernel
- *
- * Launches a kernel where thread 0 does put_signal (send) and
- * thread 1 does wait_signal (receive), enabling concurrent
- * bidirectional communication.
- *
- * @param deviceTransportPtr Pointer to P2pIbgdaTransportDevice in device memory
- * @param localBuf Local source buffer for sending
- * @param remoteBuf Remote destination buffer
- * @param nbytes Number of bytes to transfer
- * @param sendSignalId Signal slot index for sending
- * @param sendSignalVal Signal value to send
- * @param recvSignalId Signal slot index to wait on for receiving
- * @param recvSignalVal Signal value to wait for
+ * Test kernel: Bidirectional put and wait in single kernel (slot-index)
  */
-void testBidirectionalPutWait(
+void testBidirectionalPutAndWait(
     P2pIbgdaTransportDevice* deviceTransportPtr,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -260,29 +167,12 @@ void testBidirectionalPutWait(
     int blockSize);
 
 /**
- * Test kernel: All-to-all communication pattern
- *
- * Launches a kernel that uses partition() to parallelize communication
- * across multiple peers. Each peer gets a subset of thread groups, and
- * within each peer's groups, threads are divided into senders and receivers.
- *
- * This tests the key multi-peer bidirectional pattern:
- *   [peer_id, per_peer_group] = group.partition(numPeers);
- *
- * @param peerTransports Array of transport pointers (one per peer) in device
- * memory
- * @param localSendBufs Array of local send buffers (one per peer) in device
- * memory
- * @param peerRecvBufs Array of remote receive buffers (one per peer) in device
- * memory
- * @param nbytes Number of bytes to transfer per peer
- * @param numPeers Number of peers (nRanks - 1)
+ * Test kernel: All-to-all send phase (slot-index)
  */
 void testAllToAll(
     P2pIbgdaTransportDevice** peerTransports,
     IbgdaLocalBuffer* localSendBufs,
     IbgdaRemoteBuffer* peerRecvBufs,
-    int* peerRanks,
     int myRank,
     std::size_t nbytes,
     int numPeers,
@@ -290,15 +180,65 @@ void testAllToAll(
     int blockSize);
 
 /**
- * Test kernel: All-to-all wait phase
- *
- * Waits for signals from all peers after the send phase completes.
- * Call this after testAllToAll and an MPI barrier.
+ * Test kernel: All-to-all wait phase (slot-index)
  */
 void testAllToAllWait(
     P2pIbgdaTransportDevice** peerTransports,
-    int* peerRanks,
     int numPeers,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: Put data + signal remote + counter (slot-index)
+ */
+void testPutSignalCounter(
+    P2pIbgdaTransportDevice* deviceTransportPtr,
+    const IbgdaLocalBuffer& localDataBuf,
+    const IbgdaRemoteBuffer& remoteDataBuf,
+    std::size_t nbytes,
+    int signalId,
+    uint64_t signalVal,
+    int counterId,
+    uint64_t counterVal,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: Wait for local counter to reach expected value (slot-index)
+ */
+void testWaitCounter(
+    P2pIbgdaTransportDevice* transport,
+    int counterId,
+    uint64_t expectedVal,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: Multi-QP put + signal with per-block QP selection
+ *
+ * Each block selects its QP via blockIdx.x % numQps, puts its chunk
+ * of totalBytes, then signals. Tests that independent QPs work correctly
+ * when blocks use different QPs.
+ *
+ * @param transports Base pointer to N contiguous P2pIbgdaTransportDevice
+ * @param numQps Number of QPs (transports array length)
+ * @param localBuf Local source buffer
+ * @param remoteBuf Remote destination buffer
+ * @param totalBytes Total bytes (split across blocks)
+ * @param remoteSignalBuf Remote signal buffer
+ * @param signalId Signal slot index
+ * @param signalVal Signal value per block
+ * @param numBlocks Grid dimension
+ * @param blockSize Block dimension
+ */
+void testMultiQpPutAndSignal(
+    P2pIbgdaTransportDevice* transports,
+    int numQps,
+    const IbgdaLocalBuffer& localBuf,
+    const IbgdaRemoteBuffer& remoteBuf,
+    std::size_t totalBytes,
+    int signalId,
+    uint64_t signalVal,
     int numBlocks,
     int blockSize);
 

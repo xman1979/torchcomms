@@ -2,18 +2,22 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "comms/ctran/ibverbx/Ibverbx.h"
-
 #include <doca_gpunetio_host.h>
-#include "comms/ctran/interfaces/IBootstrap.h"
+#include "doca_verbs_net_wrapper.h"
+
+#include "comms/common/bootstrap/IBootstrap.h"
 #include "comms/pipes/IbgdaBuffer.h"
+#include "comms/pipes/IbverbsLazy.h"
+#include "comms/utils/CudaRAII.h"
 
 // Forward declarations for device types (defined in .cuh files)
 namespace comms::pipes {
@@ -24,6 +28,15 @@ struct MultipeerIbgdaDeviceTransport;
 namespace comms::pipes {
 
 /**
+ * IP address family for RoCE GID selection.
+ * Similar to NCCL_IB_ADDR_FAMILY.
+ */
+enum class AddressFamily {
+  IPV4, // IPv4
+  IPV6, // IPv6
+};
+
+/**
  * Configuration for MultipeerIbgdaTransport.
  *
  * IMPORTANT: All ranks must use identical configuration values.
@@ -32,25 +45,118 @@ struct MultipeerIbgdaTransportConfig {
   // CUDA device index for GPU operations
   int cudaDevice{0};
 
-  // Override NIC device name (e.g., "mlx5_0").
-  // If empty, auto-discovers the NIC closest to the GPU.
-  std::optional<std::string> nicDeviceName;
-
   // Override GID index for RoCE.
   // If not set, auto-discovers a valid RoCEv2 GID.
   std::optional<int> gidIndex;
 
+  // IP address family for the InfiniBand GID (similar to NCCL_IB_ADDR_FAMILY).
+  // Used to determine the address type for RoCE connections when gidIndex is
+  // not explicitly set. Has no effect on InfiniBand (non-RoCE) links.
+  // Default is IPV6 (IPv6).
+  AddressFamily addressFamily{AddressFamily::IPV6};
+
   // NOTE: Data buffers are NOT managed by the transport.
   // Users must allocate their own buffers and call registerBuffer() +
   // exchangeBuffer().
+  // GPU-to-NIC mapping for RDMA device selection.
+  // Maps CUDA device index to a list of NIC names (first element is preferred).
+  // If empty, uses topology-aware auto-discovery.
+  std::map<int, std::vector<std::string>> gpuNicMap;
 
-  // Number of signal slots per peer.
-  // Each slot is a 64-bit counter for signaling.
-  std::size_t signalCount{1};
+  // IB HCA filter string (NCCL_IB_HCA format) for NIC filtering during
+  // auto-discovery. If empty, all discovered NICs are considered.
+  // Only used during auto-discovery (not when gpuNicMap has a mapping for the
+  // GPU).
+  std::string ibHca;
+
+  // Per-peer data buffer size in bytes.
+  //
+  // Raw put()/signal() users interpret this as the exported per-peer RDMA
+  // buffer size. send()/recv() users interpret it as the size of one logical
+  // staging slot. The send/recv ring therefore has:
+  //   pipelineDepth slots
+  //   each slot is dataBufferSize bytes
+  //   each slot is partitioned across active_blocks block-groups at runtime
+  //
+  // For one send()/recv() call:
+  //   perBlockSlot = (dataBufferSize / active_blocks) & ~15ULL
+  //
+  // In the benchmark, one "section" is exactly one dataBufferSize-sized slot.
+  std::size_t dataBufferSize{0};
+
+  // Number of signal slots managed by the transport (per peer).
+  // Used by the slot-index API (put/signal/wait_signal by slot ID).
+  // Independent of send/recv which uses its own private signal buffers.
+  int numSignalSlots{0};
+
+  // Number of counter slots managed by the transport (per peer).
+  // Used by the slot-index API (wait_counter by slot ID).
+  // Independent of send/recv which uses its own private counter buffers.
+  int numCounterSlots{0};
+
+  // Send/recv configuration. When set, the transport allocates a private
+  // pipelined staging ring plus private signal/counter state for send()/recv().
+  // When nullopt (default), send/recv is disabled and only the raw put/signal
+  // APIs are available.
+  struct SendRecvConfig {
+    // Maximum number of block-groups that may participate in one send()/recv()
+    // call. This sizes the private signal/counter/step arrays and defines the
+    // maximum active_blocks accepted at runtime.
+    int maxGroups{128};
+
+    // Number of logical slots in the send/recv staging ring.
+    // Total staging bytes per peer per direction:
+    //   pipelineDepth * dataBufferSize
+    int pipelineDepth{2};
+  };
+  std::optional<SendRecvConfig> sendRecv;
 
   // Queue pair depth (number of outstanding WQEs per peer).
   // Higher values allow more pipelining but use more memory.
-  uint32_t qpDepth{128};
+  uint32_t qpDepth{1024};
+
+  // Number of QP sets per peer (each set = main QP + companion QP + loopback).
+  // Multiple QPs per peer allow different GPU blocks to use independent QPs,
+  // eliminating O(N) cross-block WQE serialization in DOCA's mark_wqes_ready.
+  // Block-to-QP mapping: blockIdx.x % numQpsPerPeer.
+  // Default 1 preserves current single-QP-per-peer behavior.
+  int numQpsPerPeer{1};
+
+  // InfiniBand Verbs Timeout for QP ACK timeout.
+  // Timeout is computed as 4.096 µs * 2^timeout.
+  // Increasing this value can help on very large networks (e.g., if
+  // ibv_poll_cq returns error 12). See InfiniBand specification Volume 1,
+  // section 12.7.34 (Local Ack Timeout).
+  // Valid values: 1-31. A value of 0 or >= 32 results in infinite timeout.
+  // Default is 20 (similar to NCCL_IB_TIMEOUT).
+  uint8_t timeout{20};
+
+  // InfiniBand retry count for QP transport errors.
+  // See InfiniBand specification Volume 1, section 12.7.38.
+  // Default is 7 (similar to NCCL_IB_RETRY_CNT).
+  uint8_t retryCount{7};
+
+  // InfiniBand traffic class field (similar to NCCL_IB_TC).
+  // See InfiniBand specification Volume 1 or vendor documentation.
+  // Default is 224.
+  uint8_t trafficClass{224};
+
+  // InfiniBand Service Level (similar to NCCL_IB_SL).
+  // See InfiniBand specification Volume 1, section 4.3.1.
+  // Default is 0.
+  uint8_t serviceLevel{0};
+
+  // Minimum RNR NAK Timer field value (similar to ibv_qp_attr.min_rnr_timer).
+  // Controls the delay before a receiver sends a RNR NAK.
+  // See InfiniBand specification Volume 1, Table 46.
+  // Default is 12 (matching NCCL IbvQpUtils).
+  uint8_t minRnrTimer{12};
+
+  // RNR retry count (similar to ibv_qp_attr.rnr_retry).
+  // Number of times to retry after receiving an RNR NAK.
+  // 7 means infinite retry.
+  // Default is 7 (matching NCCL IbvQpUtils).
+  uint8_t rnrRetry{7};
 };
 
 /**
@@ -73,19 +179,8 @@ struct IbgdaTransportExchInfo {
   // Local Identifier (for IB, not used in RoCE)
   uint16_t lid{0};
 
-  // Path MTU (4096 = IBV_MTU_4096)
-  uint32_t mtu{4096};
-};
-
-/**
- * Combined exchange information for RDMA connection setup.
- *
- * This struct bundles transport and signal buffer information for convenient
- * exchange during the bootstrap phase.
- */
-struct IbgdaExchInfo {
-  IbgdaTransportExchInfo transport;
-  IbgdaBufferExchInfo signal;
+  // Port active MTU. Used to negotiate path MTU: min(local, remote).
+  enum ibv_mtu mtu { IBV_MTU_4096 };
 };
 
 /**
@@ -95,24 +190,41 @@ struct IbgdaExchInfo {
 constexpr int kMaxRanksForAllGather = 128;
 
 /**
+ * Maximum number of QP sets per peer for multi-QP support.
+ */
+constexpr int kMaxQpsPerPeer = 128;
+
+/**
  * Transport exchange info for allGather-based exchange.
  *
- * Each rank contributes this structure containing:
- * - Common connection info (GID, lid, signal buffer) shared with all peers
- * - Per-target QPNs: qpnForRank[j] = QPN this rank uses to connect to rank j
+ * Each rank contributes this structure containing per-NIC GID/LID and the
+ * per-(target_rank, q) QPN this rank uses on that NIC.
  */
 struct IbgdaTransportExchInfoAll {
-  // Common info (same for all connections from this rank)
-  uint8_t gid[16]{};
-  int gidIndex{0};
-  uint16_t lid{0};
-  uint64_t signalAddr{0};
-  HostRKey signalRkey{0};
+  // Per-NIC public info shared with peers (wire format). nicInfo[n] holds
+  // this rank's NIC n's GID, LID, and the QPNs it uses to connect to each
+  // (target_rank, q). Indices [numNics .. kMaxNicsPerGpu) are zero-init and
+  // never read by peers (both ranks must agree on numNics — validated at
+  // exchange time).
+  struct NicWireInfo {
+    uint8_t gid[16]{};
+    uint16_t lid{0};
+    // QPN this rank uses on this NIC to connect to (target_rank, q).
+    // qpnForRank[myRank][*] is unused (set to 0).
+    uint32_t qpnForRank[kMaxRanksForAllGather][kMaxQpsPerPeer]{};
+  };
+  NicWireInfo nicInfo[kMaxNicsPerGpu]{};
 
-  // Per-target-rank QPNs
-  // qpnForRank[j] = QPN that this rank uses to connect to rank j
-  // qpnForRank[myRank] is unused (set to 0)
-  uint32_t qpnForRank[kMaxRanksForAllGather]{};
+  // Common (shared across NICs on this rank).
+  int gidIndex{0};
+  enum ibv_mtu mtu { IBV_MTU_4096 };
+
+  // Number of NICs (rails) used by this rank.
+  // Must match across all ranks (validated at exchange time).
+  int numNics{1};
+
+  // Number of QPs per (peer, NIC) used by this rank.
+  int numQpsPerNic{1};
 };
 
 /**
@@ -131,7 +243,7 @@ struct IbgdaTransportExchInfoAll {
  *   │  MultipeerIbgdaTransport (this class)                               │
  *   │  ├── IbvDevice (RDMA device management)                             │
  *   │  ├── IbvPd (Protection Domain)                                      │
- *   │  ├── IbvMr[] (Memory regions - data + signal per peer)              │
+ *   │  ├── IbvMr[] (Memory regions - data per peer)                       │
  *   │  ├── doca_gpu (GPU context for DOCA)                                │
  *   │  ├── doca_gpu_verbs_qp[] (High-level QPs per peer)                  │
  *   │  └── IBootstrap (Collective exchange)                               │
@@ -141,9 +253,7 @@ struct IbgdaTransportExchInfoAll {
  *   │  MultipeerIbgdaDeviceTransport (returned by getDeviceTransport())   │
  *   │  └── P2pIbgdaTransportDevice[] (per-peer handles)                   │
  *   │      ├── doca_gpu_dev_verbs_qp* (GPU QP handle)                     │
- *   │      ├── IbgdaLocalBuffer (local signal buffer)                     │
- *   │      ├── IbgdaRemoteBuffer (remote signal buffer)                   │
- *   │      └── put_signal() / wait_signal() device methods                │
+ *   │      └── put() / wait_local() device methods                        │
  *   └─────────────────────────────────────────────────────────────────────┘
  *
  * USAGE:
@@ -153,7 +263,6 @@ struct IbgdaTransportExchInfoAll {
  *   MultipeerIbgdaTransportConfig config{
  *       .cudaDevice = 0,
  *       .dataBufferSize = 1 << 20,  // 1 MB per peer
- *       .signalCount = 1,
  *   };
  *   MultipeerIbgdaTransport transport(myRank, nRanks, bootstrap, config);
  *   transport.exchange();  // Collective - all ranks must call
@@ -161,11 +270,14 @@ struct IbgdaTransportExchInfoAll {
  *   // Get device handle for kernel (requires including .cuh header)
  *   auto* deviceTransportPtr = transport.getDeviceTransportPtr();
  *
- * NIC AUTO-DISCOVERY:
- * ===================
+ * NIC SELECTION:
+ * ==============
  *
- * When nicDeviceName is not specified, the transport automatically selects
- * the RDMA NIC with the closest NUMA affinity to the specified GPU.
+ * The transport selects the RDMA NIC in order of priority:
+ * 1. config.gpuNicMap - explicit GPU-to-NIC mapping (map from GPU index to NIC
+ * names)
+ * 2. Auto-discovery - selects the NIC with closest NUMA affinity to the GPU
+ *    (optionally filtered by config.ibHca allowlist)
  *
  * COMMUNICATOR SEMANTICS:
  * =======================
@@ -182,7 +294,7 @@ class MultipeerIbgdaTransport {
   MultipeerIbgdaTransport(
       int myRank,
       int nRanks,
-      std::shared_ptr<ctran::bootstrap::IBootstrap> bootstrap,
+      std::shared_ptr<meta::comms::IBootstrap> bootstrap,
       const MultipeerIbgdaTransportConfig& config);
 
   /**
@@ -294,9 +406,18 @@ class MultipeerIbgdaTransport {
       const IbgdaLocalBuffer& localBuf);
 
   /**
-   * Get the RDMA device name being used
+   * Get the number of QP sets per peer
    */
-  std::string getNicDeviceName() const;
+  int numQpsPerPeer() const;
+
+  /**
+   * Get the number of NICs (rails) actually in use after auto-detection.
+   * Resolved at construction time from `gpuNicMap` or topology discovery;
+   * see ctor doc for the resolution rules.
+   */
+  int numNics() const {
+    return numNics_;
+  }
 
   /**
    * Get the GID index being used
@@ -309,10 +430,19 @@ class MultipeerIbgdaTransport {
   void openIbDevice();
   void allocateResources();
   void registerMemory();
-  void createQps();
+  void createQpGroups();
+  void createLoopbackCompanionQps();
+  void allocate_send_recv_buffers();
+  void exchange_send_recv_buffers();
+  void cleanup_send_recv_buffers();
+  void cleanup();
+  // Connect a QP to a peer (or self for loopback). The nic argument selects
+  // which local NIC's AH attrs / port to use; the peerInfo carries the
+  // remote-side GID / LID / qpn. At numNics_=1 nic is always 0.
   void connectQp(
       doca_gpu_verbs_qp_hl* qpHl,
-      const IbgdaTransportExchInfo& peerInfo);
+      const IbgdaTransportExchInfo& peerInfo,
+      int nic);
   int rankToPeerIndex(int rank) const;
   int peerIndexToRank(int peerIndex) const;
 
@@ -321,44 +451,108 @@ class MultipeerIbgdaTransport {
   const int nRanks_{0};
 
   // Bootstrap for collective operations
-  std::shared_ptr<ctran::bootstrap::IBootstrap> bootstrap_;
+  std::shared_ptr<meta::comms::IBootstrap> bootstrap_;
 
   // Configuration
   MultipeerIbgdaTransportConfig config_;
 
-  // DOCA GPU context
+  // DOCA GPU context (shared across NICs).
   doca_gpu* docaGpu_{nullptr};
 
-  // IB verbs resources (ibverbx RAII wrappers)
-  std::optional<ibverbx::IbvDevice> ibvDevice_;
-  std::optional<ibverbx::IbvPd> ibvPd_;
-  doca_verbs_ah_attr* ahAttr_{nullptr};
-  ibverbx::ibv_gid localGid_{};
+  // Number of NICs (rails) actually in use. <= kMaxNicsPerGpu.
+  // nicDevices_.size() == numNics_ after openIbDevice().
+  int numNics_{1};
 
-  // High-level QPs (one per peer)
-  std::vector<doca_gpu_verbs_qp_hl*> qpHlList_;
+  // Per-NIC host-side IB verbs resources. qpGroups and loopbackCompanionQps
+  // are indexed [peer * numQpsPerPeer + q].
+  struct NicHostIbgdaResources {
+    std::string deviceName;
+    ibv_context* ibvCtx{nullptr};
+    ibv_pd* ibvPd{nullptr};
+    doca_verbs_ah_attr* ahAttr{nullptr};
+    union ibv_gid localGid{};
+    ibv_mr* sinkMr{nullptr};
+    std::vector<doca_gpu_verbs_qp_group_hl*> qpGroups;
+    std::vector<doca_gpu_verbs_qp_hl*> loopbackCompanionQps;
+  };
+  std::vector<NicHostIbgdaResources> nicDevices_;
 
-  // GPU memory (signal buffer is transport-managed)
-  void* signalBuffer_{nullptr};
-  std::size_t signalBufferSize_{0};
+  // Sink buffer for RDMA atomic return values (discarded).
+  // DOCA's OPCODE_ATOMIC_FA requires a local address for the fetch-add
+  // return value. We don't need it, so we use a small "sink" buffer.
+  // Allocated via cuMemCreate with gpuDirectRDMACapable=1 so it can be
+  // registered as an IB MR on all platforms (including aarch64/SMMU).
+  void* sinkBuffer_{nullptr};
+  std::size_t sinkBufferSize_{0};
+  std::size_t sinkBufferAllocSize_{0};
+  std::uint64_t sinkBufferHandle_{0};
 
-  // Memory regions for signal buffer
-  std::optional<ibverbx::IbvMr> signalMr_;
+  // Cached MR entry: one MR per (CUDA allocation, NIC), refcounted.
+  // Multiple user buffers within the same cudaMalloc allocation share one
+  // MR per NIC; the MR set covers all NICs for the same physical buffer.
+  struct CachedMr {
+    std::array<ibv_mr*, kMaxNicsPerGpu> mrs{};
+    size_t allocSize{0};
+    int refs{0};
+  };
 
-  // User-registered buffers (maps ptr -> IbvMr)
-  std::unordered_map<void*, ibverbx::IbvMr> registeredBuffers_;
+  // Maps CUDA allocation base address -> cached MR covering the full
+  // allocation. Keyed by allocBase from cuMemGetAddressRange, not by user
+  // pointer. Ordered map enables O(log n) containment lookup via
+  // upper_bound — used by deregisterBuffer to find the owning allocation
+  // without calling cuMemGetAddressRange (which fails if CUDA already freed
+  // the memory).
+  std::map<uintptr_t, CachedMr> registeredBuffers_;
 
-  // GPU PCIe bus ID and NIC device name
+  // GPU PCIe bus ID.
   std::string gpuPciBusId_;
-  std::string nicDeviceName_;
-  int gidIndex_{3}; // Default GID index
+  // GID index + active MTU are common across NICs (same config knob, same
+  // fabric/HCA generation in multi-NIC platforms like GB200/GB300).
+  int gidIndex_{3};
+  enum ibv_mtu localMtu_ { IBV_MTU_4096 };
 
   // Per-peer device transports (GPU accessible)
   P2pIbgdaTransportDevice* peerTransportsGpu_{nullptr};
   std::size_t peerTransportSize_{0};
 
+  // All GPU allocations from buildDeviceTransportsOnGpu (freed in cleanup)
+  std::vector<void*> gpuAllocations_;
+
   // Exchange info received from peers
-  std::vector<IbgdaExchInfo> peerExchInfo_;
+  std::vector<IbgdaTransportExchInfo> peerExchInfo_;
+
+  // Transport-owned signal buffers (allocated if numSignalSlots > 0)
+  void* signalInboxGpu_{nullptr};
+  std::vector<IbgdaRemoteBuffer> signalRemoteViews_;
+  std::vector<IbgdaLocalBuffer> signalLocalViews_;
+
+  // Transport-owned counter buffers (allocated if numCounterSlots > 0)
+  void* counterGpu_{nullptr};
+  std::vector<IbgdaLocalBuffer> counterViews_;
+
+  void* discardSignalGpu_{nullptr};
+  std::vector<IbgdaRemoteBuffer> discardSignalRemoteViews_;
+
+  // Send/recv buffers (allocated when maxGroups > 0)
+  struct SendRecvPeerBuffers {
+    IbgdaLocalBuffer sendStaging;
+    IbgdaLocalBuffer recvStaging;
+    IbgdaLocalBuffer signal;
+    IbgdaLocalBuffer counter;
+    int64_t* stepState{nullptr};
+    IbgdaRemoteBuffer remoteRecvStaging;
+    IbgdaRemoteBuffer remoteSignal;
+  };
+  std::vector<SendRecvPeerBuffers> sendRecvPeerBuffers_;
+
+  std::unique_ptr<meta::comms::DeviceBuffer> sendStagingBulk_;
+  std::unique_ptr<meta::comms::DeviceBuffer> recvStagingBulk_;
+  std::unique_ptr<meta::comms::DeviceBuffer> signalBulk_;
+  std::unique_ptr<meta::comms::DeviceBuffer> counterBulk_;
+  std::unique_ptr<meta::comms::DeviceBuffer> stepStateBulk_;
+
+  IbgdaLocalBuffer recvStagingBulkReg_;
+  IbgdaLocalBuffer signalBulkReg_;
 };
 
 } // namespace comms::pipes

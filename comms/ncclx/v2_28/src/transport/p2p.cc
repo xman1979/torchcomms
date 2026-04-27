@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "comm.h"
+#include "meta/NcclxConfig.h" // @manual
 #include "graph.h"
 #include "utils.h"
 #include "shmutils.h"
@@ -131,6 +132,11 @@ extern int64_t ncclParamMNNVLEnable();
 ncclResult_t p2pCanConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2) {
   initCeOperation();
 
+  if (comm->noLocal_) {
+    *ret = 0;
+    return ncclSuccess;
+  }
+
   // Check topology / p2p level.
   int intermediateRank;
   NCCLCHECK(ncclTopoCheckP2p(comm, comm->topo, info1->rank, info2->rank, ret, NULL, &intermediateRank, NULL));
@@ -249,7 +255,7 @@ ncclResult_t ncclP2pAllocateShareableBuffer(size_t size, int refcount, ncclIpcDe
       CUDACHECK(res);
     }
   }
-  INFO(NCCL_P2P|NCCL_ALLOC, "commDesc: %s Allocated shareable buffer %p size %zu ipcDesc %p for %s", ctran::utils::parseCommDesc(comm->config.commDesc), *ptr, size, ipcDesc, callsite);
+  INFO(NCCL_P2P|NCCL_ALLOC, "commDesc: %s Allocated shareable buffer %p size %zu ipcDesc %p for %s", NCCLX_CONFIG_FIELD(comm->config, commDesc).c_str(), *ptr, size, ipcDesc, callsite);
 
   return ncclSuccess;
 }

@@ -2,13 +2,20 @@
 
 #include "comms/torchcomms/ncclx/TorchCommWindowNCCLX.hpp"
 
+#include <cuda_runtime.h>
 #include <fmt/core.h>
 
-#include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/ncclx/TorchCommNCCLX.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/utils/CudaRAII.h"
 
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
+#include "comms/ctran/utils/DevMemType.h"
 #include "comms/torchcomms/device/DeviceBackendTraits.hpp"
+#endif
+
+#if defined(ENABLE_PIPES)
+#include "comms/torchcomms/device/pipes/PipesDeviceBackend.hpp"
 #endif
 
 namespace torch::comms {
@@ -30,52 +37,33 @@ TorchCommWindowNCCLX<Backend>::TorchCommWindowNCCLX(
 template <typename Backend>
 TorchCommWindowNCCLX<Backend>::~TorchCommWindowNCCLX() noexcept {
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
-  // Cleanup registered local buffers
+  // Free device-side buffer handles (cudaMalloc'd in
+  // register_local_buffer_handle). The host-side RegisteredBuffer cleanup is
+  // handled below by registered_local_buffers_.
+  for (auto& [handle, buf] : device_buffer_handles_) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    cudaFree(reinterpret_cast<void*>(handle));
+  }
+  device_buffer_handles_.clear();
+
+  // Cleanup registered local buffers via backend-specific deregistration
   for (auto& buf : registered_local_buffers_) {
-    if (buf.backend_window != nullptr && local_comm_ != nullptr) {
-      NCCLX_CHECK_IGNORE(
-          nccl_api_,
-          nccl_api_->commWindowDeregister(
-              local_comm_, static_cast<NcclxWindow>(buf.backend_window)),
-          "NCCLX local buffer deregister failed in destructor");
+    if (nccl_comm_ != nullptr) {
+      Backend::deregister_local_buffer(nccl_api_, nccl_comm_, buf);
     }
   }
   registered_local_buffers_.clear();
 
-  // Destroy ncclDevComm using the dev_comm stored in the deleter
-  if (device_window_) {
-    auto& deleter = device_window_.get_deleter();
-    if (deleter.nccl_comm != nullptr && deleter.nccl_api != nullptr) {
-      auto nccl_result = deleter.nccl_api->devCommDestroy(
-          deleter.nccl_comm, &deleter.dev_comm);
-      if (nccl_result != ncclSuccess) {
-        TC_LOG(ERROR) << "Failed to destroy NCCL device communicator: "
-                      << deleter.nccl_api->getErrorString(nccl_result);
-      }
-    }
-  }
+  // Destroy backend-specific device communicator state.
+  // GIN: devCommDestroy. Pipes: no-op (cleanup via deleter).
+  Backend::destroy_device_comm(device_window_);
 
   // device_window_ unique_ptr destructor calls cudaFree via custom deleter
   device_window_.reset();
 
-  // Cleanup NCCL orig window
-  if (nccl_orig_win_ != nullptr) {
-    auto result = nccl_api_->commWindowDeregister(nccl_comm_, nccl_orig_win_);
-    if (result != ncclSuccess) {
-      TC_LOG(ERROR) << "NCCLX orig window deregister failed in destructor";
-    }
-    nccl_orig_win_ = nullptr;
-  }
+  // Deregister extra window (GIN nccl_orig_win_; Pipes: no-op).
+  Backend::deregister_extra_window(nccl_api_, nccl_comm_, &nccl_orig_win_);
 
-  // Cleanup local communicator
-  if (local_comm_ != nullptr) {
-    auto result = nccl_api_->commDestroy(local_comm_);
-    if (result != ncclSuccess) {
-      TC_LOG(ERROR) << "NCCLX local_comm destroy failed in destructor";
-    }
-    local_comm_ = nullptr;
-    local_comm_initialized_ = false;
-  }
 #endif
 
   // Cleanup CTRAN window (host API)
@@ -95,7 +83,9 @@ TorchCommWindowNCCLX<Backend>::~TorchCommWindowNCCLX() noexcept {
 // =============================================================================
 
 template <typename Backend>
-void TorchCommWindowNCCLX<Backend>::tensor_register(const at::Tensor& tensor) {
+void TorchCommWindowNCCLX<Backend>::tensor_register(
+    const at::Tensor& tensor,
+    bool owning) {
   checkCommAndThrow();
 
   if (!tensor.defined()) {
@@ -122,30 +112,93 @@ void TorchCommWindowNCCLX<Backend>::tensor_register(const at::Tensor& tensor) {
     buf_shape_.push_back(buf_shape[i]);
   }
 
-  CHECK_EQ(
-      nccl_api_->commWindowRegister(
-          tensor.data_ptr(), win_size_, nccl_comm_, &win_),
-      ncclSuccess)
-      << "[TorchCommWindowNCCLX]: NCCLX window registration failed.";
+  if (torch_comm_->getGraphCaptureMode()) {
+    {
+      meta::comms::StreamCaptureModeGuard captureGuard{
+          torch_comm_->getCudaApi(), cudaStreamCaptureModeRelaxed};
+      CHECK_EQ(
+          nccl_api_->commWindowRegister(
+              tensor.data_ptr(), win_size_, nccl_comm_, &win_),
+          ncclSuccess)
+          << "[TorchCommWindowNCCLX]: NCCLX window registration failed "
+          << "(graph capture).";
 
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
-  // Initialize local communicator and NCCL orig window for device API
-  // initLocalComm();
-  initNcclOrigWindow(tensor.data_ptr(), win_size_);
+      // Register the extra device-API window (sets nccl_orig_win_) so that
+      // get_device_window() and register_local_buffer() find a fully
+      // initialized window during graph capture.
+      // The NCCL symmetric path requires VMM-allocated memory (cuMemCreate).
+      // Buffers from cudaMallocAsync (graph private pool) are not VMM and
+      // will fail cuMemRetainAllocationHandle. Only attempt registration
+      // if the buffer is VMM-allocated.
+      {
+        int cudaDev = 0;
+        cudaGetDevice(&cudaDev);
+        DevMemType memType{DevMemType::kCudaMalloc};
+        getDevMemType(tensor.data_ptr(), cudaDev, memType);
+        if (memType == DevMemType::kCumem) {
+          Backend::register_extra_window(
+              nccl_api_,
+              nccl_comm_,
+              &nccl_orig_win_,
+              tensor.data_ptr(),
+              win_size_);
+        }
+      }
 #endif
+    }
+  } else {
+    CHECK_EQ(
+        nccl_api_->commWindowRegister(
+            tensor.data_ptr(), win_size_, nccl_comm_, &win_),
+        ncclSuccess)
+        << "[TorchCommWindowNCCLX]: NCCLX window registration failed.";
 
-  buf_tensor_ = tensor;
+#ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
+    // GIN: register a second window with NCCL_WIN_DEVICE_API flag.
+    // Pipes: no-op (device window creation deferred to get_device_window).
+    Backend::register_extra_window(
+        nccl_api_, nccl_comm_, &nccl_orig_win_, tensor.data_ptr(), win_size_);
+#endif
+  }
+
+  // Store raw data pointer for get_device_window() fallback when
+  // buf_tensor_ is not set (owning=false).
+  buf_data_ptr_ = tensor.data_ptr();
+
+  // When owning=false, the window does NOT hold a reference to the tensor.
+  // This allows tensor memory to be reused (e.g., within a CUDA graph).
+  // The NCCL window registration (commWindowRegister) independently tracks
+  // the underlying physical buffer, so the window remains functional.
+  //
+  // IMPORTANT: When owning=false, the caller must ensure the tensor's
+  // storage remains valid for the window's entire lifetime.
+  if (owning) {
+    buf_tensor_ = tensor;
+  } else {
+    TC_LOG(WARNING)
+        << "[TorchCommWindowNCCLX]: Non-owning registration — window does not "
+        << "hold a reference to the tensor. The caller must ensure the tensor "
+        << "remains alive for the lifetime of this window. get_tensor() will "
+        << "return nullopt.";
+  }
   buf_device_ = tensor.device();
 }
 
 template <typename Backend>
 void TorchCommWindowNCCLX<Backend>::tensor_deregister() {
   checkCommAndThrow();
+
+  if (torch_comm_->getGraphCaptureMode()) {
+    return;
+  }
+
   torch_comm_->barrier(false);
 
   if (win_ == nullptr) {
     throw std::runtime_error("[TorchCommWindowNCCLX]: Double deregistration.");
   }
+
   auto ctran_result = nccl_api_->commWindowDeregister(nccl_comm_, win_);
   if (ctran_result != ncclSuccess) {
     TC_LOG(ERROR) << "NCCLX CTRAN window deregister failed";
@@ -154,13 +207,8 @@ void TorchCommWindowNCCLX<Backend>::tensor_deregister() {
   win_size_ = 0;
 
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
-  if (nccl_orig_win_ != nullptr) {
-    auto result = nccl_api_->commWindowDeregister(nccl_comm_, nccl_orig_win_);
-    if (result != ncclSuccess) {
-      TC_LOG(ERROR) << "NCCLX orig window deregister failed";
-    }
-    nccl_orig_win_ = nullptr;
-  }
+  // GIN: deregister nccl_orig_win_. Pipes: no-op.
+  Backend::deregister_extra_window(nccl_api_, nccl_comm_, &nccl_orig_win_);
 #endif
 
   buf_tensor_.reset();
@@ -197,6 +245,7 @@ c10::intrusive_ptr<TorchWork> TorchCommWindowNCCLX<Backend>::put(
 
   checkDeviceAndThrow(tensor);
   auto stream = torch_comm_->getOperationStream(asyncOp);
+  torch_comm_->graph_event_tracker_.initOnGraphStart(stream);
   auto work = torch_comm_->createWork(stream, options.timeout, {tensor});
   work->recordStart("put");
   CHECK_EQ(
@@ -242,6 +291,7 @@ c10::intrusive_ptr<TorchWork> TorchCommWindowNCCLX<Backend>::signal(
     const SignalOptions& options) {
   checkWindowAndThrow();
   auto stream = torch_comm_->getOperationStream(asyncOp);
+  torch_comm_->graph_event_tracker_.initOnGraphStart(stream);
   auto work = torch_comm_->createWork(stream, options.timeout);
   work->recordStart("signal");
   CHECK_EQ(nccl_api_->winSignal(peerRank, win_, stream), ncclSuccess);
@@ -258,6 +308,7 @@ c10::intrusive_ptr<TorchWork> TorchCommWindowNCCLX<Backend>::wait_signal(
   checkWindowAndThrow();
   auto stream = torch_comm_->getOperationStream(asyncOp);
 
+  torch_comm_->graph_event_tracker_.initOnGraphStart(stream);
   auto work = torch_comm_->createWork(stream, options.timeout);
   work->recordStart("wait_signal");
   CHECK_EQ(nccl_api_->winWaitSignal(peerRank, win_, stream), ncclSuccess);
@@ -269,6 +320,7 @@ c10::intrusive_ptr<TorchWork> TorchCommWindowNCCLX<Backend>::wait_signal(
 template <typename Backend>
 std::shared_ptr<TorchCommWindowAttr> TorchCommWindowNCCLX<Backend>::get_attr(
     int peerRank) {
+#ifdef NCCL_RMA_SUPPORTED
   checkWindowAndThrow();
   NcclxWindowAttr nccl_attr_raw = nullptr;
   CHECK_EQ(
@@ -292,6 +344,10 @@ std::shared_ptr<TorchCommWindowAttr> TorchCommWindowNCCLX<Backend>::get_attr(
       throw std::runtime_error("Unsupported NCCL window access type");
   }
   return attr;
+#else
+  throw std::runtime_error(
+      "Window attributes are not supported without NCCL_RMA_SUPPORTED");
+#endif
 }
 
 // =============================================================================
@@ -301,44 +357,14 @@ std::shared_ptr<TorchCommWindowAttr> TorchCommWindowNCCLX<Backend>::get_attr(
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
 
 template <typename Backend>
-void TorchCommWindowNCCLX<Backend>::initLocalComm() {
-  if (local_comm_initialized_) {
-    return;
-  }
-
-  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-  config.splitShare = 1;
-
-  CHECK_EQ(
-      nccl_api_->commSplit(nccl_comm_, 0, 0, &local_comm_, &config),
-      ncclSuccess)
-      << "[TorchCommWindowNCCLX]: Failed to create local communicator";
-
-  local_comm_initialized_ = true;
-}
-
-template <typename Backend>
-void TorchCommWindowNCCLX<Backend>::initNcclOrigWindow(void* ptr, size_t size) {
-  if (nccl_orig_win_ != nullptr) {
-    return;
-  }
-
-  CHECK_EQ(
-      nccl_api_->commWindowRegister(
-          ptr, size, nccl_comm_, &nccl_orig_win_, NCCL_WIN_DEVICE_API),
-      ncclSuccess)
-      << "[TorchCommWindowNCCLX]: NCCL orig window registration failed";
-}
-
-template <typename Backend>
-typename TorchCommWindowNCCLX<Backend>::DeviceRegisteredBuffer
-TorchCommWindowNCCLX<Backend>::register_local_buffer(const at::Tensor& tensor) {
+RegisteredBuffer TorchCommWindowNCCLX<Backend>::register_local_buffer(
+    const at::Tensor& tensor) {
   checkCommAndThrow();
 
-  if (!local_comm_initialized_) {
+  if (device_window_ == nullptr) {
     throw std::runtime_error(
-        "[TorchCommWindowNCCLX]: Local comm not initialized. "
-        "Call tensor_register first.");
+        "[TorchCommWindowNCCLX]: Device window not initialized. "
+        "Call get_device_window() first before registering local buffers.");
   }
 
   if (!tensor.defined() || !tensor.is_contiguous()) {
@@ -348,75 +374,110 @@ TorchCommWindowNCCLX<Backend>::register_local_buffer(const at::Tensor& tensor) {
 
   checkDeviceAndThrow(tensor);
 
-  DeviceRegisteredBuffer buf;
-  buf.base_ptr = tensor.data_ptr();
-  buf.size = tensor.numel() * tensor.element_size();
+  auto buf = Backend::register_local_buffer(
+      nccl_api_,
+      nccl_comm_,
+      tensor.data_ptr(),
+      tensor.numel() * tensor.element_size());
 
-  NcclxWindow local_win = nullptr;
-  CHECK_EQ(
-      nccl_api_->commWindowRegister(
-          buf.base_ptr, buf.size, local_comm_, &local_win),
-      ncclSuccess)
-      << "[TorchCommWindowNCCLX]: Local buffer registration failed";
-
-  buf.backend_window = static_cast<void*>(local_win);
   registered_local_buffers_.push_back(buf);
-
   return buf;
 }
 
 template <typename Backend>
 void TorchCommWindowNCCLX<Backend>::deregister_local_buffer(
-    DeviceRegisteredBuffer& buf) {
-  if (buf.backend_window == nullptr) {
+    RegisteredBuffer& buf) {
+  if (buf.base_ptr == nullptr && buf.backend_window == nullptr) {
     return;
   }
 
-  if (!local_comm_initialized_ || local_comm_ == nullptr) {
-    TC_LOG(WARNING)
-        << "Local comm not initialized, skipping local buffer deregister";
-    return;
-  }
-
-  auto result = nccl_api_->commWindowDeregister(
-      local_comm_, static_cast<NcclxWindow>(buf.backend_window));
-  if (result != ncclSuccess) {
-    TC_LOG(ERROR) << "Failed to deregister local buffer";
-  }
-
-  // Remove from tracking vector
+  // Remove from tracking vector before deregistration
   auto it = std::find_if(
       registered_local_buffers_.begin(),
       registered_local_buffers_.end(),
-      [&buf](const DeviceRegisteredBuffer& b) {
-        return b.backend_window == buf.backend_window;
-      });
+      [&buf](const RegisteredBuffer& b) { return b.base_ptr == buf.base_ptr; });
   if (it != registered_local_buffers_.end()) {
     registered_local_buffers_.erase(it);
   }
 
-  buf.backend_window = nullptr;
-  buf.base_ptr = nullptr;
-  buf.size = 0;
+  Backend::deregister_local_buffer(nccl_api_, nccl_comm_, buf);
+
+  // Clear the caller's buffer to indicate it's no longer registered
+  buf = RegisteredBuffer{};
 }
 
 template <typename Backend>
-typename TorchCommWindowNCCLX<Backend>::DeviceWindow*
-TorchCommWindowNCCLX<Backend>::get_device_window(
+int64_t TorchCommWindowNCCLX<Backend>::register_local_buffer_handle(
+    const at::Tensor& tensor) {
+  // Get host-side RegisteredBuffer via the existing method.
+  auto buf = register_local_buffer(tensor);
+
+  // Allocate device-side copy of RegisteredBuffer.
+  // Uses cudaMalloc which operates in a separate VA space from
+  // NCCLX's cuMemMap, avoiding allocation conflicts.
+  RegisteredBuffer* device_buf = nullptr;
+  auto err = cudaMalloc(&device_buf, sizeof(RegisteredBuffer));
+  if (err != cudaSuccess) {
+    deregister_local_buffer(buf);
+    throw std::runtime_error(
+        std::string(
+            "[TorchCommWindowNCCLX] cudaMalloc failed for "
+            "RegisteredBuffer device copy: ") +
+        cudaGetErrorString(err));
+  }
+  err = cudaMemcpy(
+      device_buf, &buf, sizeof(RegisteredBuffer), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    cudaFree(device_buf);
+    deregister_local_buffer(buf);
+    throw std::runtime_error(
+        std::string(
+            "[TorchCommWindowNCCLX] cudaMemcpy failed for "
+            "RegisteredBuffer device copy: ") +
+        cudaGetErrorString(err));
+  }
+
+  auto handle = reinterpret_cast<int64_t>(device_buf);
+  device_buffer_handles_[handle] = buf;
+  return handle;
+}
+
+template <typename Backend>
+void TorchCommWindowNCCLX<Backend>::deregister_local_buffer_handle(
+    int64_t handle) {
+  auto it = device_buffer_handles_.find(handle);
+  if (it == device_buffer_handles_.end()) {
+    throw std::runtime_error(
+        "[TorchCommWindowNCCLX] deregister_local_buffer_handle called with "
+        "unknown handle");
+  }
+
+  // Retrieve host-side RegisteredBuffer and deregister via backend.
+  auto buf = it->second;
+  deregister_local_buffer(buf);
+
+  // Free device-side copy.
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  cudaFree(reinterpret_cast<void*>(handle));
+  device_buffer_handles_.erase(it);
+}
+
+template <typename Backend>
+void* TorchCommWindowNCCLX<Backend>::get_device_window(
     int signal_count,
     int counter_count,
     int barrier_count) {
   checkCommAndThrow();
 
-  if (nccl_orig_win_ == nullptr) {
+  if (Backend::select_device_win(win_, nccl_orig_win_) == nullptr) {
     throw std::runtime_error(
-        "[TorchCommWindowNCCLX]: NCCL orig window not initialized. "
+        "[TorchCommWindowNCCLX]: Window not initialized. "
         "Call tensor_register first.");
   }
 
   // Return existing device window pointer if already created
   if (device_window_) {
-    return device_window_.get();
+    return static_cast<void*>(device_window_.get());
   }
 
   int commRank = 0;
@@ -438,17 +499,84 @@ TorchCommWindowNCCLX<Backend>::get_device_window(
   config.comm_rank = commRank;
   config.comm_size = commSize;
 
-  // Create device window - the custom deleter handles all cleanup
-  device_window_ = Backend::create_device_window(
-      nccl_comm_,
-      nccl_api_,
-      config,
-      nccl_orig_win_,
-      buf_tensor_.has_value() ? buf_tensor_->data_ptr() : nullptr,
-      win_size_);
+  // Create device window - the custom deleter handles all cleanup.
+  // Both backends share the same create_device_window signature.
+  //
+  // buf_data_ptr_ is set during tensor_register() in graph capture mode
+  // when buf_tensor_ is intentionally not stored (to allow pool memory reuse).
+  void* buf_ptr =
+      buf_tensor_.has_value() ? buf_tensor_->data_ptr() : buf_data_ptr_;
 
-  return device_window_.get();
+  // Graph capture mode: create_device_window() calls devCommCreate,
+  // cudaMalloc, and cudaMemcpy which require relaxed capture mode to
+  // execute eagerly rather than being captured into the graph.
+  if (torch_comm_->getGraphCaptureMode()) {
+    meta::comms::StreamCaptureModeGuard captureGuard{
+        torch_comm_->getCudaApi(), cudaStreamCaptureModeRelaxed};
+    device_window_ = Backend::create_device_window(
+        nccl_comm_,
+        nccl_api_,
+        torch_comm_->getCudaApi(),
+        config,
+        Backend::select_device_win(win_, nccl_orig_win_),
+        buf_ptr,
+        win_size_);
+  } else {
+    device_window_ = Backend::create_device_window(
+        nccl_comm_,
+        nccl_api_,
+        torch_comm_->getCudaApi(),
+        config,
+        Backend::select_device_win(win_, nccl_orig_win_),
+        buf_ptr,
+        win_size_);
+  }
+
+  return static_cast<void*>(device_window_.get());
 }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+template <typename Backend>
+void* TorchCommWindowNCCLX<Backend>::get_nvlink_address(
+    int peer,
+    size_t offset) {
+  checkCommAndThrow();
+
+  if (nccl_orig_win_ == nullptr) {
+    throw std::runtime_error(
+        "[TorchCommWindowNCCLX]: NCCL orig window not initialized. "
+        "Call tensor_register first.");
+  }
+
+  void* outPtr = nullptr;
+  CHECK_EQ(
+      nccl_api_->winGetPeerDevicePointer(nccl_orig_win_, offset, peer, &outPtr),
+      ncclSuccess)
+      << "[TorchCommWindowNCCLX]: ncclGetPeerDevicePointer failed";
+
+  return outPtr;
+}
+
+template <typename Backend>
+void* TorchCommWindowNCCLX<Backend>::get_multimem_address(size_t offset) {
+  checkCommAndThrow();
+
+  if (nccl_orig_win_ == nullptr) {
+    throw std::runtime_error(
+        "[TorchCommWindowNCCLX]: NCCL orig window not initialized. "
+        "Call tensor_register first.");
+  }
+
+  void* outPtr = nullptr;
+  CHECK_EQ(
+      nccl_api_->winGetLsaMultimemDevicePointer(
+          nccl_orig_win_, offset, &outPtr),
+      ncclSuccess)
+      << "[TorchCommWindowNCCLX]: ncclGetLsaMultimemDevicePointer failed";
+
+  return outPtr;
+}
+#endif
 
 #endif // TORCHCOMMS_HAS_NCCL_DEVICE_API
 
@@ -511,6 +639,16 @@ void TorchCommWindowNCCLX<Backend>::checkWindowAndThrow() const {
 template class TorchCommWindowNCCLX<torchcomms::device::NCCLDeviceBackend>;
 #else
 template class TorchCommWindowNCCLX<HostOnlyBackend>;
+#endif
+
+// Pipes instantiation is independent of the device API flag.
+// ENABLE_PIPES can be set without TORCHCOMMS_HAS_NCCL_DEVICE_API (e.g.,
+// NCCLX 2.27 CMake builds with ENABLE_PIPES=1). In that case, host-side
+// window operations (put, signal, wait_signal) work; device API methods
+// (get_device_window, register_local_buffer) fall back to the base class
+// default that throws "not yet supported".
+#if defined(ENABLE_PIPES)
+template class TorchCommWindowNCCLX<torchcomms::device::PipesDeviceBackend>;
 #endif
 
 } // namespace torch::comms

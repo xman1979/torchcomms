@@ -6,10 +6,10 @@
 #include <torch/csrc/distributed/c10d/TCPStore.hpp> // @manual
 #include "rccl.h" // @manual
 
-#include "comms/torchcomms/StoreManager.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
-#include "comms/torchcomms/TorchCommUtils.hpp"
 #include "comms/torchcomms/rccl/TorchCommRCCL.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/StoreManager.hpp"
+#include "comms/torchcomms/utils/Utils.hpp"
 
 namespace torch::comms {
 
@@ -134,8 +134,7 @@ ncclUniqueId TorchCommRCCLBootstrap::exchangeUniqueIdStore() {
 
 ncclUniqueId TorchCommRCCLBootstrap::exchangeUniqueIdTCPStore(
     std::string_view name) {
-  store_ =
-      StoreManager::get().getStore(TorchCommRCCL::kBackendName, name, timeout_);
+  store_ = createPrefixStore(std::string(name), timeout_);
   created_internal_store_ = true;
 
   return exchangeUniqueIdStore();
@@ -170,8 +169,7 @@ void TorchCommRCCLBootstrap::cleanupTCPStore(ncclComm_t nccl_comm) {
     // object.
     store_.reset();
 
-    auto stream =
-        hip_api_->getCurrentHIPStreamMasqueradingAsCUDA(device_.index());
+    auto stream = hip_api_->getCurrentCUDAStream(device_.index());
     ncclResult_t result = rccl_api_->allReduce(
         barrier_buffer_,
         barrier_buffer_,

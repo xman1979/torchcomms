@@ -2,10 +2,12 @@
 
 #pragma once
 
+#include <ATen/core/ivalue.h> // @manual=//caffe2:ATen-core
 #include <c10/util/intrusive_ptr.h>
 #include <chrono>
 #include <functional>
 #include <future>
+#include <vector>
 
 namespace torch::comms {
 
@@ -50,6 +52,55 @@ class TorchWork : public c10::intrusive_ptr_target {
     return std::chrono::milliseconds::max();
   }
 
+  // Fault Tolerance API
+
+  /**
+   * Block the CPU thread until the work is completed.
+   * Unlike wait(), which blocks only the current CUDA stream, this method
+   * blocks the CPU thread itself until the operation completes.
+   *
+   * @throws std::runtime_error if not implemented by the backend.
+   */
+  virtual void waitBlocking() {
+    throw std::runtime_error(
+        "[TorchWork]: waitBlocking not implemented for this work type");
+  }
+
+  // -- Work lifecycle hooks --
+  //
+  // These hooks allow external observers to track work object state
+  // transitions without coupling to specific backend implementations.
+  //
+  // - Start hook:  fired when setStatus(INPROGRESS) is called
+  // - End hook:    fired when setStatus(COMPLETED/ERROR/TIMEDOUT) is called
+  // - Wait hook:   fired when runWaitHooks() is called (backends call this
+  //                from their wait() implementation)
+  //
+  // Multiple hooks can be registered; they fire in registration order.
+  // Hooks are NOT thread-safe -- register before concurrent status changes.
+
+  using WorkHook = std::function<void()>;
+
+  void registerWorkStartHook(WorkHook hook) {
+    start_hooks_.push_back(std::move(hook));
+  }
+
+  void registerWorkEndHook(WorkHook hook) {
+    // If work already reached a terminal state, fire the hook immediately
+    // rather than enqueuing it (it would never fire otherwise).
+    auto s = status();
+    if (s == WorkStatus::COMPLETED || s == WorkStatus::ERROR ||
+        s == WorkStatus::TIMEDOUT) {
+      hook();
+    } else {
+      end_hooks_.push_back(std::move(hook));
+    }
+  }
+
+  void registerWorkWaitHook(WorkHook hook) {
+    wait_hooks_.push_back(std::move(hook));
+  }
+
   // Disable copy and move semantics
   TorchWork(const TorchWork&) = delete;
   TorchWork& operator=(const TorchWork&) = delete;
@@ -60,44 +111,68 @@ class TorchWork : public c10::intrusive_ptr_target {
   void setStatus(WorkStatus status) {
     status_ = status;
 
-    if (status == WorkStatus::COMPLETED || status == WorkStatus::ERROR ||
+    if (status == WorkStatus::INPROGRESS) {
+      runStartHooks();
+    } else if (
+        status == WorkStatus::COMPLETED || status == WorkStatus::ERROR ||
         status == WorkStatus::TIMEDOUT) {
-      runCallback();
+      runEndHooks();
+    }
+  }
+
+  // Backend wait() implementations should call this to fire wait hooks.
+  void runWaitHooks() {
+    for (auto& hook : wait_hooks_) {
+      hook();
     }
   }
 
   friend class TorchComm;
+  friend class WorkWrapper;
 
-  void setCallback(std::function<void()> callback) {
-    callback_ = std::move(callback);
-  }
-
-  void runCallback() {
-    if (callback_) {
-      std::call_once(callback_once_, [this]() {
-        callback_();
-        callback_ = nullptr;
-      });
-    }
-  }
-
-  // break weak-ref cycle: postHook() stores a lambda in callback_ that
-  // captures a weak_intrusive_ptr back to this object. after the strong
-  // refcount reaches 0, release_resources() clears the callback, destroying the
-  // weak pointer and allowing the weak refcount to reach 0 so the object is
-  // deleted.
-  void release_resources() override {
-    callback_ = nullptr;
-  }
+  virtual void markCompleted(
+      c10::intrusive_ptr<c10::ivalue::Future> future_,
+      std::vector<at::Tensor> outputTensors_);
 
   template <typename T, typename NullType>
   friend class c10::intrusive_ptr;
 
  private:
-  std::atomic<WorkStatus> status_{WorkStatus::NOT_STARTED};
+  void runStartHooks() {
+    for (auto& hook : start_hooks_) {
+      hook();
+    }
+  }
 
-  std::once_flag callback_once_;
-  std::function<void()> callback_;
+  void runEndHooks() {
+    // Guard: end hooks fire at most once, even if setStatus is called
+    // with multiple terminal states (e.g., ERROR then TIMEDOUT).
+    if (end_hooks_fired_) {
+      return;
+    }
+    end_hooks_fired_ = true;
+    for (auto& hook : end_hooks_) {
+      hook();
+    }
+  }
+
+  // break weak-ref cycle: hooks registered via postHook() may capture a
+  // weak_intrusive_ptr back to this object. after the strong refcount
+  // reaches 0, release_resources() clears the hooks, destroying the weak
+  // pointers and allowing the weak refcount to reach 0 so the object is
+  // deleted.
+  void release_resources() override {
+    start_hooks_.clear();
+    end_hooks_.clear();
+    wait_hooks_.clear();
+  }
+
+  std::atomic<WorkStatus> status_{WorkStatus::NOT_STARTED};
+  bool end_hooks_fired_{false};
+
+  std::vector<WorkHook> start_hooks_;
+  std::vector<WorkHook> end_hooks_;
+  std::vector<WorkHook> wait_hooks_;
 };
 
 class TorchWorkCompleted : public TorchWork {

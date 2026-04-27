@@ -7,19 +7,16 @@
 
 #include <folly/init/Init.h>
 
-#include "comm.h"
 #include "comms/ctran/Ctran.h"
 #include "comms/ctran/tests/CtranDistTestUtils.h"
 #include "comms/ctran/tests/CtranTestUtils.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/window/CtranWin.h"
 #include "comms/testinfra/TestUtils.h"
-#include "comms/testinfra/TestsDistUtils.h"
-#include "nccl.h"
 
 using namespace ctran;
 
-class CtranWinTest : public NcclxBaseTest {
+class CtranWinTest : public ctran::CtranDistTestFixture {
  public:
   CtranWinTest() = default;
 
@@ -27,25 +24,16 @@ class CtranWinTest : public NcclxBaseTest {
   void SetUp() override {
     setenv("NCCL_CTRAN_ENABLE", "1", 0);
     setenv("NCCL_CTRAN_IB_EPOCH_LOCK_ENFORCE_CHECK", "true", 0);
-    NcclxBaseTest::SetUp();
-    CUDACHECK_TEST(cudaSetDevice(this->localRank));
+    ctran::CtranDistTestFixture::SetUp();
   }
   void TearDown() override {
     // Check that all allocated memory segments have been freed
     EXPECT_TRUE(segments.empty()) << "Not all memory segments were freed";
-  }
-
-  void barrier(ncclComm_t comm, cudaStream_t stream) {
-    // simple Allreduce as barrier before get data from other ranks
-    void* buf;
-    CUDACHECK_TEST(cudaMalloc(&buf, sizeof(char)));
-    NCCLCHECK_TEST(ncclAllReduce(buf, buf, 1, ncclChar, ncclSum, comm, stream));
-    CUDACHECK_TEST(cudaDeviceSynchronize());
-    CUDACHECK_TEST(cudaFree(buf));
+    ctran::CtranDistTestFixture::TearDown();
   }
 
   void createWin(
-      ncclComm_t comm,
+      CtranComm* comm,
       bool isUserBuf,
       MemAllocType bufType,
       void** winBasePtr,
@@ -53,12 +41,11 @@ class CtranWinTest : public NcclxBaseTest {
       size_t sizeBytes) {
     meta::comms::Hints hints;
     auto res = commSuccess;
-    // If userBuf is true, allocate buffer and use ctranWinRegister API
     if (isUserBuf) {
       *winBasePtr = commMemAlloc(sizeBytes, bufType, segments);
 
-      res = ctranWinRegister(
-          (void*)*winBasePtr, sizeBytes, comm->ctranComm_.get(), winPtr, hints);
+      res =
+          ctranWinRegister((void*)*winBasePtr, sizeBytes, comm, winPtr, hints);
 
     } else {
       hints.set(
@@ -67,8 +54,8 @@ class CtranWinTest : public NcclxBaseTest {
                   bufType == MemAllocType::kMemHostUnregistered
               ? "cpu"
               : "gpu");
-      res = ctranWinAllocate(
-          sizeBytes, comm->ctranComm_.get(), (void**)winBasePtr, winPtr, hints);
+      res =
+          ctranWinAllocate(sizeBytes, comm, (void**)winBasePtr, winPtr, hints);
     }
     ASSERT_EQ(res, commSuccess);
     ASSERT_NE(*winBasePtr, nullptr);
@@ -78,7 +65,6 @@ class CtranWinTest : public NcclxBaseTest {
   freeWinBuf(bool isUserBuf, void* ptr, size_t size, MemAllocType bufType) {
     if (isUserBuf) {
       commMemFree(ptr, size, bufType);
-      // Remove the segment from the tracking vector
       segments.erase(
           std::remove_if(
               segments.begin(),
@@ -97,29 +83,20 @@ class CtranWinTestParam
 TEST_P(CtranWinTestParam, winAllocCreate) {
   auto [bufType, userBuf] = GetParam();
 
-  ncclComm_t comm = createNcclComm(
-      this->globalRank,
-      this->numRanks,
-      this->localRank,
-      false,
-      nullptr,
-      server.get());
-
+  auto comm = makeCtranComm();
   ASSERT_NE(comm, nullptr);
 
-  auto statex = comm->ctranComm_->statex_.get();
+  auto statex = comm->statex_.get();
   ASSERT_NE(statex, nullptr);
 
-  cudaStream_t stream = 0;
   CtranWin* win = nullptr;
   size_t sizeBytes = 8192 * sizeof(int);
   void* winBase = nullptr;
-  createWin(comm, userBuf, bufType, &winBase, &win, sizeBytes);
+  createWin(comm.get(), userBuf, bufType, &winBase, &win, sizeBytes);
 
   EXPECT_THAT(win, ::testing::NotNull());
 
-  // Expect window allocation would trigger internal buffer registration export
-  const auto dump0 = comm->ctranComm_->ctran_->mapper->dumpExportRegCache();
+  const auto dump0 = comm->ctran_->mapper->dumpExportRegCache();
   EXPECT_GE(dump0.size(), 0);
 
   for (int peer = 0; peer < this->numRanks; peer++) {
@@ -128,12 +105,10 @@ TEST_P(CtranWinTestParam, winAllocCreate) {
     EXPECT_EQ(res, commSuccess);
     if (peer == statex->rank()) {
       EXPECT_EQ(remoteAddr, winBase);
-      // For CPU window or peers on remote node, remote address is null
     } else if (!(statex->node(peer) == statex->node() &&
                  win->nvlEnabled(peer))) {
       EXPECT_THAT(remoteAddr, ::testing::IsNull());
     } else {
-      // Do actual copy to validate remote address is accessible
       FB_CUDACHECKIGNORE(
           cudaMemcpy(remoteAddr, winBase, sizeBytes, cudaMemcpyDefault));
       EXPECT_THAT(remoteAddr, ::testing::NotNull());
@@ -148,47 +123,32 @@ TEST_P(CtranWinTestParam, winAllocCreate) {
         win->updateOpCount(next_peer, window::OpCountType::kWaitSignal), i);
   }
 
-  // Barrier to ensure all peers have finished creation and query
-  this->barrier(comm, stream);
+  oobBarrier();
 
   auto res = ctranWinFree(win);
   EXPECT_EQ(res, commSuccess);
 
-  // This test only exported buffers in window, thus expect all exported cache
-  // is freed upon window free
-  const auto dump1 = comm->ctranComm_->ctran_->mapper->dumpExportRegCache();
+  const auto dump1 = comm->ctran_->mapper->dumpExportRegCache();
   EXPECT_EQ(dump1.size(), 0);
 
   freeWinBuf(userBuf, winBase, sizeBytes, bufType);
-
-  finalizeNcclComm(globalRank, server.get());
-  NCCLCHECK_TEST(ncclCommDestroy(comm));
 }
 
 TEST_F(CtranWinTest, directCopy) {
-  ncclComm_t comm = createNcclComm(
-      this->globalRank,
-      this->numRanks,
-      this->localRank,
-      false,
-      nullptr,
-      server.get());
+  auto comm = makeCtranComm();
   ASSERT_NE(comm, nullptr);
 
-  auto statex = comm->ctranComm_->statex_.get();
+  auto statex = comm->statex_.get();
   ASSERT_NE(statex, nullptr);
 
   if (statex->nLocalRanks() == 1) {
-    NCCLCHECK_TEST(ncclCommDestroy(comm));
     GTEST_SKIP() << "Host needs to have at least 2 GPUs to run this test";
   }
 
-  cudaStream_t stream = 0;
   CtranWin* win = nullptr;
   size_t count = 8192;
   void* winBase = nullptr;
-  auto res = ctranWinAllocate(
-      count * sizeof(int), comm->ctranComm_.get(), &winBase, &win);
+  auto res = ctranWinAllocate(count * sizeof(int), comm.get(), &winBase, &win);
   EXPECT_EQ(res, commSuccess);
   ASSERT_NE(winBase, nullptr);
 
@@ -196,13 +156,11 @@ TEST_F(CtranWinTest, directCopy) {
   int seed = this->globalRank * count;
   assignChunkValue(localWinAddr, count, seed, 1);
 
-  // Barrier to ensure remote GPU has finished data write to window
-  this->barrier(comm, stream);
+  oobBarrier();
 
   srand(time(NULL));
   std::vector<int> remoteData_host(count, rand());
   for (int peer = 0; peer < this->numRanks; ++peer) {
-    // Direct remote memory access is only allowed for local GPUs
     if ((peer != this->globalRank) && (statex->node() == statex->node(peer))) {
       void* remoteWinBase = nullptr;
       res = ctranWinSharedQuery(peer, win, &remoteWinBase);
@@ -221,38 +179,26 @@ TEST_F(CtranWinTest, directCopy) {
     }
   }
 
-  // Barrier to ensure all peers have completed remote data access
-  this->barrier(comm, stream);
+  oobBarrier();
 
   res = ctranWinFree(win);
   EXPECT_EQ(res, commSuccess);
-
-  finalizeNcclComm(globalRank, server.get());
-  NCCLCHECK_TEST(ncclCommDestroy(comm));
 }
 
 TEST_F(CtranWinTest, nvlDisabled) {
   EnvRAII env1(
       NCCL_CTRAN_BACKENDS,
       std::vector<enum NCCL_CTRAN_BACKENDS>{NCCL_CTRAN_BACKENDS::ib});
-  ncclComm_t comm = createNcclComm(
-      this->globalRank,
-      this->numRanks,
-      this->localRank,
-      false,
-      nullptr,
-      server.get());
-
+  auto comm = makeCtranComm();
   ASSERT_NE(comm, nullptr);
 
-  auto statex = comm->ctranComm_->statex_.get();
+  auto statex = comm->statex_.get();
   ASSERT_NE(statex, nullptr);
 
   CtranWin* win = nullptr;
   size_t sizeBytes = 8192 * sizeof(int);
   void* winBase = nullptr;
-  auto res =
-      ctranWinAllocate(sizeBytes, comm->ctranComm_.get(), &winBase, &win);
+  auto res = ctranWinAllocate(sizeBytes, comm.get(), &winBase, &win);
   ASSERT_EQ(res, commSuccess);
   ASSERT_NE(winBase, nullptr);
 
@@ -262,7 +208,6 @@ TEST_F(CtranWinTest, nvlDisabled) {
     ASSERT_EQ(win->nvlEnabled(peer), false);
     void* remoteAddr = nullptr;
     ASSERT_EQ(ctranWinSharedQuery(peer, win, &remoteAddr), commSuccess);
-    // Expect can only directly access local GPU's window
     if (peer == statex->rank()) {
       EXPECT_EQ(remoteAddr, winBase);
     } else {
@@ -272,9 +217,6 @@ TEST_F(CtranWinTest, nvlDisabled) {
 
   res = ctranWinFree(win);
   EXPECT_EQ(res, commSuccess);
-
-  finalizeNcclComm(globalRank, server.get());
-  NCCLCHECK_TEST(ncclCommDestroy(comm));
 }
 
 // Test fixture using CtranDistTestFixture (without NCCL dependency)
@@ -291,13 +233,6 @@ class CtranWinDistTest : public ctran::CtranDistTestFixture {
 
   void TearDown() override {
     CtranDistTestFixture::TearDown();
-  }
-
-  void barrier(CtranComm* comm) {
-    auto resFuture = comm->bootstrap_->barrier(
-        comm->statex_->rank(), comm->statex_->nRanks());
-    ASSERT_EQ(
-        static_cast<commResult_t>(std::move(resFuture).get()), commSuccess);
   }
 };
 
@@ -421,7 +356,7 @@ TEST_F(CtranWinDistTest, asymmetricWindowDirectCopy) {
   assignChunkValue(localWinAddr, localCount, seed, 1);
 
   // Barrier to ensure all ranks have initialized their windows
-  this->barrier(comm.get());
+  oobBarrier();
 
   // Read from other local ranks and verify data
   for (int peer = 0; peer < this->numRanks; ++peer) {
@@ -452,13 +387,13 @@ TEST_F(CtranWinDistTest, asymmetricWindowDirectCopy) {
   }
 
   // Barrier before cleanup
-  this->barrier(comm.get());
+  oobBarrier();
 
   res = ctranWinFree(win);
   EXPECT_EQ(res, commSuccess);
 }
 
-// Test asymmetric window with PUT and GET operations between ranks
+// Test asymmetric window with direct
 TEST_F(CtranWinDistTest, asymmetricWindowPutGet) {
   auto comm = makeCtranComm();
   ASSERT_NE(comm, nullptr);
@@ -517,7 +452,7 @@ TEST_F(CtranWinDistTest, asymmetricWindowPutGet) {
   CUDACHECK_TEST(cudaStreamCreateWithFlags(&getStream, cudaStreamNonBlocking));
   CUDACHECK_TEST(cudaStreamCreateWithFlags(&waitStream, cudaStreamNonBlocking));
 
-  this->barrier(comm.get());
+  oobBarrier();
 
   // === PUT test: each rank PUTs to next peer ===
   const int kNumIters = 10;
@@ -555,7 +490,7 @@ TEST_F(CtranWinDistTest, asymmetricWindowPutGet) {
   }
   EXPECT_EQ(putErrs, 0) << "PUT verification failed";
 
-  this->barrier(comm.get());
+  oobBarrier();
 
   // === GET test: each rank GETs from next peer ===
   // After PUT phase, nextPeer's window has data from rank at offset
@@ -574,7 +509,7 @@ TEST_F(CtranWinDistTest, asymmetricWindowPutGet) {
   }
 
   CUDACHECK_TEST(cudaStreamSynchronize(getStream));
-  this->barrier(comm.get());
+  oobBarrier();
 
   // Verify GET: we should get back our own data that we PUT to nextPeer
   std::vector<int> getRecvData(localCount, -1);
@@ -601,6 +536,247 @@ TEST_F(CtranWinDistTest, asymmetricWindowPutGet) {
   EXPECT_EQ(res, commSuccess);
 }
 
+// Verify that the cuStreamBatchMemOp signal reset in waitSignalDriverApi
+// correctly resets signal values between CUDA graph replays.  Without the
+// reset, replay N>0 would see stale GEQ values from replay N-1 and the
+// wait would pass prematurely (before the peer's put data arrives).
+TEST_F(CtranWinDistTest, signalResetAcrossGraphReplays) {
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  auto statex = comm->statex_.get();
+  ASSERT_NE(statex, nullptr);
+
+  if (statex->nRanks() < 2) {
+    GTEST_SKIP() << "Need at least 2 ranks";
+  }
+
+  const int rank = statex->rank();
+  const int numRanks = statex->nRanks();
+  const int nextPeer = (rank + 1) % numRanks;
+  const int prevPeer = (rank + numRanks - 1) % numRanks;
+  const size_t count = 1024;
+  const size_t winSizeBytes = count * sizeof(int) * numRanks;
+
+  // Allocate window
+  CtranWin* win = nullptr;
+  void* winBase = nullptr;
+  COMMCHECK_TEST(ctranWinAllocate(winSizeBytes, comm.get(), &winBase, &win));
+  ASSERT_NE(winBase, nullptr);
+
+  // Put buffer: rank * 1000 + index
+  int* putBuf = nullptr;
+  CUDACHECK_TEST(cudaMalloc(&putBuf, count * sizeof(int)));
+  assignChunkValue(putBuf, count, rank * 1000, 1);
+
+  cudaStream_t captureStream, putStream, waitStream;
+  CUDACHECK_TEST(
+      cudaStreamCreateWithFlags(&captureStream, cudaStreamNonBlocking));
+  CUDACHECK_TEST(cudaStreamCreateWithFlags(&putStream, cudaStreamNonBlocking));
+  CUDACHECK_TEST(cudaStreamCreateWithFlags(&waitStream, cudaStreamNonBlocking));
+
+  oobBarrier();
+
+  // Capture put + signal + wait_signal into a graph
+  CUDACHECK_TEST(
+      cudaStreamBeginCapture(captureStream, cudaStreamCaptureModeRelaxed));
+
+  // Fork to putStream
+  cudaEvent_t forkEvent, joinEvent;
+  CUDACHECK_TEST(cudaEventCreate(&forkEvent));
+  CUDACHECK_TEST(cudaEventCreate(&joinEvent));
+
+  CUDACHECK_TEST(cudaEventRecord(forkEvent, captureStream));
+  CUDACHECK_TEST(cudaStreamWaitEvent(putStream, forkEvent, 0));
+
+  COMMCHECK_TEST(ctranPutSignal(
+      putBuf, count, commInt32, nextPeer, count * rank, win, putStream, true));
+
+  // Join putStream back, fork to waitStream
+  CUDACHECK_TEST(cudaEventRecord(joinEvent, putStream));
+  CUDACHECK_TEST(cudaStreamWaitEvent(waitStream, joinEvent, 0));
+
+  COMMCHECK_TEST(ctranWaitSignal(prevPeer, win, waitStream));
+
+  // Join waitStream back to captureStream
+  cudaEvent_t joinEvent2;
+  CUDACHECK_TEST(cudaEventCreate(&joinEvent2));
+  CUDACHECK_TEST(cudaEventRecord(joinEvent2, waitStream));
+  CUDACHECK_TEST(cudaStreamWaitEvent(captureStream, joinEvent2, 0));
+
+  cudaGraph_t graph;
+  CUDACHECK_TEST(cudaStreamEndCapture(captureStream, &graph));
+  ASSERT_NE(graph, nullptr);
+
+  cudaGraphExec_t graphExec;
+  CUDACHECK_TEST(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
+
+  oobBarrier();
+
+  // Replay multiple times
+  constexpr int kNumReplays = 5;
+  for (int replay = 0; replay < kNumReplays; replay++) {
+    // Zero the window buffer so we can detect fresh data
+    CUDACHECK_TEST(cudaMemset(winBase, 0, winSizeBytes));
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    oobBarrier();
+
+    CUDACHECK_TEST(cudaGraphLaunch(graphExec, captureStream));
+    CUDACHECK_TEST(cudaStreamSynchronize(captureStream));
+    oobBarrier();
+
+    // Verify data from previous peer arrived correctly
+    int* winBufInt = reinterpret_cast<int*>(winBase);
+    std::vector<int> recvData(count, -1);
+    CUDACHECK_TEST(cudaMemcpy(
+        recvData.data(),
+        winBufInt + count * prevPeer,
+        count * sizeof(int),
+        cudaMemcpyDefault));
+
+    int errs = 0;
+    for (size_t i = 0; i < count; ++i) {
+      int expected = prevPeer * 1000 + static_cast<int>(i);
+      if (recvData[i] != expected && errs++ < 5) {
+        XLOG(ERR) << "Replay " << replay << ": Rank " << rank << ": data[" << i
+                  << "] = " << recvData[i] << ", expected = " << expected;
+      }
+    }
+    EXPECT_EQ(errs, 0) << "Replay " << replay
+                       << ": signal reset failed — stale data";
+  }
+
+  // Cleanup
+  CUDACHECK_TEST(cudaGraphExecDestroy(graphExec));
+  CUDACHECK_TEST(cudaGraphDestroy(graph));
+  CUDACHECK_TEST(cudaFree(putBuf));
+  CUDACHECK_TEST(cudaStreamDestroy(captureStream));
+  CUDACHECK_TEST(cudaStreamDestroy(putStream));
+  CUDACHECK_TEST(cudaStreamDestroy(waitStream));
+  CUDACHECK_TEST(cudaEventDestroy(forkEvent));
+  CUDACHECK_TEST(cudaEventDestroy(joinEvent));
+  CUDACHECK_TEST(cudaEventDestroy(joinEvent2));
+  COMMCHECK_TEST(ctranWinFree(win));
+  oobBarrier();
+}
+
+// E2E test: ctranWinRegister with a disjoint multi-segment user buffer
+// (>CTRAN_IPC_INLINE_SEGMENTS physical allocations) that exercises the
+// multi-packet NVL export path introduced in D97017284 / D96228113.
+//
+// The window's exchange() calls mapper->allGatherCtrl(), which for NVL
+// (intra-node) peers exports the buffer's IPC descriptors. When the buffer
+// is backed by many physical segments, the extra segments are sent in
+// additional packets beyond the inline ControlMsg header.
+//
+// This test:
+//   1. Allocates a disjoint GPU buffer with many segments via
+//      ncclMemAllocDisjoint.
+//   2. Registers it as a user-provided window buffer via ctranWinRegister.
+//   3. Verifies remote window addresses are accessible for NVL peers via
+//      ctranWinSharedQuery.
+//   4. Writes a rank-specific pattern into each window and verifies that
+//      intra-node peers can read it back correctly (direct copy over NVL).
+TEST_F(CtranWinTest, multiSegmentWindowRegister) {
+  if (!ncclIsCuMemSupported()) {
+    GTEST_SKIP() << "CuMem not supported, skip multi-segment window test";
+  }
+
+  auto ctranComm = makeCtranComm();
+  ASSERT_NE(ctranComm, nullptr);
+
+  auto statex = ctranComm->statex_.get();
+  ASSERT_NE(statex, nullptr);
+
+  if (statex->nLocalRanks() < 2) {
+    GTEST_SKIP() << "Test requires at least 2 local GPUs to exercise NVL path";
+  }
+
+  // Allocate a disjoint buffer with many segments to trigger the
+  // multi-packet export path (CTRAN_IPC_INLINE_SEGMENTS == 2).
+  constexpr int kNumSegments = 100;
+  constexpr size_t kSegSize = 1024; // 1KB per segment
+  std::vector<size_t> segSizes(kNumSegments, kSegSize);
+  size_t totalSize = kSegSize * kNumSegments;
+
+  void* disjointBuf = nullptr;
+  std::vector<TestMemSegment> disjointSegments;
+  COMMCHECK_TEST(
+      commMemAllocDisjoint(&disjointBuf, segSizes, disjointSegments));
+  ASSERT_NE(disjointBuf, nullptr);
+
+  // Fill local buffer with a rank-specific pattern:
+  // every int element = globalRank * 10000 + element_index
+  const size_t count = totalSize / sizeof(int);
+  std::vector<int> fillVals(count);
+  for (size_t i = 0; i < count; ++i) {
+    fillVals[i] = this->globalRank * 10000 + static_cast<int>(i);
+  }
+  CUDACHECK_TEST(cudaMemcpy(
+      disjointBuf, fillVals.data(), totalSize, cudaMemcpyHostToDevice));
+
+  // Register the disjoint buffer as a user-provided window.
+  // This exercises: ctranWinRegister -> allocate(userBufPtr) -> exchange()
+  // -> allGatherCtrl() with multi-segment NVL export.
+  CtranWin* win = nullptr;
+  meta::comms::Hints hints;
+  auto res =
+      ctranWinRegister(disjointBuf, totalSize, ctranComm.get(), &win, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(win, nullptr);
+
+  // Verify remote addresses via ctranWinSharedQuery
+  for (int peer = 0; peer < this->numRanks; ++peer) {
+    void* remoteAddr = nullptr;
+    res = ctranWinSharedQuery(peer, win, &remoteAddr);
+    EXPECT_EQ(res, commSuccess);
+
+    if (peer == statex->rank()) {
+      EXPECT_EQ(remoteAddr, disjointBuf);
+    } else if (statex->node(peer) == statex->node() && win->nvlEnabled(peer)) {
+      // Intra-node NVL peer: remote address should be mapped
+      EXPECT_NE(remoteAddr, nullptr)
+          << "NVL peer " << peer << " should have non-null remote address";
+    }
+  }
+
+  // Barrier to ensure all ranks have finished window creation and data write
+  oobBarrier();
+
+  // Verify data integrity: read back remote window contents from NVL peers
+  for (int peer = 0; peer < this->numRanks; ++peer) {
+    if (peer == this->globalRank) {
+      continue;
+    }
+    if (!(statex->node(peer) == statex->node() && win->nvlEnabled(peer))) {
+      continue;
+    }
+
+    void* remoteAddr = nullptr;
+    res = ctranWinSharedQuery(peer, win, &remoteAddr);
+    ASSERT_EQ(res, commSuccess);
+    ASSERT_NE(remoteAddr, nullptr);
+
+    std::vector<int> readBack(count);
+    CUDACHECK_TEST(cudaMemcpy(
+        readBack.data(), remoteAddr, totalSize, cudaMemcpyDeviceToHost));
+
+    for (size_t i = 0; i < count; ++i) {
+      int expected = peer * 10000 + static_cast<int>(i);
+      EXPECT_EQ(readBack[i], expected)
+          << "Mismatch at index " << i << " reading from peer " << peer;
+    }
+  }
+
+  // Barrier before cleanup to ensure all peers finished remote reads
+  oobBarrier();
+
+  res = ctranWinFree(win);
+  EXPECT_EQ(res, commSuccess);
+
+  COMMCHECK_TEST(commMemFreeDisjoint(disjointBuf, segSizes));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     CtranWinInstance,
     CtranWinTestParam,
@@ -615,7 +791,7 @@ INSTANTIATE_TEST_SUITE_P(
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
-  ::testing::AddGlobalTestEnvironment(new DistEnvironmentBase);
+  ::testing::AddGlobalTestEnvironment(new ctran::CtranDistEnvironment);
   folly::Init init(&argc, &argv);
   return RUN_ALL_TESTS();
 }

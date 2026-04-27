@@ -2,6 +2,8 @@
 
 #include "comms/torchcomms/ncclx/NcclxApi.hpp"
 
+#include <folly/debugging/symbolizer/Symbolizer.h>
+
 // Check NCCL version at compile time
 #if NCCL_VERSION_CODE < NCCL_VERSION(2, 25, 0)
 #error \
@@ -19,7 +21,8 @@ NCCLXException::NCCLXException(
     ncclComm_t comm)
     : message_(
           message + ": " + nccl_api.getErrorString(result) +
-          " \nNCCL Last Error: " + nccl_api.getLastError(comm)),
+          " \nNCCL Last Error: " + nccl_api.getLastError(comm) +
+          " \nBacktrace:\n" + folly::symbolizer::getStackTraceStr()),
       result_(result) {}
 
 const char* NCCLXException::what() const noexcept {
@@ -68,6 +71,11 @@ ncclResult_t DefaultNcclxApi::commAbort(ncclComm_t comm) {
   return ncclCommAbort(comm);
 }
 
+ncclResult_t DefaultNcclxApi::commRevoke(ncclComm_t comm) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  return ncclCommRevoke(comm, 0);
+}
+
 ncclResult_t DefaultNcclxApi::commGetAsyncError(
     ncclComm_t comm,
     ncclResult_t* asyncError) {
@@ -85,6 +93,52 @@ ncclResult_t DefaultNcclxApi::commSplit(
   return ncclCommSplit(comm, color, key, newcomm, config);
 }
 
+ncclResult_t DefaultNcclxApi::commShrink(
+    ncclComm_t comm,
+    int* excludeRanksList,
+    int excludeRanksCount,
+    ncclComm_t* newcomm,
+    ncclConfig_t* config,
+    int shrinkFlags) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  return ncclCommShrink(
+      comm, excludeRanksList, excludeRanksCount, newcomm, config, shrinkFlags);
+}
+
+ncclResult_t DefaultNcclxApi::commGetUniqueId(
+    ncclComm_t comm,
+    ncclUniqueId* uniqueId) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  return ncclCommGetUniqueId(comm, uniqueId);
+#else
+  (void)comm;
+  (void)uniqueId;
+  return ncclInvalidUsage;
+#endif
+}
+
+ncclResult_t DefaultNcclxApi::commGrow(
+    ncclComm_t comm,
+    int nRanks,
+    const ncclUniqueId* uniqueId,
+    int rank,
+    ncclComm_t* newcomm,
+    ncclConfig_t* config) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  return ncclCommGrow(comm, nRanks, uniqueId, rank, newcomm, config);
+#else
+  (void)comm;
+  (void)nRanks;
+  (void)uniqueId;
+  (void)rank;
+  (void)newcomm;
+  (void)config;
+  return ncclInvalidUsage;
+#endif
+}
+
 ncclResult_t DefaultNcclxApi::commRegister(
     ncclComm_t comm,
     void* buffer,
@@ -97,6 +151,16 @@ ncclResult_t DefaultNcclxApi::commRegister(
 ncclResult_t DefaultNcclxApi::commDeregister(ncclComm_t comm, void* handle) {
   std::lock_guard<std::mutex> lock(api_mutex_);
   return ncclCommDeregister(comm, handle);
+}
+
+ncclResult_t DefaultNcclxApi::globalRegisterWithPtr(void* buffer, size_t size) {
+  return ncclGlobalRegisterWithPtr(buffer, size);
+}
+
+ncclResult_t DefaultNcclxApi::globalDeregisterWithPtr(
+    void* buffer,
+    size_t size) {
+  return ncclGlobalDeregisterWithPtr(buffer, size);
 }
 
 ncclResult_t DefaultNcclxApi::send(
@@ -205,6 +269,31 @@ ncclResult_t DefaultNcclxApi::allToAll(
   return ncclAllToAll(sendbuff, recvbuff, count, datatype, comm, stream);
 }
 
+#ifdef NCCL_REDUCE_SCATTER_QUANTIZE_SUPPORTED
+ncclResult_t DefaultNcclxApi::reduceScatterQuantize(
+    const void* sendbuff,
+    void* recvbuff,
+    size_t recvcount,
+    ncclDataType_t inputType,
+    ncclDataType_t transportType,
+    ncclRedOp_t op,
+    uint64_t* seedPtr,
+    ncclComm_t comm,
+    cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  return ncclReduceScatterQuantize(
+      sendbuff,
+      recvbuff,
+      recvcount,
+      inputType,
+      transportType,
+      op,
+      seedPtr,
+      comm,
+      stream);
+}
+#endif
+
 ncclResult_t DefaultNcclxApi::allToAllv(
     const void* sendbuff,
     const size_t sendcounts[],
@@ -226,6 +315,31 @@ ncclResult_t DefaultNcclxApi::allToAllv(
       datatype,
       comm,
       stream);
+}
+
+ncclResult_t DefaultNcclxApi::deviceAllToAllv(
+    const void* sendbuff,
+    void* recvbuff,
+    const int64_t* sendcounts_d,
+    const int64_t* recvcounts_d,
+    ncclDataType_t datatype,
+    ncclComm_t comm,
+    cudaStream_t stream,
+    int64_t sendcountsMultiplier,
+    int64_t recvcountsMultiplier,
+    const std::unordered_map<std::string, std::string>& hints) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  return ncclx::deviceAllToAllv(
+      sendbuff,
+      recvbuff,
+      sendcounts_d,
+      recvcounts_d,
+      datatype,
+      comm,
+      stream,
+      sendcountsMultiplier,
+      recvcountsMultiplier,
+      hints);
 }
 
 ncclResult_t DefaultNcclxApi::alltoallvDynamicDispatch(
@@ -369,6 +483,32 @@ ncclResult_t DefaultNcclxApi::alltoallvDedupCombine(
       "NCCLX allToAllvDedupCombine is not supported in this build");
 }
 
+ncclResult_t DefaultNcclxApi::allGatherInit(
+    void* recvbuff,
+    size_t maxRecvCount,
+    const std::unordered_map<std::string, std::string>& hints,
+    ncclDataType_t datatype,
+    ncclComm_t comm,
+    cudaStream_t stream,
+    void** request) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  ncclx::Hints ncclxHints;
+  for (const auto& [key, value] : hints) {
+    ncclxHints.set(key, value);
+  }
+  return ncclx::allGatherInit(
+      recvbuff, maxRecvCount, ncclxHints, datatype, comm, stream, request);
+}
+
+ncclResult_t DefaultNcclxApi::allGatherExec(
+    const void* sendbuff,
+    size_t count,
+    ncclDataType_t datatype,
+    void* request) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  return ncclx::allGatherExec(sendbuff, count, datatype, request);
+}
+
 ncclResult_t DefaultNcclxApi::pFree(void* request) {
   std::lock_guard<std::mutex> lock(api_mutex_);
   return ncclx::pFree(request);
@@ -400,7 +540,11 @@ ncclResult_t DefaultNcclxApi::winPut(
     NcclxWindow win,
     cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(api_mutex_);
+#if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
   return ncclPut(
+#else
+  return ncclx::ncclPut(
+#endif
       originBuff, count, datatype, peer, targetOffsetNelems, win, stream);
 };
 
@@ -416,13 +560,23 @@ ncclResult_t DefaultNcclxApi::winSharedQuery(
 ncclResult_t
 DefaultNcclxApi::winSignal(int peer, NcclxWindow win, cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(api_mutex_);
-  return ncclSignal(peer, 0, peer, win, stream);
+#if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
+  return ncclSignal(
+#else
+  return ncclx::ncclSignal(
+#endif
+      peer, win, stream);
 }
 
 ncclResult_t
 DefaultNcclxApi::winWaitSignal(int peer, NcclxWindow win, cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(api_mutex_);
-  return ncclWaitSignal(peer, win, stream);
+#if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
+  return ncclWaitSignal(
+#else
+  return ncclx::ncclWaitSignal(
+#endif
+      peer, win, stream);
 }
 
 ncclResult_t DefaultNcclxApi::winGetAttributes(
@@ -478,6 +632,59 @@ ncclResult_t DefaultNcclxApi::redOpDestroy(ncclRedOp_t op, ncclComm_t comm) {
   return ncclRedOpDestroy(op, comm);
 }
 
+ncclResult_t DefaultNcclxApi::commDump(
+    ncclComm_t comm,
+    std::unordered_map<std::string, std::string>& map) {
+  std::lock_guard<std::mutex> lock(api_mutex_);
+  return ::ncclCommDump(comm, map);
+}
+
+#if defined(ENABLE_PIPES)
+ncclResult_t DefaultNcclxApi::winCreateDeviceWin(
+    NcclxWindow win,
+    int signal_count,
+    int counter_count,
+    int barrier_count,
+    void** outDevicePtr) {
+  return ncclWinCreateDeviceWin(
+      win, signal_count, counter_count, barrier_count, outDevicePtr);
+}
+
+ncclResult_t DefaultNcclxApi::winDestroyDeviceWin(void* devicePtr) {
+  return ncclWinDestroyDeviceWin(devicePtr);
+}
+
+ncclResult_t DefaultNcclxApi::getMultiPeerDeviceHandle(
+    ncclComm_t comm,
+    void** outTransportsPtr,
+    int* outMyRank,
+    int* outNRanks,
+    int* outNumNvlPeers,
+    int* outNumIbPeers) {
+  return ncclGetMultiPeerDeviceHandle(
+      comm,
+      outTransportsPtr,
+      outMyRank,
+      outNRanks,
+      outNumNvlPeers,
+      outNumIbPeers);
+}
+
+ncclResult_t DefaultNcclxApi::winLocalRegisterBuffer(
+    ncclComm_t comm,
+    void* ptr,
+    size_t size,
+    ncclLkeyPerDevice* outLkeys) {
+  return ncclWinLocalRegisterBuffer(comm, ptr, size, outLkeys);
+}
+
+ncclResult_t DefaultNcclxApi::winLocalDeregisterBuffer(
+    ncclComm_t comm,
+    void* ptr) {
+  return ncclWinLocalDeregisterBuffer(comm, ptr);
+}
+#endif // ENABLE_PIPES
+
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
 ncclResult_t DefaultNcclxApi::devCommCreate(
     ncclComm_t comm,
@@ -490,6 +697,27 @@ ncclResult_t DefaultNcclxApi::devCommDestroy(
     ncclComm_t comm,
     const ncclDevComm_t* devComm) {
   return ncclDevCommDestroy(comm, devComm);
+}
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+ncclResult_t DefaultNcclxApi::winGetPeerDevicePointer(
+    NcclxWindow win,
+    size_t offset,
+    int peer,
+    void** outPtr) {
+  return ncclGetPeerDevicePointer(win, offset, peer, outPtr);
+}
+
+ncclResult_t DefaultNcclxApi::winGetLsaMultimemDevicePointer(
+    NcclxWindow win,
+    size_t offset,
+    void** outPtr) {
+  return ncclGetLsaMultimemDevicePointer(win, offset, outPtr);
+}
+#endif
+
+ncclTeam_t DefaultNcclxApi::teamLsa(ncclComm_t comm) {
+  return ncclTeamLsa(comm);
 }
 #endif // TORCHCOMMS_HAS_NCCL_DEVICE_API
 

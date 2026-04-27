@@ -4,6 +4,7 @@
 
 #include <gmock/gmock.h>
 #include <nccl.h> // @manual
+#include <unordered_map>
 #include "comms/torchcomms/ncclx/NcclxApi.hpp"
 
 // Device API headers are only available in NCCLX 2.28+
@@ -13,6 +14,9 @@
 #endif
 
 namespace torch::comms::test {
+
+// Type alias to avoid preprocessor comma issues inside MOCK_METHOD macros.
+using NcclxCommDumpMap = std::unordered_map<std::string, std::string>;
 
 /**
  * Mock implementation of NcclxApi using Google Mock.
@@ -45,6 +49,8 @@ class NcclxMock : public NcclxApi {
 
   MOCK_METHOD(ncclResult_t, commAbort, (ncclComm_t comm), (override));
 
+  MOCK_METHOD(ncclResult_t, commRevoke, (ncclComm_t comm), (override));
+
   MOCK_METHOD(
       ncclResult_t,
       commGetAsyncError,
@@ -61,6 +67,34 @@ class NcclxMock : public NcclxApi {
        ncclConfig_t* config),
       (override));
 
+  MOCK_METHOD(
+      ncclResult_t,
+      commShrink,
+      (ncclComm_t comm,
+       int* excludeRanksList,
+       int excludeRanksCount,
+       ncclComm_t* newcomm,
+       ncclConfig_t* config,
+       int shrinkFlags),
+      (override));
+
+  MOCK_METHOD(
+      ncclResult_t,
+      commGetUniqueId,
+      (ncclComm_t comm, ncclUniqueId* uniqueId),
+      (override));
+
+  MOCK_METHOD(
+      ncclResult_t,
+      commGrow,
+      (ncclComm_t comm,
+       int nRanks,
+       const ncclUniqueId* uniqueId,
+       int rank,
+       ncclComm_t* newcomm,
+       ncclConfig_t* config),
+      (override));
+
   // Memory registration
   MOCK_METHOD(
       ncclResult_t,
@@ -72,6 +106,19 @@ class NcclxMock : public NcclxApi {
       ncclResult_t,
       commDeregister,
       (ncclComm_t comm, void* handle),
+      (override));
+
+  // Pointer-based memory registration (global - does not require comm)
+  MOCK_METHOD(
+      ncclResult_t,
+      globalRegisterWithPtr,
+      (void* buffer, size_t size),
+      (override));
+
+  MOCK_METHOD(
+      ncclResult_t,
+      globalDeregisterWithPtr,
+      (void* buffer, size_t size),
       (override));
 
   // Point-to-point operations
@@ -180,6 +227,22 @@ class NcclxMock : public NcclxApi {
        cudaStream_t stream),
       (override));
 
+#ifdef NCCL_REDUCE_SCATTER_QUANTIZE_SUPPORTED
+  MOCK_METHOD(
+      ncclResult_t,
+      reduceScatterQuantize,
+      (const void* sendbuff,
+       void* recvbuff,
+       size_t recvcount,
+       ncclDataType_t inputType,
+       ncclDataType_t transportType,
+       ncclRedOp_t op,
+       uint64_t* seedPtr,
+       ncclComm_t comm,
+       cudaStream_t stream),
+      (override));
+#endif
+
   MOCK_METHOD(
       ncclResult_t,
       allToAllv,
@@ -263,6 +326,28 @@ class NcclxMock : public NcclxApi {
        void* request),
       (override));
 
+  // Persistent AllGather operations
+  MOCK_METHOD(
+      ncclResult_t,
+      allGatherInit,
+      (void* recvbuff,
+       size_t maxRecvCount,
+       (const NcclxCommDumpMap& hints),
+       ncclDataType_t datatype,
+       ncclComm_t comm,
+       cudaStream_t stream,
+       void** request),
+      (override));
+
+  MOCK_METHOD(
+      ncclResult_t,
+      allGatherExec,
+      (const void* sendbuff,
+       size_t count,
+       ncclDataType_t datatype,
+       void* request),
+      (override));
+
   MOCK_METHOD(ncclResult_t, pFree, (void* request), (override));
 
   MOCK_METHOD(
@@ -335,6 +420,55 @@ class NcclxMock : public NcclxApi {
       devCommDestroy,
       (ncclComm_t comm, const ncclDevComm_t* devComm),
       (override));
+
+  MOCK_METHOD(ncclTeam_t, teamLsa, (ncclComm_t comm), (override));
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  MOCK_METHOD(
+      ncclResult_t,
+      winGetPeerDevicePointer,
+      (NcclxWindow win, size_t offset, int peer, void** outPtr),
+      (override));
+
+  MOCK_METHOD(
+      ncclResult_t,
+      winGetLsaMultimemDevicePointer,
+      (NcclxWindow win, size_t offset, void** outPtr),
+      (override));
+#endif
+#endif
+
+#if defined(ENABLE_PIPES)
+  MOCK_METHOD(
+      ncclResult_t,
+      winCreateDeviceWin,
+      (NcclxWindow win,
+       int signal_count,
+       int counter_count,
+       int barrier_count,
+       void** outDevicePtr),
+      (override));
+  MOCK_METHOD(ncclResult_t, winDestroyDeviceWin, (void* devicePtr), (override));
+  MOCK_METHOD(
+      ncclResult_t,
+      getMultiPeerDeviceHandle,
+      (ncclComm_t comm,
+       void** outTransportsPtr,
+       int* outMyRank,
+       int* outNRanks,
+       int* outNumNvlPeers,
+       int* outNumIbPeers),
+      (override));
+  MOCK_METHOD(
+      ncclResult_t,
+      winLocalRegisterBuffer,
+      (ncclComm_t comm, void* ptr, size_t size, ncclLkeyPerDevice* outLkeys),
+      (override));
+  MOCK_METHOD(
+      ncclResult_t,
+      winLocalDeregisterBuffer,
+      (ncclComm_t comm, void* ptr),
+      (override));
 #endif
 
   // Group operations
@@ -350,6 +484,12 @@ class NcclxMock : public NcclxApi {
       ncclResult_t,
       commCount,
       (const ncclComm_t comm, int* count),
+      (override));
+
+  MOCK_METHOD(
+      ncclResult_t,
+      commDump,
+      (ncclComm_t comm, NcclxCommDumpMap& map),
       (override));
 
   MOCK_METHOD(

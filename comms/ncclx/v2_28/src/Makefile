@@ -5,10 +5,12 @@
 #
 
 ENABLE_TCPDM ?= 0
+ENABLE_PIPES ?= 0
 
 # Assuming calling from src directory
 SRCDIR = $(abspath ./)
 NCCLDIR = $(abspath ../)
+SHAREDDIR = $(abspath ${NCCLDIR}/..)
 
 include ../makefiles/common.mk
 include ../makefiles/version.mk
@@ -18,6 +20,10 @@ CXXFLAGS += -DMOCK_SCUBA_DATA -DFOLLY_XLOG_STRIP_PREFIXES=\"${BASE_DIR}\"
 
 ifeq ($(ENABLE_TCPDM),0)
 CXXFLAGS += -DCTRAN_DISABLE_TCPDM
+endif
+
+ifeq ($(ENABLE_PIPES),1)
+CXXFLAGS += -DENABLE_PIPES
 endif
 
 ##### src files
@@ -42,20 +48,24 @@ LIBSRCFILES := \
 	$(filter-out ${SRCDIR}/ras/client.cc,$(wildcard ${SRCDIR}/ras/*.cc))
 
 LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/analyzer/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/colltrace/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/logger/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/tcpstore/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/transport/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/commDump.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/NcclxConfig.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/commHash.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/RankUtil.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/analyzer/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/colltrace/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/logger/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/tcpstore/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/transport/*.cc)
 LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/utilx/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/commstate/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/rma/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/collectives/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/comms-monitor/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/ctran-integration/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/hints/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/algoconf/*.cc)
-LIBSRCFILES += $(wildcard ${NCCLDIR}/meta/wrapper/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/commstate/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/rma/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/collectives/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/comms-monitor/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/ctran-integration/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/hints/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/algoconf/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/wrapper/*.cc)
 
 #### Start of fbcode source files
 ## Trainer Context for getting/setting trainer steps.
@@ -66,6 +76,9 @@ LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/logger/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/*.cc)
 ## CollTrace source files
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/colltrace/*.cc)
+## CollTrace CUDA source files (host-side kernel launchers)
+LIBSRCFILES += ${BASE_DIR}/comms/utils/GpuClockCalibration.cu
+LIBSRCFILES += ${BASE_DIR}/comms/utils/colltrace/HRDWRingBufferInstantiations.cu
 ## CollTrace plugin source files
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/colltrace/plugins/*.cc)
 ## Include ibverbx files
@@ -98,7 +111,6 @@ LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/AllGatherP/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/ReduceScatter/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/AllReduce/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/AllToAll/*.cc)
-LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/AllToAllvDedup/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/SendRecv/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/Broadcast/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/RMA/*.cc)
@@ -106,52 +118,18 @@ LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/RMA/*.cc)
 INCLUDES := -Iinclude
 INCLUDES += -Iinclude/plugin
 INCLUDES += -I${NCCLDIR}/
+INCLUDES += -I${SHAREDDIR}/
 INCLUDES += -I${NCCLDIR}/meta
-INCLUDES += -I${NCCLDIR}/meta/wrapper
-INCLUDES += -I${NCCLDIR}/meta/hints
-INCLUDES += -I${NCCLDIR}/meta/algoconf
-INCLUDES += -I${NCCLDIR}/meta/logger -Idevice
+INCLUDES += -I${SHAREDDIR}/meta
+INCLUDES += -I${SHAREDDIR}/meta/wrapper
+INCLUDES += -Idevice
 INCLUDES += -I$(BASE_DIR)
 INCLUDES += -I$(CONDA_INCLUDE_DIR)
 
 ifeq ($(ENABLE_TCPDM),1)
 ## Thrift buffer manager client
 CXXFLAGS    += -DTCP_DEVMEM_AGENT
-THRIFT      ?= thrift1
 DEVMEM_DIR  := $(BASE_DIR)/comms/tcp_devmem
-THRIFT_FILE := $(DEVMEM_DIR)/devmgr/devmgr.thrift
-THRIFT_H    := $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_client.h
-
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgr.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgrAsyncClient.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgr_processmap_binary.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgr_processmap_compact.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_constants.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_data.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_metadata.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types_binary.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types_compact.cpp
-LIBSRCFILES += $(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types_serialization.cpp
-
-$(THRIFT_H): $(THRIFT_FILE)
-	@printf "Generating  %-35s > %s\n" $(THRIFT_FILE) $(DEVMEM_DIR)/devmgr
-	$(THRIFT) --gen mstch_cpp2:include_prefix=$(DEVMEM_DIR)/devmgr -o $(DEVMEM_DIR)/devmgr $(THRIFT_FILE)
-
-$(DEVMEM_DIR)/devmgr/devmgr_client.cc: $(THRIFT_H)
-$(DEVMEM_DIR)/transport.cc: $(THRIFT_H)
-
-$(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgr.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgrAsyncClient.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgr_processmap_binary.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/DevMgr_processmap_compact.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_constants.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_data.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_metadata.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types_binary.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types_compact.cpp: $(THRIFT_H)
-$(DEVMEM_DIR)/devmgr/gen-cpp2/devmgr_types_serialization.cpp: $(THRIFT_H)
 
 ## Include TCP Devmem transport files and dependencies
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/backends/tcpdevmem/*.cc)
@@ -163,6 +141,7 @@ LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/request_pool.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/transport.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/worker.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/devmgr/devmgr.cc)
+LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/devmgr/bufmgr.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/devmgr/devmgr_client.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/common/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/tcp_devmem/unpack/external_unpack.cc)
@@ -217,15 +196,20 @@ PKGTARGET  := $(PKGCONFIGFILE)
 LIBSRCFILES_CC  := $(filter %.cc,$(LIBSRCFILES))
 LIBSRCFILES_CPP := $(filter %.cpp,$(LIBSRCFILES))
 LIBSRCFILES_C   := $(filter %.c,$(LIBSRCFILES))
+LIBSRCFILES_CU  := $(filter %.cu,$(LIBSRCFILES))
 LIBOBJ_CC       := $(LIBSRCFILES_CC:%.cc=$(OBJDIR)/%.o)
 LIBOBJ_CPP      := $(LIBSRCFILES_CPP:%.cpp=$(OBJDIR)/%.o)
 LIBOBJ_C        := $(LIBSRCFILES_C:%.c=$(OBJDIR)/%.o)
-LIBOBJ          := $(LIBOBJ_CC) $(LIBOBJ_CPP) $(LIBOBJ_C)
+LIBOBJ_CU       := $(LIBSRCFILES_CU:%.cu=$(OBJDIR)/%.cu.o)
+LIBOBJ          := $(LIBOBJ_CC) $(LIBOBJ_CPP) $(LIBOBJ_C) $(LIBOBJ_CU)
 BINOBJ     := $(BINSRCFILES:%.cc=$(OBJDIR)/%.o)
 DEPFILES   := $(LIBOBJ:%.o=%.d) $(BINOBJ:%.o=%.d)
 LDFLAGS    += -Wl,--no-undefined
 LDFLAGS    += -L${CUDA_LIB} -L${BUILDDIR} -L${CONDA_LIB_DIR} -l$(CUDARTLIB) -lpthread -lm -lrt -ldl
 LDFLAGS    += ${THIRD_PARTY_LDFLAGS}
+ifeq ($(ENABLE_PIPES),1)
+LDFLAGS    += -lpipes
+endif
 LDFLAGS    += -Wl,--version-script=version.script
 ifeq ($(CUDARTLIB), cudarthook)
     # Ensure that cudart symbols are resolved within the module itself.
@@ -312,7 +296,7 @@ $(INCDIR)/CtranEx.h : ${BASE_DIR}/comms/ctran/CtranEx.h
 	mkdir -p $(INCDIR)
 	install -m 644 $< $@
 
-$(INCDIR)/CtranExComm.h : ${NCCLDIR}/meta/wrapper/CtranExComm.h
+$(INCDIR)/CtranExComm.h : ${SHAREDDIR}/meta/wrapper/CtranExComm.h
 	@printf "Grabbing   %-35s > %s\n" $< $@
 	mkdir -p $(INCDIR)
 	install -m 644 $< $@
@@ -396,6 +380,11 @@ $(OBJDIR)/%.o : %.c $(INCTARGETS)
 	@sed -e 's/.*://' -e 's/\\$$//' < $(@:%.o=%.d.tmp) | fmt -1 | \
                 sed -e 's/^ *//' -e 's/$$/:/' >> $(@:%.o=%.d)
 	@rm -f $(@:%.o=%.d.tmp)
+
+$(OBJDIR)/%.cu.o : %.cu $(INCTARGETS)
+	@printf "Compiling  %-35s > %s\n" $< $@
+	mkdir -p `dirname $@`
+	$(NVCC) $(NVCC_GENCODE) $(CXXSTD) -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -I. -I$(INCDIR) $(INCLUDES) -I$(INCPLUGIN) -I$(DOCA_HOME)/include -c $< -o $@
 
 $(DOCA_OBJDIR)/%.o : $(DOCA_HOME)/src/%.cpp
 	@printf "Compiling  %-35s > %s\n" $< $@

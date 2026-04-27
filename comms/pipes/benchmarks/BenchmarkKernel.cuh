@@ -65,38 +65,37 @@ __global__ void p2pBidirectional(
     SyncScope groupScope = SyncScope::WARP,
     Timeout timeout = Timeout());
 
-// Signal benchmark kernel - ping-pong signaling between two peers
+// Signal benchmark kernel - ping-pong signaling pattern
 __global__ void p2pSignalBenchKernel(
     P2pNvlTransportDevice p2p,
     int nSteps,
     SyncScope groupScope = SyncScope::WARP);
 
-// Send one kernel - single chunk transfer with metadata
-__global__ void p2pSendOne(
+// =============================================================================
+// LL128 benchmark kernels - warp-based LL128 protocol with inline flag
+// signaling
+// =============================================================================
+
+// LL128 send kernel
+__global__ void p2pLl128Send(
     P2pNvlTransportDevice p2p,
     void* srcBuff,
     std::size_t nBytes,
-    SyncScope groupScope = SyncScope::WARP);
+    Timeout timeout = Timeout());
 
-// Recv one kernel - single chunk receive with metadata
-__global__ void p2pRecvOne(
+// LL128 recv kernel
+__global__ void p2pLl128Recv(
     P2pNvlTransportDevice p2p,
     void* dstBuff,
-    SyncScope groupScope = SyncScope::WARP);
+    std::size_t nBytes,
+    Timeout timeout = Timeout());
 
-// Send multiple kernel - transfer multiple chunks with metadata
-__global__ void p2pSendMultiple(
+// LL128 bidirectional kernel - half warps send, half recv
+__global__ void p2pLl128Bidirectional(
     P2pNvlTransportDevice p2p,
-    void* srcBuff,
-    DeviceSpan<const std::size_t> chunkSizes,
-    DeviceSpan<const std::size_t> chunkIndices,
-    SyncScope groupScope = SyncScope::WARP);
-
-// Recv multiple kernel - receive multiple chunks with metadata
-__global__ void p2pRecvMultiple(
-    P2pNvlTransportDevice p2p,
-    void* dstBuff,
-    DeviceSpan<std::size_t> chunkSizes,
-    SyncScope groupScope = SyncScope::WARP);
+    void* sendBuff,
+    void* recvBuff,
+    std::size_t nBytes,
+    Timeout timeout = Timeout());
 
 } // namespace comms::pipes::benchmark

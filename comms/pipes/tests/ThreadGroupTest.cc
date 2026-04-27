@@ -15,9 +15,6 @@ using meta::comms::DeviceBuffer;
 
 namespace comms::pipes {
 
-// Multiwarp size constant (4 warps = 128 threads)
-constexpr uint32_t kMultiwarpSize = 4 * comms::device::kWarpSize;
-
 class ThreadGroupTestFixture : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -205,6 +202,166 @@ INSTANTIATE_TEST_SUITE_P(
     });
 
 // =============================================================================
+// Strided Locality Tests
+// =============================================================================
+
+struct StridedTestParams {
+  uint32_t numItems;
+  SyncScope scope;
+  std::string description;
+  std::string testName;
+};
+
+class ThreadGroupStridedTest
+    : public ThreadGroupTestFixture,
+      public ::testing::WithParamInterface<StridedTestParams> {};
+
+// Test: for_each_item_strided correctness and determinism
+// Verifies that:
+// 1. Each work item is processed exactly once (no duplicates, no skips)
+// 2. Each group processes items in strided fashion
+// 3. Item K is ALWAYS assigned to group (K % total_groups)
+// 4. This mapping is deterministic regardless of total_items
+//
+// Why this matters:
+// - STRIDED pattern ensures consistent chunk-to-group mapping
+// - Useful when groups maintain local state for specific chunks
+// - e.g., ChunkState tracking where each group "owns" certain chunks
+//
+// Test setup:
+// - Configurable number of work items (even or uneven distribution)
+// - 8 blocks × 256 threads/block = 2048 threads total
+// - For warps: 2048 threads / 32 = 64 warps
+//
+// Verification method:
+// - Each group writes its group_id to all work items it processes
+// - CPU verifies that item K is assigned to group (K % total_groups)
+TEST_P(ThreadGroupStridedTest, ForEachItemStridedLocality) {
+  const auto& params = GetParam();
+  const uint32_t numItems = params.numItems;
+  const int numBlocks = 8;
+  const int blockSize = 256;
+
+  DeviceBuffer groupIdsBuffer(numItems * sizeof(uint32_t));
+  DeviceBuffer errorCountBuffer(sizeof(uint32_t));
+
+  auto groupIds_d = static_cast<uint32_t*>(groupIdsBuffer.get());
+  auto errorCount_d = static_cast<uint32_t*>(errorCountBuffer.get());
+
+  CUDACHECK_TEST(cudaMemset(groupIds_d, 0, numItems * sizeof(uint32_t)));
+  CUDACHECK_TEST(cudaMemset(errorCount_d, 0, sizeof(uint32_t)));
+
+  test::testStridedLocality(
+      groupIds_d, numItems, errorCount_d, numBlocks, blockSize, params.scope);
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+
+  uint32_t errorCount_h = 0;
+  CUDACHECK_TEST(cudaMemcpy(
+      &errorCount_h, errorCount_d, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+  EXPECT_EQ(errorCount_h, 0)
+      << "Strided pattern should assign item K to group (K % total_groups) ("
+      << params.description << ")";
+
+  std::vector<uint32_t> groupIds_h(numItems);
+  CUDACHECK_TEST(cudaMemcpy(
+      groupIds_h.data(),
+      groupIds_d,
+      numItems * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+
+  uint32_t totalGroups;
+  if (params.scope == SyncScope::WARP) {
+    const uint32_t warpsPerBlock = blockSize / comms::device::kWarpSize;
+    totalGroups = numBlocks * warpsPerBlock;
+  } else if (params.scope == SyncScope::MULTIWARP) {
+    const uint32_t multiwarpsPerBlock = blockSize / kMultiwarpSize;
+    totalGroups = numBlocks * multiwarpsPerBlock;
+  } else {
+    totalGroups = numBlocks;
+  }
+
+  for (uint32_t item_id = 0; item_id < numItems; item_id++) {
+    uint32_t expected_group_id = item_id % totalGroups;
+    EXPECT_EQ(groupIds_h[item_id], expected_group_id)
+        << "Work item " << item_id << " should be assigned to group "
+        << expected_group_id << " but was assigned to " << groupIds_h[item_id]
+        << " (" << params.description << ")";
+  }
+
+  // Verify each group processes the expected number of items
+  std::vector<uint32_t> itemsPerGroup(totalGroups, 0);
+  for (uint32_t item_id = 0; item_id < numItems; item_id++) {
+    itemsPerGroup[groupIds_h[item_id]]++;
+  }
+
+  for (uint32_t group_id = 0; group_id < totalGroups; group_id++) {
+    // Expected items: ceil((numItems - group_id) / totalGroups) if group_id <
+    // numItems
+    uint32_t expectedItems =
+        (numItems + totalGroups - 1 - group_id) / totalGroups;
+    if (group_id >= numItems) {
+      expectedItems = 0;
+    }
+    EXPECT_EQ(itemsPerGroup[group_id], expectedItems)
+        << "Group " << group_id << " should process " << expectedItems
+        << " items but processed " << itemsPerGroup[group_id] << " ("
+        << params.description << ")";
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    StridedDistributions,
+    ThreadGroupStridedTest,
+    ::testing::Values(
+        StridedTestParams{
+            .numItems = 2048,
+            .scope = SyncScope::WARP,
+            .description = "WARP: even distribution (2048 items, 64 warps)",
+            .testName = "Warp_EvenCase"},
+        StridedTestParams{
+            .numItems = 2040,
+            .scope = SyncScope::WARP,
+            .description = "WARP: uneven distribution (2040 items, 64 warps)",
+            .testName = "Warp_UnevenCase"},
+        StridedTestParams{
+            .numItems = 1024,
+            .scope = SyncScope::BLOCK,
+            .description = "BLOCK: even distribution (1024 items, 8 blocks)",
+            .testName = "Block_EvenCase"},
+        StridedTestParams{
+            .numItems = 1000,
+            .scope = SyncScope::BLOCK,
+            .description = "BLOCK: uneven distribution (1000 items, 8 blocks)",
+            .testName = "Block_UnevenCase"},
+        StridedTestParams{
+            .numItems = 1024,
+            .scope = SyncScope::MULTIWARP,
+            .description =
+                "MULTIWARP: even distribution (1024 items, 16 multiwarps)",
+            .testName = "Multiwarp_EvenCase"},
+        StridedTestParams{
+            .numItems = 1000,
+            .scope = SyncScope::MULTIWARP,
+            .description =
+                "MULTIWARP: uneven distribution (1000 items, 16 multiwarps)",
+            .testName = "Multiwarp_UnevenCase"},
+        StridedTestParams{
+            .numItems = 1024,
+            .scope = SyncScope::CLUSTER,
+            .description = "CLUSTER: even distribution (1024 items, 8 blocks)",
+            .testName = "Cluster_EvenCase"},
+        StridedTestParams{
+            .numItems = 1000,
+            .scope = SyncScope::CLUSTER,
+            .description =
+                "CLUSTER: uneven distribution (1000 items, 8 blocks)",
+            .testName = "Cluster_UnevenCase"}),
+    [](const ::testing::TestParamInfo<StridedTestParams>& info) {
+      return info.param.testName;
+    });
+
+// =============================================================================
 // Block Group Tests
 // =============================================================================
 
@@ -281,6 +438,113 @@ TEST_F(ThreadGroupTestFixture, BlockGroupContiguousLocality) {
           << "Work item " << item_id << " should be assigned to block group "
           << group_id;
     }
+  }
+}
+
+// =============================================================================
+// Thread Solo Tests
+// =============================================================================
+
+// Test: make_thread_solo creates a correct single-thread ThreadGroup
+// Verifies:
+// - group_size == 1 for every thread
+// - thread_id_in_group == 0 for every thread (each thread is always its own
+//   leader)
+// - is_leader() == true for every thread
+// - group_id == global thread index (unique per thread across all blocks)
+// - total_groups == total thread count (numBlocks * blockSize)
+// - scope == SyncScope::THREAD
+// - sync() completes without deadlock (compiler barrier only)
+TEST_F(ThreadGroupTestFixture, ThreadSoloGroupProperties) {
+  const int numBlocks = 4;
+  const int blockSize = 256;
+  const uint32_t totalThreads = numBlocks * blockSize;
+
+  DeviceBuffer groupIdsBuffer(totalThreads * sizeof(uint32_t));
+  DeviceBuffer groupSizesBuffer(totalThreads * sizeof(uint32_t));
+  DeviceBuffer threadIdsBuffer(totalThreads * sizeof(uint32_t));
+  DeviceBuffer isLeaderBuffer(totalThreads * sizeof(uint32_t));
+  DeviceBuffer syncResultsBuffer(totalThreads * sizeof(uint32_t));
+  DeviceBuffer errorCountBuffer(sizeof(uint32_t));
+
+  auto groupIds_d = static_cast<uint32_t*>(groupIdsBuffer.get());
+  auto groupSizes_d = static_cast<uint32_t*>(groupSizesBuffer.get());
+  auto threadIds_d = static_cast<uint32_t*>(threadIdsBuffer.get());
+  auto isLeader_d = static_cast<uint32_t*>(isLeaderBuffer.get());
+  auto syncResults_d = static_cast<uint32_t*>(syncResultsBuffer.get());
+  auto errorCount_d = static_cast<uint32_t*>(errorCountBuffer.get());
+
+  CUDACHECK_TEST(cudaMemset(groupIds_d, 0xFF, totalThreads * sizeof(uint32_t)));
+  CUDACHECK_TEST(
+      cudaMemset(groupSizes_d, 0xFF, totalThreads * sizeof(uint32_t)));
+  CUDACHECK_TEST(
+      cudaMemset(threadIds_d, 0xFF, totalThreads * sizeof(uint32_t)));
+  CUDACHECK_TEST(cudaMemset(isLeader_d, 0xFF, totalThreads * sizeof(uint32_t)));
+  CUDACHECK_TEST(cudaMemset(syncResults_d, 0, totalThreads * sizeof(uint32_t)));
+  CUDACHECK_TEST(cudaMemset(errorCount_d, 0, sizeof(uint32_t)));
+
+  test::testThreadSoloGroup(
+      groupIds_d,
+      groupSizes_d,
+      threadIds_d,
+      isLeader_d,
+      syncResults_d,
+      errorCount_d,
+      numBlocks,
+      blockSize);
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+
+  // Device-side checks passed
+  uint32_t errorCount_h = 0;
+  CUDACHECK_TEST(cudaMemcpy(
+      &errorCount_h, errorCount_d, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  EXPECT_EQ(errorCount_h, 0)
+      << "make_thread_solo should produce correct group properties on-device";
+
+  // Copy results to host for detailed verification
+  std::vector<uint32_t> groupIds_h(totalThreads);
+  std::vector<uint32_t> groupSizes_h(totalThreads);
+  std::vector<uint32_t> threadIds_h(totalThreads);
+  std::vector<uint32_t> isLeader_h(totalThreads);
+  std::vector<uint32_t> syncResults_h(totalThreads);
+
+  CUDACHECK_TEST(cudaMemcpy(
+      groupIds_h.data(),
+      groupIds_d,
+      totalThreads * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+  CUDACHECK_TEST(cudaMemcpy(
+      groupSizes_h.data(),
+      groupSizes_d,
+      totalThreads * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+  CUDACHECK_TEST(cudaMemcpy(
+      threadIds_h.data(),
+      threadIds_d,
+      totalThreads * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+  CUDACHECK_TEST(cudaMemcpy(
+      isLeader_h.data(),
+      isLeader_d,
+      totalThreads * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+  CUDACHECK_TEST(cudaMemcpy(
+      syncResults_h.data(),
+      syncResults_d,
+      totalThreads * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+
+  for (uint32_t i = 0; i < totalThreads; i++) {
+    EXPECT_EQ(groupIds_h[i], i)
+        << "Thread " << i << ": group_id should equal global thread index";
+    EXPECT_EQ(groupSizes_h[i], 1u)
+        << "Thread " << i << ": group_size should be 1";
+    EXPECT_EQ(threadIds_h[i], 0u)
+        << "Thread " << i << ": thread_id_in_group should be 0";
+    EXPECT_EQ(isLeader_h[i], 1u)
+        << "Thread " << i << ": is_leader() should be true";
+    EXPECT_EQ(syncResults_h[i], 1u)
+        << "Thread " << i << ": sync() should complete without deadlock";
   }
 }
 
@@ -583,9 +847,9 @@ class ThreadGroupPartitionInterleavedTest
     : public ThreadGroupTestFixture,
       public ::testing::WithParamInterface<PartitionTestParams> {};
 
-// Test: partition_interleaved round-robin assignment
+// Test: partition_interleaved strided assignment
 // Verifies:
-// - partition_id = group_id % num_partitions (round-robin)
+// - partition_id = group_id % num_partitions (strided)
 // - subgroup.group_id = group_id / num_partitions (renumbered within partition)
 // - subgroup.total_groups = (total_groups + num_partitions - 1 - pid) /
 // num_partitions
@@ -685,7 +949,7 @@ TEST_P(ThreadGroupPartitionInterleavedTest, PartitionInterleaved) {
   }
 
   EXPECT_EQ(partitionIds_h, expectedPartitionIds)
-      << "Partition IDs should follow interleaved (round-robin) pattern";
+      << "Partition IDs should follow interleaved (strided) pattern";
   EXPECT_EQ(subgroupIds_h, expectedSubgroupIds)
       << "Subgroup IDs should be sequential within each partition";
   EXPECT_EQ(subgroupTotalGroups_h, expectedTotalGroups)
@@ -2037,6 +2301,283 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<ClusterTestParams>& info) {
       return info.param.testName;
     });
+
+// =============================================================================
+// to_warp_group() Tests
+// =============================================================================
+
+struct ToWarpGroupTestParams {
+  int numBlocks;
+  int blockSize;
+  SyncScope scope;
+  std::string testName;
+};
+
+class ThreadGroupToWarpGroupTest
+    : public ThreadGroupTestFixture,
+      public ::testing::WithParamInterface<ToWarpGroupTestParams> {};
+
+TEST_P(ThreadGroupToWarpGroupTest, ToWarpGroupBasicConversion) {
+  const auto& params = GetParam();
+  const uint32_t totalWarps =
+      params.numBlocks * (params.blockSize / comms::device::kWarpSize);
+
+  DeviceBuffer groupIdsBuffer(totalWarps * sizeof(uint32_t));
+  DeviceBuffer totalGroupsOutBuffer(totalWarps * sizeof(uint32_t));
+  DeviceBuffer errorCountBuffer(sizeof(uint32_t));
+
+  auto groupIds_d = static_cast<uint32_t*>(groupIdsBuffer.get());
+  auto totalGroupsOut_d = static_cast<uint32_t*>(totalGroupsOutBuffer.get());
+  auto errorCount_d = static_cast<uint32_t*>(errorCountBuffer.get());
+
+  CUDACHECK_TEST(cudaMemset(groupIds_d, 0xFF, totalWarps * sizeof(uint32_t)));
+  CUDACHECK_TEST(
+      cudaMemset(totalGroupsOut_d, 0xFF, totalWarps * sizeof(uint32_t)));
+  CUDACHECK_TEST(cudaMemset(errorCount_d, 0, sizeof(uint32_t)));
+
+  test::testToWarpGroup(
+      groupIds_d,
+      totalGroupsOut_d,
+      errorCount_d,
+      params.numBlocks,
+      params.blockSize,
+      params.scope);
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+
+  uint32_t errorCount_h = 0;
+  CUDACHECK_TEST(cudaMemcpy(
+      &errorCount_h, errorCount_d, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  EXPECT_EQ(errorCount_h, 0)
+      << "to_warp_group() should produce correct thread_id_in_group, "
+         "group_size, and scope";
+
+  std::vector<uint32_t> groupIds_h(totalWarps);
+  std::vector<uint32_t> totalGroupsOut_h(totalWarps);
+
+  CUDACHECK_TEST(cudaMemcpy(
+      groupIds_h.data(),
+      groupIds_d,
+      totalWarps * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+  CUDACHECK_TEST(cudaMemcpy(
+      totalGroupsOut_h.data(),
+      totalGroupsOut_d,
+      totalWarps * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost));
+
+  for (uint32_t w = 0; w < totalWarps; w++) {
+    EXPECT_EQ(groupIds_h[w], w)
+        << "Warp " << w << " should have group_id == " << w;
+    EXPECT_EQ(totalGroupsOut_h[w], totalWarps)
+        << "Warp " << w << " should have total_groups == " << totalWarps;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ToWarpGroupConfigs,
+    ThreadGroupToWarpGroupTest,
+    ::testing::Values(
+        ToWarpGroupTestParams{
+            .numBlocks = 4,
+            .blockSize = 256,
+            .scope = SyncScope::WARP,
+            .testName = "Warp_Idempotent"},
+        ToWarpGroupTestParams{
+            .numBlocks = 4,
+            .blockSize = 256,
+            .scope = SyncScope::BLOCK,
+            .testName = "Block_256threads"},
+        ToWarpGroupTestParams{
+            .numBlocks = 8,
+            .blockSize = 128,
+            .scope = SyncScope::BLOCK,
+            .testName = "Block_128threads"},
+        ToWarpGroupTestParams{
+            .numBlocks = 4,
+            .blockSize = 32,
+            .scope = SyncScope::BLOCK,
+            .testName = "Block_32threads"},
+        ToWarpGroupTestParams{
+            .numBlocks = 4,
+            .blockSize = 256,
+            .scope = SyncScope::MULTIWARP,
+            .testName = "Multiwarp_256threads"},
+        ToWarpGroupTestParams{
+            .numBlocks = 2,
+            .blockSize = 512,
+            .scope = SyncScope::BLOCK,
+            .testName = "Block_512threads"},
+        ToWarpGroupTestParams{
+            .numBlocks = 2,
+            .blockSize = 512,
+            .scope = SyncScope::MULTIWARP,
+            .testName = "Multiwarp_512threads"}),
+    [](const ::testing::TestParamInfo<ToWarpGroupTestParams>& info) {
+      return info.param.testName;
+    });
+
+// =============================================================================
+// partition() then to_warp_group() Tests
+// =============================================================================
+
+TEST_F(ThreadGroupTestFixture, PartitionThenToWarpGroup) {
+  const int numBlocks = 4;
+  const int blockSize = 256;
+  const uint32_t warps_per_block = blockSize / comms::device::kWarpSize;
+  const uint32_t totalWarps = numBlocks * warps_per_block;
+
+  DeviceBuffer warpGroupIdsBuffer(totalWarps * sizeof(uint32_t));
+  DeviceBuffer warpTotalGroupsBuffer(totalWarps * sizeof(uint32_t));
+  DeviceBuffer partitionIdsBuffer(totalWarps * sizeof(uint32_t));
+  DeviceBuffer errorCountBuffer(sizeof(uint32_t));
+
+  auto warpGroupIds_d = static_cast<uint32_t*>(warpGroupIdsBuffer.get());
+  auto warpTotalGroups_d = static_cast<uint32_t*>(warpTotalGroupsBuffer.get());
+  auto partitionIds_d = static_cast<uint32_t*>(partitionIdsBuffer.get());
+  auto errorCount_d = static_cast<uint32_t*>(errorCountBuffer.get());
+
+  // Sub-case A: numPartitions=2
+  // Partition 0 gets blocks 0,1; partition 1 gets blocks 2,3
+  // Each partition: 2 blocks * 8 warps/block = 16 warps
+  {
+    SCOPED_TRACE("sub-case A: numPartitions=2");
+
+    CUDACHECK_TEST(
+        cudaMemset(warpGroupIds_d, 0xFF, totalWarps * sizeof(uint32_t)));
+    CUDACHECK_TEST(
+        cudaMemset(warpTotalGroups_d, 0xFF, totalWarps * sizeof(uint32_t)));
+    CUDACHECK_TEST(
+        cudaMemset(partitionIds_d, 0xFF, totalWarps * sizeof(uint32_t)));
+    CUDACHECK_TEST(cudaMemset(errorCount_d, 0, sizeof(uint32_t)));
+
+    const uint32_t numPartitions = 2;
+    test::testPartitionThenToWarpGroup(
+        warpGroupIds_d,
+        warpTotalGroups_d,
+        partitionIds_d,
+        numPartitions,
+        errorCount_d,
+        numBlocks,
+        blockSize);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+
+    uint32_t errorCount_h = 0;
+    CUDACHECK_TEST(cudaMemcpy(
+        &errorCount_h, errorCount_d, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(errorCount_h, 0)
+        << "partition then to_warp_group should not produce errors";
+
+    std::vector<uint32_t> warpGroupIds_h(totalWarps);
+    std::vector<uint32_t> warpTotalGroups_h(totalWarps);
+    std::vector<uint32_t> partitionIds_h(totalWarps);
+
+    CUDACHECK_TEST(cudaMemcpy(
+        warpGroupIds_h.data(),
+        warpGroupIds_d,
+        totalWarps * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    CUDACHECK_TEST(cudaMemcpy(
+        warpTotalGroups_h.data(),
+        warpTotalGroups_d,
+        totalWarps * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    CUDACHECK_TEST(cudaMemcpy(
+        partitionIds_h.data(),
+        partitionIds_d,
+        totalWarps * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+
+    // With 4 blocks and 2 partitions (even split):
+    // Partition 0 gets blocks 0,1 (warps 0-15), partition 1 gets blocks 2,3
+    // (warps 16-31)
+    // Each partition has 2 blocks * 8 warps/block = 16 warps
+    const uint32_t blocks_per_partition = numBlocks / numPartitions;
+    const uint32_t warps_per_partition = blocks_per_partition * warps_per_block;
+
+    for (uint32_t gw = 0; gw < totalWarps; gw++) {
+      uint32_t block_id = gw / warps_per_block;
+      uint32_t expected_pid = block_id / blocks_per_partition;
+
+      EXPECT_EQ(partitionIds_h[gw], expected_pid)
+          << "Global warp " << gw << " should be in partition " << expected_pid;
+      EXPECT_EQ(warpTotalGroups_h[gw], warps_per_partition)
+          << "Global warp " << gw
+          << " should have total_groups == " << warps_per_partition;
+      EXPECT_LT(warpGroupIds_h[gw], warps_per_partition)
+          << "Global warp " << gw << " should have group_id in [0, "
+          << warps_per_partition << ")";
+    }
+  }
+
+  // Sub-case B: numPartitions=4
+  // 1 block per partition = 8 warps per partition
+  {
+    SCOPED_TRACE("sub-case B: numPartitions=4");
+
+    CUDACHECK_TEST(
+        cudaMemset(warpGroupIds_d, 0xFF, totalWarps * sizeof(uint32_t)));
+    CUDACHECK_TEST(
+        cudaMemset(warpTotalGroups_d, 0xFF, totalWarps * sizeof(uint32_t)));
+    CUDACHECK_TEST(
+        cudaMemset(partitionIds_d, 0xFF, totalWarps * sizeof(uint32_t)));
+    CUDACHECK_TEST(cudaMemset(errorCount_d, 0, sizeof(uint32_t)));
+
+    const uint32_t numPartitions = 4;
+    test::testPartitionThenToWarpGroup(
+        warpGroupIds_d,
+        warpTotalGroups_d,
+        partitionIds_d,
+        numPartitions,
+        errorCount_d,
+        numBlocks,
+        blockSize);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+
+    uint32_t errorCount_h = 0;
+    CUDACHECK_TEST(cudaMemcpy(
+        &errorCount_h, errorCount_d, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(errorCount_h, 0)
+        << "partition then to_warp_group should not produce errors";
+
+    std::vector<uint32_t> warpGroupIds_h(totalWarps);
+    std::vector<uint32_t> warpTotalGroups_h(totalWarps);
+    std::vector<uint32_t> partitionIds_h(totalWarps);
+
+    CUDACHECK_TEST(cudaMemcpy(
+        warpGroupIds_h.data(),
+        warpGroupIds_d,
+        totalWarps * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    CUDACHECK_TEST(cudaMemcpy(
+        warpTotalGroups_h.data(),
+        warpTotalGroups_d,
+        totalWarps * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+    CUDACHECK_TEST(cudaMemcpy(
+        partitionIds_h.data(),
+        partitionIds_d,
+        totalWarps * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost));
+
+    // With 4 blocks and 4 partitions:
+    // 1 block per partition = 8 warps per partition
+    const uint32_t warps_per_partition = warps_per_block; // 8
+
+    for (uint32_t gw = 0; gw < totalWarps; gw++) {
+      uint32_t block_id = gw / warps_per_block;
+      uint32_t expected_pid = block_id;
+
+      EXPECT_EQ(partitionIds_h[gw], expected_pid)
+          << "Global warp " << gw << " should be in partition " << expected_pid;
+      EXPECT_EQ(warpTotalGroups_h[gw], warps_per_partition)
+          << "Global warp " << gw
+          << " should have total_groups == " << warps_per_partition;
+      EXPECT_LT(warpGroupIds_h[gw], warps_per_partition)
+          << "Global warp " << gw << " should have group_id in [0, "
+          << warps_per_partition << ")";
+    }
+  }
+}
 
 } // namespace comms::pipes
 

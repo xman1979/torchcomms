@@ -74,7 +74,7 @@ class P2pSignalBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
   // Helper function to run P2P signal benchmark - returns latency
   // in microseconds
   float runSignalBenchmark(
-      comms::pipes::P2pNvlTransportDevice& p2p,
+      comms::pipes::P2pNvlTransportDevice* p2p,
       const BenchmarkConfig& config,
       int nSteps = 1000) {
     XLOGF(DBG1, "=== Running Signal benchmark: {} ===", config.name);
@@ -193,7 +193,7 @@ TEST_F(P2pSignalBenchmarkFixture, SignalBenchmark) {
         .dataBufferSize = 1,
         .chunkSize = 1,
         .pipelineDepth = 1,
-        .signalCount = signalCount,
+        .p2pSignalCount = signalCount,
     };
 
     comms::pipes::MultiPeerNvlTransport transport(
@@ -201,7 +201,7 @@ TEST_F(P2pSignalBenchmarkFixture, SignalBenchmark) {
     transport.exchange();
 
     auto p2p = transport.getP2pTransportDevice(peerRank);
-    runSignalBenchmark(p2p, warmupConfig, nSteps); // Discard result
+    runSignalBenchmark(&p2p, warmupConfig, nSteps); // Discard result
   }
 
   std::vector<BenchmarkResult> results;
@@ -219,7 +219,7 @@ TEST_F(P2pSignalBenchmarkFixture, SignalBenchmark) {
         .dataBufferSize = 1,
         .chunkSize = 1,
         .pipelineDepth = 1,
-        .signalCount = signalCount,
+        .p2pSignalCount = signalCount,
     };
 
     comms::pipes::MultiPeerNvlTransport transport(
@@ -230,7 +230,7 @@ TEST_F(P2pSignalBenchmarkFixture, SignalBenchmark) {
 
     BenchmarkResult result;
     result.testName = config.name;
-    result.p2pTime = runSignalBenchmark(p2p, config, nSteps);
+    result.p2pTime = runSignalBenchmark(&p2p, config, nSteps);
     results.push_back(result);
   }
 

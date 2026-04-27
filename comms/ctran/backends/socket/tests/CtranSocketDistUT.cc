@@ -6,7 +6,6 @@
 #include <folly/ScopeGuard.h>
 #include <folly/init/Init.h>
 
-#include "comms/ctran/backends/CtranCtrl.h"
 #include "comms/ctran/backends/socket/CtranSocket.h"
 #include "comms/ctran/tests/CtranDistTestUtils.h"
 #include "comms/ctran/tests/CtranTestUtils.h"
@@ -28,7 +27,6 @@ class CtranSocketTest : public ctran::CtranDistTestFixture {
     ctran::CtranDistTestFixture::SetUp();
     comm_ = makeCtranComm();
     comm = comm_.get();
-    ctrlMgr = std::make_unique<CtranCtrlManager>();
   }
 
   void printTestDesc(const std::string& testName, const std::string& testDesc) {
@@ -41,7 +39,6 @@ class CtranSocketTest : public ctran::CtranDistTestFixture {
  protected:
   std::unique_ptr<CtranComm> comm_{nullptr};
   CtranComm* comm{nullptr};
-  std::unique_ptr<CtranCtrlManager> ctrlMgr{nullptr};
 };
 
 TEST_F(CtranSocketTest, NormalInitialize) {
@@ -49,7 +46,7 @@ TEST_F(CtranSocketTest, NormalInitialize) {
       "NormalInitialize",
       "Expect CtranSocket to be initialized without internal error.");
 
-  auto ctranSock = std::make_unique<CtranSocket>(comm, ctrlMgr.get());
+  auto ctranSock = std::make_unique<CtranSocket>(comm);
   EXPECT_NE(ctranSock, nullptr);
 }
 
@@ -79,7 +76,7 @@ TEST_F(CtranSocketTest, InitializeWithoutComm) {
   SocketServerAddr serverAddr{.port = port, .ipv6 = maybeAddr->str()};
 
   auto ctranSock = std::make_unique<CtranSocket>(
-      rank, cudaDev, commHash, commDesc, ctrlMgr.get(), serverAddr);
+      rank, cudaDev, commHash, commDesc, serverAddr);
   EXPECT_NE(ctranSock, nullptr);
 
   // test send/recv control message
@@ -103,9 +100,9 @@ TEST_F(CtranSocketTest, InitializeWithoutComm) {
   ControlMsg rmsg(ControlMsgType::IB_EXPORT_MEM);
   CtranSocketRequest req;
 
-  smsg.ibExp.remoteAddr = 99;
-  smsg.ibExp.rkeys[0] = 1;
-  smsg.ibExp.nKeys = 1;
+  smsg.ibDesc.remoteAddr = 99;
+  smsg.ibDesc.rkeys[0] = 1;
+  smsg.ibDesc.nKeys = 1;
   SocketServerAddr remoteAddr;
   if (globalRank == 0) {
     remoteAddr.port = serverAddrs[1].port;
@@ -122,65 +119,17 @@ TEST_F(CtranSocketTest, InitializeWithoutComm) {
   waitSocketReq(req, ctranSock);
 
   if (globalRank == 1) {
-    EXPECT_EQ(rmsg.ibExp.rkeys[0], smsg.ibExp.rkeys[0]);
-    EXPECT_EQ(rmsg.ibExp.remoteAddr, smsg.ibExp.remoteAddr);
+    EXPECT_EQ(rmsg.ibDesc.rkeys[0], smsg.ibDesc.rkeys[0]);
+    EXPECT_EQ(rmsg.ibDesc.remoteAddr, smsg.ibDesc.remoteAddr);
   }
 }
 
-namespace {
-constexpr int testRkey = 9;
-constexpr uint64_t testRemoteAddr = 100;
-bool testCbFlag = false;
-commResult_t testCtrlMsgCb(int peer, void* msgPtr, void* ctx) {
-  bool* testCbFlagPtr = reinterpret_cast<bool*>(ctx);
-  *testCbFlagPtr = true;
-  EXPECT_EQ(peer, 0);
-  auto msg = reinterpret_cast<ControlMsg*>(msgPtr);
-  EXPECT_EQ(msg->type, ControlMsgType::IB_EXPORT_MEM);
-  EXPECT_EQ(msg->ibExp.rkeys[0], testRkey);
-  EXPECT_EQ(msg->ibExp.remoteAddr, testRemoteAddr);
-  return commSuccess;
-}
-} // namespace
-
-TEST_F(CtranSocketTest, CbCtrlMsg) {
-  this->printTestDesc(
-      "CbCtrlMsg",
-      "Expect rank 0 can issue a send control msg that triggers corresponding callback on rank 1");
-
-  // Register callback
-  this->ctrlMgr->regCb(
-      ControlMsgType::IB_EXPORT_MEM, testCtrlMsgCb, &testCbFlag);
-
-  auto ctranSock =
-      std::make_unique<CtranSocket>(this->comm, this->ctrlMgr.get());
-  CtranSocketRequest req;
-  ControlMsg smsg(ControlMsgType::IB_EXPORT_MEM);
-
-  smsg.ibExp.remoteAddr = testRemoteAddr;
-  smsg.ibExp.rkeys[0] = testRkey;
-  smsg.ibExp.nKeys = 1;
-  if (this->globalRank == 0) {
-    COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsg, 1, req));
-
-    // Wait until send finishes
-    waitSocketReq(req, ctranSock);
-  } else if (this->globalRank == 1) {
-    // Wait until callback is triggered
-    do {
-      COMMCHECK_TEST(ctranSock->progress());
-    } while (!testCbFlag);
-  } else {
-    // no-op for non-communicating ranks
-    COMMCHECK_TEST(req.complete());
-  }
-}
 TEST_F(CtranSocketTest, CtrlMsg) {
   printTestDesc(
       "SendRecvCtrlMsg",
       "Expect rank 2 can issue multiple send control msgs to ranks 0 and 1, and match to the corresponding recvs");
 
-  auto ctranSock = std::make_unique<CtranSocket>(comm, ctrlMgr.get());
+  auto ctranSock = std::make_unique<CtranSocket>(comm);
   std::vector<CtranSocketRequest> reqs;
   std::vector<ControlMsg> smsgs;
   ControlMsg rmsg0(ControlMsgType::IB_EXPORT_MEM);
@@ -199,9 +148,9 @@ TEST_F(CtranSocketTest, CtrlMsg) {
     reqs.resize(3, CtranSocketRequest());
     smsgs.resize(3, ControlMsg(ControlMsgType::IB_EXPORT_MEM));
     // send two msgs to rank 1
-    smsgs[0].ibExp.remoteAddr = 99;
-    smsgs[0].ibExp.rkeys[0] = recvRank0;
-    smsgs[0].ibExp.nKeys = 1;
+    smsgs[0].ibDesc.remoteAddr = 99;
+    smsgs[0].ibDesc.rkeys[0] = recvRank0;
+    smsgs[0].ibDesc.nKeys = 1;
     COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsgs[0], recvRank0, reqs[0]));
 
     // let recvRank0 connected via ListenThread first; thus the next
@@ -209,16 +158,16 @@ TEST_F(CtranSocketTest, CtrlMsg) {
     // in order
     sleep(2);
 
-    smsgs[1].ibExp.remoteAddr = 100;
-    smsgs[1].ibExp.rkeys[0] = recvRank0;
-    smsgs[1].ibExp.nKeys = 1;
+    smsgs[1].ibDesc.remoteAddr = 100;
+    smsgs[1].ibDesc.rkeys[0] = recvRank0;
+    smsgs[1].ibDesc.nKeys = 1;
 
     COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsgs[1], recvRank0, reqs[1]));
 
     // send one msg to rank 2
-    smsgs[2].ibExp.remoteAddr = 101;
-    smsgs[2].ibExp.rkeys[0] = recvRank1;
-    smsgs[2].ibExp.nKeys = 1;
+    smsgs[2].ibDesc.remoteAddr = 101;
+    smsgs[2].ibDesc.rkeys[0] = recvRank1;
+    smsgs[2].ibDesc.nKeys = 1;
     COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsgs[2], recvRank1, reqs[2]));
   } else if (globalRank == recvRank0) {
     reqs.resize(2, CtranSocketRequest());
@@ -238,13 +187,13 @@ TEST_F(CtranSocketTest, CtrlMsg) {
   }
 
   if (globalRank == recvRank0) {
-    EXPECT_EQ(rmsg0.ibExp.rkeys[0], recvRank0);
-    EXPECT_EQ(rmsg0.ibExp.remoteAddr, 99);
-    EXPECT_EQ(rmsg1.ibExp.rkeys[0], recvRank0);
-    EXPECT_EQ(rmsg1.ibExp.remoteAddr, 100);
+    EXPECT_EQ(rmsg0.ibDesc.rkeys[0], recvRank0);
+    EXPECT_EQ(rmsg0.ibDesc.remoteAddr, 99);
+    EXPECT_EQ(rmsg1.ibDesc.rkeys[0], recvRank0);
+    EXPECT_EQ(rmsg1.ibDesc.remoteAddr, 100);
   } else if (globalRank == recvRank1) {
-    EXPECT_EQ(rmsg0.ibExp.rkeys[0], recvRank1);
-    EXPECT_EQ(rmsg0.ibExp.remoteAddr, 101);
+    EXPECT_EQ(rmsg0.ibDesc.rkeys[0], recvRank1);
+    EXPECT_EQ(rmsg0.ibDesc.remoteAddr, 101);
   }
 }
 
@@ -252,7 +201,7 @@ TEST_F(CtranSocketTest, AllGather) {
   printTestDesc(
       "AllGather",
       "Expect every rank to recv&send a control msg to all other ranks");
-  auto ctranSock = std::make_unique<CtranSocket>(comm, ctrlMgr.get());
+  auto ctranSock = std::make_unique<CtranSocket>(comm);
   std::vector<CtranSocketRequest> sreqs(numRanks);
   std::vector<CtranSocketRequest> rreqs(numRanks);
   std::vector<ControlMsg> smsgs(numRanks);
@@ -265,17 +214,17 @@ TEST_F(CtranSocketTest, AllGather) {
     auto& rreq = rreqs[i];
     auto& rmsg = rmsgs[i];
     rmsg.setType(ControlMsgType::IB_EXPORT_MEM);
-    rmsg.ibExp.remoteAddr = 0;
-    rmsg.ibExp.rkeys[0] = 0;
-    rmsg.ibExp.nKeys = 1;
+    rmsg.ibDesc.remoteAddr = 0;
+    rmsg.ibDesc.rkeys[0] = 0;
+    rmsg.ibDesc.nKeys = 1;
     COMMCHECK_TEST(ctranSock->irecvCtrlMsg(rmsg, i, rreq));
     // post send request
     auto& sreq = sreqs[i];
     auto& smsg = smsgs[i];
     smsg.setType(ControlMsgType::IB_EXPORT_MEM);
-    smsg.ibExp.remoteAddr = 99;
-    smsg.ibExp.rkeys[0] = globalRank;
-    smsg.ibExp.nKeys = 1;
+    smsg.ibDesc.remoteAddr = 99;
+    smsg.ibDesc.rkeys[0] = globalRank;
+    smsg.ibDesc.nKeys = 1;
     COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsg, i, sreq));
   }
   for (int i = 0; i < numRanks; i++) {
@@ -292,8 +241,8 @@ TEST_F(CtranSocketTest, AllGather) {
       continue;
     }
     auto& rmsg = rmsgs[i];
-    EXPECT_EQ(rmsg.ibExp.rkeys[0], i);
-    EXPECT_EQ(rmsg.ibExp.remoteAddr, 99);
+    EXPECT_EQ(rmsg.ibDesc.rkeys[0], i);
+    EXPECT_EQ(rmsg.ibDesc.remoteAddr, 99);
   }
 }
 TEST_F(CtranSocketTest, MatchAnyCtrlMsg) {
@@ -301,7 +250,7 @@ TEST_F(CtranSocketTest, MatchAnyCtrlMsg) {
       "MatchAnyCtrlMsg",
       "Expect rank 0 can issue a send control msg to rank 1 and matches to the UNSPECIFIED recv on rank1");
 
-  auto ctranSock = std::make_unique<CtranSocket>(comm, ctrlMgr.get());
+  auto ctranSock = std::make_unique<CtranSocket>(comm);
   const int nCtrl = 300; // exceed MAX_CONTROL_MSGS
   std::vector<CtranSocketRequest> reqs(nCtrl);
   std::vector<ControlMsg> smsgs(nCtrl);
@@ -312,13 +261,13 @@ TEST_F(CtranSocketTest, MatchAnyCtrlMsg) {
     auto& rmsg = rmsgs[i];
     auto& req = reqs[i];
     smsg.setType(ControlMsgType::IB_EXPORT_MEM);
-    smsg.ibExp.remoteAddr = 99;
-    smsg.ibExp.rkeys[0] = i + 1;
-    smsg.ibExp.nKeys = 1;
+    smsg.ibDesc.remoteAddr = 99;
+    smsg.ibDesc.rkeys[0] = i + 1;
+    smsg.ibDesc.nKeys = 1;
     rmsg.setType(ControlMsgType::UNSPECIFIED);
-    rmsg.ibExp.remoteAddr = 0;
-    rmsg.ibExp.rkeys[0] = 0;
-    rmsg.ibExp.nKeys = 1;
+    rmsg.ibDesc.remoteAddr = 0;
+    rmsg.ibDesc.rkeys[0] = 0;
+    rmsg.ibDesc.nKeys = 1;
 
     if (globalRank == 0) {
       COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsg, 1, req));
@@ -335,8 +284,8 @@ TEST_F(CtranSocketTest, MatchAnyCtrlMsg) {
     if (globalRank == 1) {
       auto& rmsg = rmsgs[i];
       EXPECT_EQ(rmsg.type, ControlMsgType::IB_EXPORT_MEM);
-      EXPECT_EQ(rmsg.ibExp.rkeys[0], i + 1);
-      EXPECT_EQ(rmsg.ibExp.remoteAddr, 99);
+      EXPECT_EQ(rmsg.ibDesc.rkeys[0], i + 1);
+      EXPECT_EQ(rmsg.ibDesc.remoteAddr, 99);
     }
   }
 }
@@ -347,7 +296,7 @@ TEST_F(CtranSocketTest, CtrlMsgAndPreConnect) {
       "Expect rank 0 can issue a send control msg, followed by preConnect"
       "the preConnect is expected to be a no-op");
 
-  auto ctranSock = std::make_unique<CtranSocket>(comm, ctrlMgr.get());
+  auto ctranSock = std::make_unique<CtranSocket>(comm);
   CtranSocketRequest req;
   ControlMsg smsg(ControlMsgType::IB_EXPORT_MEM);
   ControlMsg rmsg(ControlMsgType::IB_EXPORT_MEM);
@@ -363,9 +312,9 @@ TEST_F(CtranSocketTest, CtrlMsgAndPreConnect) {
     COMMCHECK_TEST(ctranSock->preConnect(peerRanks));
   }
 
-  smsg.ibExp.remoteAddr = 99;
-  smsg.ibExp.rkeys[0] = 1;
-  smsg.ibExp.nKeys = 1;
+  smsg.ibDesc.remoteAddr = 99;
+  smsg.ibDesc.rkeys[0] = 1;
+  smsg.ibDesc.nKeys = 1;
   if (globalRank == sendRank) {
     COMMCHECK_TEST(ctranSock->isendCtrlMsg(smsg, recvRank, req));
   } else if (globalRank == recvRank) {
@@ -377,8 +326,8 @@ TEST_F(CtranSocketTest, CtrlMsgAndPreConnect) {
   waitSocketReq(req, ctranSock);
 
   if (globalRank == recvRank) {
-    EXPECT_EQ(rmsg.ibExp.rkeys[0], smsg.ibExp.rkeys[0]);
-    EXPECT_EQ(rmsg.ibExp.remoteAddr, smsg.ibExp.remoteAddr);
+    EXPECT_EQ(rmsg.ibDesc.rkeys[0], smsg.ibDesc.rkeys[0]);
+    EXPECT_EQ(rmsg.ibDesc.remoteAddr, smsg.ibDesc.remoteAddr);
   }
 }
 

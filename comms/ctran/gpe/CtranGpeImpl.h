@@ -20,6 +20,9 @@
 #include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/ctran/utils/ExtUtils.h"
 #include "comms/ctran/utils/PinnedHostPool.h"
+#include "comms/utils/GraphCaptureSideStream.h"
+
+struct CommLogData;
 
 struct KernelFlagItem {
   using Self = KernelFlagItem;
@@ -35,6 +38,9 @@ struct KernelFlagItem {
   }
 
   bool inUse() {
+    if (persistent_) {
+      return true;
+    }
     for (int i = 0; i < numGroups_; i++) {
       if (flag_[i] != KERNEL_UNSET) {
         return true;
@@ -65,11 +71,27 @@ struct KernelFlagItem {
     }
   }
 
+  // Prevent pool reclaim between graph replays. The kernel writes
+  // KERNEL_UNSET after each replay, but persistent keeps inUse() true.
+  void setPersistent() {
+    persistent_ = true;
+  }
+
+  // Allow pool reclaim. Called at graph destruction to release the flag.
+  void clearPersistent() {
+    persistent_ = false;
+  }
+
   volatile int flag_[CTRAN_ALGO_MAX_THREAD_BLOCKS];
   int numGroups_{1};
+  // If true, inUse() always returns true — prevents reclaim() from stealing
+  // the flag while a persistent cmd (graph capture) still owns it.
+  // Not cleared by reset() — only cleared by clearPersistent().
+  bool persistent_{false};
   // padding for different KernelFlagItems to be on different cache lines.
   static constexpr int kCacheLineSizeBytes = 128;
-  int unused[(kCacheLineSizeBytes - sizeof(int)) / sizeof(int)];
+  // -2 ints: one for numGroups_, one for persistent_ (padded to int)
+  int unused[(kCacheLineSizeBytes - 2 * sizeof(int)) / sizeof(int)];
 
   void _() {
     // Make sure KernelFlagItem satisfies the PinnedHostItem concept
@@ -78,8 +100,7 @@ struct KernelFlagItem {
     // The following compile-time check is a hint of the memory usage
     // KernelFlag uses 384 bytes of pinned memory
     static_assert(
-        sizeof(Self) ==
-        4 * CTRAN_ALGO_MAX_THREAD_BLOCKS + 4 + (kCacheLineSizeBytes - 4));
+        sizeof(Self) == 4 * CTRAN_ALGO_MAX_THREAD_BLOCKS + kCacheLineSizeBytes);
 
     // Ensure two KernelFlagItems are on different cache lines.
     //
@@ -103,7 +124,7 @@ using KernelFlagPool = PinnedHostPool<KernelFlagItem>;
 class CtranGpeCmd {
  public:
   CtranGpeCmd() = default;
-  ~CtranGpeCmd() = default;
+  ~CtranGpeCmd();
 
   enum TypeEnum {
     GRAPH_ENQUEUE,
@@ -127,11 +148,19 @@ class CtranGpeCmd {
   std::shared_ptr<std::atomic_flag> cpuFlag{nullptr};
 
   bool persistent{false};
+  // Count of queued-but-not-yet-processed instances of this cmd. Used by
+  // cmdDestroy to wait for the GPE to drain stale queue entries before
+  // deleting the cmd.
+  std::atomic_uint32_t inFlight{0};
+  CtranGpe* gpe{nullptr};
 
   std::optional<std::chrono::milliseconds> timeout{std::nullopt};
 
   // Unpack queue to teardown after kernel completes (for TcpDM backend)
   void* unpackPool{nullptr};
+
+  // Post-kernel cleanup callback. Called by GPE thread after kernel finishes.
+  std::function<void()> postKernelCleanup{nullptr};
 };
 
 /**
@@ -184,6 +213,67 @@ commResult_t allocGpeKernelSyncs(
     int nworkers,
     std::vector<ctran::algos::GpeKernelSync*>& gpeKernelSyncs);
 
+class OrderedWorkStreamGuard {
+ public:
+  ~OrderedWorkStreamGuard();
+
+  void init(const CommLogData& logMetaData);
+
+  class Scope {
+   public:
+    Scope(
+        OrderedWorkStreamGuard& guard,
+        cudaStream_t userStream,
+        const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
+    ~Scope();
+
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+    Scope(Scope&& other) noexcept;
+    Scope& operator=(Scope&& other) noexcept;
+
+    commResult_t status() const {
+      return status_;
+    }
+    cudaStream_t stream() const {
+      return userStream_;
+    }
+
+   private:
+    OrderedWorkStreamGuard* guard_;
+    cudaStream_t userStream_;
+    ctran::utils::cudagraph::StreamCaptureInfo captureInfo_;
+    commResult_t status_;
+  };
+
+  Scope acquire(
+      cudaStream_t userStream,
+      const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
+
+ private:
+  commResult_t doAcquire(
+      cudaStream_t userStream,
+      const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
+  commResult_t doRelease(
+      cudaStream_t userStream,
+      const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
+
+  cudaEvent_t execModeSyncEvent_{};
+  unsigned long long lastCaptureId_{0};
+  bool everCaptured_{false};
+  cudaStream_t lastUserStream_{nullptr};
+  cudaGraphNode_t lastRecordNode_{};
+
+  // Side stream used during capture to host the external cudaEventRecord
+  // node for execModeSyncEvent_ off the user stream's critical path, so
+  // its release fence doesn't stall compute between ctran submissions.
+  // The next doAcquire still adds lastRecordNode_ (now on the side) as
+  // an explicit capture dependency of userStream, preserving ordering.
+  std::unique_ptr<meta::comms::GraphSideStream> sideStream_;
+
+  const CommLogData* logMetaData_{nullptr};
+};
+
 class CtranGpe::Impl {
  public:
   Impl();
@@ -227,12 +317,6 @@ class CtranGpe::Impl {
     return commSuccess;
   }
 
-  // Maintain execution order between
-  // user streams before launching Ctran kernel,
-  commResult_t preKernelLaunch(cudaStream_t curStream);
-  // Ensure future work waits on just launched Ctran kernel
-  commResult_t postKernelLaunch(cudaStream_t curStream);
-
   CtranComm* comm{nullptr};
 
   std::unique_ptr<KernelElemPool> kernelElemPool;
@@ -250,14 +334,7 @@ class CtranGpe::Impl {
   folly::Synchronized<CmdQueue, std::mutex> cmdQueue_;
   std::condition_variable cmdQueueCv_;
   std::thread thread_;
-  // Internal event and stream used to manage execution order of Ctran kernels
-  // if multiple streams are used to submit ops
-  cudaEvent_t execEvent_;
-  cudaStream_t execOrderStream_;
-  // record the most recent user stream to allow a fast path bypass stream
-  // ordering
-  cudaStream_t lastUserStream_;
-
+  OrderedWorkStreamGuard ws_;
   // Main function called by the GPE thread. It waits and handles any  commands
   // submitted to cmdQueue until the TERMINATE command is received.
   void gpeThreadFn();

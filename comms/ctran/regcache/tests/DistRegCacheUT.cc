@@ -4,7 +4,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <cstdlib>
-#include <iostream>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -13,30 +12,26 @@
 #include "comms/ctran/regcache/IpcRegCache.h"
 #include "comms/ctran/regcache/IpcRegCacheBase.h"
 #include "comms/ctran/regcache/RegCache.h"
+#include "comms/ctran/tests/CtranDistTestUtils.h"
 #include "comms/ctran/tests/CtranNcclTestUtils.h"
-#include "comms/ctran/utils/Debug.h"
 #include "comms/testinfra/TestUtils.h"
-#include "comms/testinfra/TestsDistUtils.h"
-#include "nccl.h"
 
-class DistRegCacheTest : public NcclxBaseTest {
+class DistRegCacheTest : public ctran::CtranDistTestFixture {
  public:
-  int cudaDev{0};
   std::shared_ptr<ctran::RegCache> regCache{nullptr};
 
   void SetUp() override {
     setenv("NCCL_CTRAN_ENABLE", "1", 1);
-    setenv("NCCL_FASTINIT_MODE", "ring_hybrid", 1);
-    NcclxBaseTest::SetUp();
+    setenv("NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET", "1", 1);
+    ctran::CtranDistTestFixture::SetUp();
 
-    commDeprecated_ = createNcclComm(globalRank, numRanks, localRank);
-    comm_ = commDeprecated_->ctranComm_.get();
-    cudaDev = comm_->statex_->cudaDev();
+    comm_ = makeCtranComm();
 
     // Turn on profiler after initialization to track only test registrations
     NCCL_CTRAN_REGISTER_REPORT_SNAPSHOT_COUNT = 0;
 
-    if (!ctranInitialized(comm_) || !comm_->ctran_->mapper->hasBackend()) {
+    if (!ctranInitialized(comm_.get()) ||
+        !comm_->ctran_->mapper->hasBackend()) {
       GTEST_SKIP()
           << "Ctran is not initialized or backend is not available.  Skip test.";
     }
@@ -49,8 +44,7 @@ class DistRegCacheTest : public NcclxBaseTest {
     // Turn off profiler to avoid internal in comm destroy.
     NCCL_CTRAN_REGISTER_REPORT_SNAPSHOT_COUNT = -1;
 
-    NCCLCHECK_TEST(ncclCommDestroy(commDeprecated_));
-    NcclxBaseTest::TearDown();
+    ctran::CtranDistTestFixture::TearDown();
   }
 
   commResult_t
@@ -86,41 +80,13 @@ class DistRegCacheTest : public NcclxBaseTest {
   void allGatherSocketAddress(
       const folly::SocketAddress& msg,
       std::vector<folly::SocketAddress>& remoteMsgs) {
-    auto statex = comm_->statex_.get();
-    int nRanks = statex->nRanks();
-
-    const size_t msgSize = sizeof(folly::SocketAddress);
-    void* sendBuf = nullptr;
-    void* recvBuf = nullptr;
-    CUDACHECK_TEST(cudaMalloc(&sendBuf, msgSize));
-    CUDACHECK_TEST(cudaMalloc(&recvBuf, msgSize * nRanks));
-
-    // Create a CUDA stream for all operations
-    cudaStream_t stream;
-    CUDACHECK_TEST(cudaStreamCreate(&stream));
-    CUDACHECK_TEST(cudaMemcpyAsync(
-        sendBuf, &msg, msgSize, cudaMemcpyHostToDevice, stream));
-    // Perform ncclAllGather to get ControlMsg
-    NCCLCHECK_TEST(ncclAllGather(
-        sendBuf, recvBuf, msgSize, ncclInt8, commDeprecated_, stream));
-    remoteMsgs.resize(nRanks);
-    CUDACHECK_TEST(cudaMemcpyAsync(
-        remoteMsgs.data(),
-        recvBuf,
-        msgSize * nRanks,
-        cudaMemcpyDeviceToHost,
-        stream));
-    CUDACHECK_TEST(cudaStreamSynchronize(stream));
-
-    // Clean up
-    CUDACHECK_TEST(cudaFree(sendBuf));
-    CUDACHECK_TEST(cudaFree(recvBuf));
-    CUDACHECK_TEST(cudaStreamDestroy(stream));
+    remoteMsgs.resize(numRanks);
+    remoteMsgs[globalRank] = msg;
+    oobAllGather(remoteMsgs);
   }
 
  protected:
-  ncclComm_t commDeprecated_{nullptr};
-  CtranComm* comm_{nullptr};
+  std::unique_ptr<CtranComm> comm_{nullptr};
 };
 
 class DistRegCacheTestSuite
@@ -194,7 +160,7 @@ TEST_P(DistRegCacheTestSuite, ExportImportMem) {
 
   std::unique_ptr<CtranIb> ctranIb;
   try {
-    ctranIb = std::make_unique<CtranIb>(comm_, nullptr);
+    ctranIb = std::make_unique<CtranIb>(comm_.get(), nullptr);
   } catch (const std::bad_alloc&) {
     GTEST_SKIP() << "IB backend failed to allocate. Skip test";
   }
@@ -228,15 +194,17 @@ TEST_P(DistRegCacheTestSuite, ExportImportMem) {
     ASSERT_NE(regHdl, nullptr);
 
     ControlMsg msg(ControlMsgType::NVL_EXPORT_MEM);
-    COMMCHECK_TEST(
-        ipcRegCache->exportMem(data, regHdl->ipcRegElem, msg.ipcDesc));
+    std::vector<ctran::utils::CtranIpcSegDesc> extraSegments;
+    COMMCHECK_TEST(ipcRegCache->exportMem(
+        data, regHdl->ipcRegElem, msg.ipcDesc, extraSegments));
     ctran::regcache::IpcRegElem* ipcRegElem =
         reinterpret_cast<ctran::regcache::IpcRegElem*>(regHdl->ipcRegElem);
     auto ipcMem = ipcRegElem->ipcMem.rlock();
 
     EXPECT_EQ(msg.type, ControlMsgType::NVL_EXPORT_MEM);
     EXPECT_EQ(msg.ipcDesc.desc.range, ipcMem->getRange());
-    EXPECT_EQ(msg.ipcDesc.desc.numSegments, 1);
+    EXPECT_EQ(msg.ipcDesc.desc.numInlineSegments(), 1);
+    EXPECT_EQ(msg.ipcDesc.desc.totalSegments, 1);
     EXPECT_NE(msg.ipcDesc.desc.segments[0].sharedHandle.fd, 0);
     EXPECT_GT(msg.ipcDesc.desc.segments[0].range, 0);
     EXPECT_EQ(msg.ipcDesc.desc.pid, getpid());
@@ -326,12 +294,19 @@ TEST_F(DistRegCacheTest, ExportReleaseMemCb) {
     std::vector<ctran::regcache::IpcReqCb> exportReqs(numRanks - 1);
     for (int peer = 1; peer < numRanks; peer++) {
       struct ctran::regcache::IpcDesc IpcDesc;
-      COMMCHECK_TEST(ipcRegCache->exportMem(data, ipcRegElem, IpcDesc));
+      std::vector<ctran::utils::CtranIpcSegDesc> extraSegments;
+      COMMCHECK_TEST(
+          ipcRegCache->exportMem(data, ipcRegElem, IpcDesc, extraSegments));
       EXPECT_EQ(IpcDesc.desc.range, ipcMemSize);
-      EXPECT_EQ(IpcDesc.desc.numSegments, 1);
+      EXPECT_EQ(IpcDesc.desc.numInlineSegments(), 1);
+      EXPECT_EQ(IpcDesc.desc.totalSegments, 1);
       EXPECT_GT(IpcDesc.desc.segments[0].range, 0);
-      ipcRegCache->notifyRemoteIpcExport(
-          myId, peerServerAddrs[peer], IpcDesc, &exportReqs[peer - 1]);
+      COMMCHECK_TEST(ipcRegCache->notifyRemoteIpcExport(
+          myId,
+          peerServerAddrs[peer],
+          IpcDesc,
+          extraSegments,
+          &exportReqs[peer - 1]));
     }
     mapper->barrier();
     for (auto it = exportReqs.begin(); it != exportReqs.end(); it++) {
@@ -340,8 +315,8 @@ TEST_F(DistRegCacheTest, ExportReleaseMemCb) {
     // Send release message to all other ranks
     std::vector<ctran::regcache::IpcReqCb> releaseReqs(numRanks - 1);
     for (int peer = 1; peer < numRanks; peer++) {
-      ipcRegCache->notifyRemoteIpcRelease(
-          myId, peerServerAddrs[peer], ipcRegElem, &releaseReqs[peer - 1]);
+      COMMCHECK_TEST(ipcRegCache->notifyRemoteIpcRelease(
+          myId, peerServerAddrs[peer], ipcRegElem, &releaseReqs[peer - 1]));
     }
     mapper->barrier();
     for (auto it = releaseReqs.begin(); it != releaseReqs.end(); it++) {
@@ -390,22 +365,25 @@ TEST_F(DistRegCacheTest, ExportMultiMem) {
 
     // register and export the same GPU buffer twice
     std::vector<ctran::regcache::IpcReqCb> reqs(2);
+    std::vector<ctran::utils::CtranIpcSegDesc> extraSegments;
     COMMCHECK_TEST(
         mapper->regMem(data, dataRange, &segHdl, true, true, (void**)&regHdl));
     ctran::regcache::IpcRegElem* ipcRegElem1 =
         reinterpret_cast<ctran::regcache::IpcRegElem*>(regHdl->ipcRegElem);
-    COMMCHECK_TEST(ipcRegCache->exportMem(data, ipcRegElem1, IpcDesc));
-    ipcRegCache->notifyRemoteIpcExport(
-        myId, peerServerAddrs[peer], IpcDesc, &reqs[0]);
+    COMMCHECK_TEST(
+        ipcRegCache->exportMem(data, ipcRegElem1, IpcDesc, extraSegments));
+    COMMCHECK_TEST(ipcRegCache->notifyRemoteIpcExport(
+        myId, peerServerAddrs[peer], IpcDesc, extraSegments, &reqs[0]));
     COMMCHECK_TEST(mapper->deregMem(segHdl, true));
     // second register and export
     COMMCHECK_TEST(
         mapper->regMem(data, dataRange, &segHdl, true, true, (void**)&regHdl));
     ctran::regcache::IpcRegElem* ipcRegElem2 =
         reinterpret_cast<ctran::regcache::IpcRegElem*>(regHdl->ipcRegElem);
-    COMMCHECK_TEST(ipcRegCache->exportMem(data, ipcRegElem2, IpcDesc));
-    ipcRegCache->notifyRemoteIpcExport(
-        myId, peerServerAddrs[peer], IpcDesc, &reqs[1]);
+    COMMCHECK_TEST(
+        ipcRegCache->exportMem(data, ipcRegElem2, IpcDesc, extraSegments));
+    COMMCHECK_TEST(ipcRegCache->notifyRemoteIpcExport(
+        myId, peerServerAddrs[peer], IpcDesc, extraSegments, &reqs[1]));
     for (auto it = reqs.begin(); it != reqs.end(); it++) {
       while (it->completed.load() == false) {
       }
@@ -427,6 +405,104 @@ TEST_F(DistRegCacheTest, ExportMultiMem) {
   }
 }
 
+TEST_F(DistRegCacheTest, ExportMultiSegmentMem) {
+  // E2E test: rank 0 allocates disjoint memory with more segments than
+  // CTRAN_IPC_INLINE_SEGMENTS, registers via globalRegister (mapper->regMem
+  // doesn't support multi-segment), exports via notifyRemoteIpcExport(), and
+  // rank 1 verifies the imported registration matches what rank 0 sent.
+  auto& mapper = comm_->ctran_->mapper;
+  ASSERT_NE(mapper, nullptr);
+
+  constexpr size_t numSegments = CTRAN_IPC_INLINE_SEGMENTS + 1;
+  const size_t segSize = 1UL << 21;
+  const size_t bufSize = segSize * numSegments;
+
+  auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  ASSERT_NE(ipcRegCache, nullptr);
+  folly::SocketAddress localServerAddr = ipcRegCache->getServerAddr();
+  std::vector<folly::SocketAddress> peerServerAddrs;
+  allGatherSocketAddress(localServerAddr, peerServerAddrs);
+
+  if (globalRank == 0) {
+    auto myId = comm_->statex_->gPid();
+    const int peer = 1;
+
+    std::vector<TestMemSegment> segments;
+    void* data = ctran::CtranNcclTestHelpers::prepareBuf(
+        bufSize, kCuMemAllocDisjoint, segments, numSegments);
+    ASSERT_NE(data, nullptr);
+
+    // Use globalRegister which supports multi-segment buffers
+    COMMCHECK_TEST(regCache->globalRegister(data, bufSize, true));
+
+    // Retrieve the RegElem to access ipcRegElem for export
+    std::vector<void*> segHdls;
+    std::vector<ctran::regcache::RegElem*> regElems;
+    COMMCHECK_TEST(regCache->lookupSegmentsForBuffer(
+        data, bufSize, localRank, segHdls, regElems));
+    ASSERT_FALSE(regElems.empty());
+    auto* regHdl = regElems[0];
+    ASSERT_NE(regHdl, nullptr);
+    ASSERT_NE(regHdl->ipcRegElem, nullptr);
+
+    // Export memory — should produce extraSegments
+    ctran::regcache::IpcDesc ipcDesc;
+    std::vector<ctran::utils::CtranIpcSegDesc> extraSegments;
+    COMMCHECK_TEST(ipcRegCache->exportMem(
+        data, regHdl->ipcRegElem, ipcDesc, extraSegments));
+
+    // Verify export produced the expected segment layout
+    ctran::regcache::IpcRegElem* ipcRegElem =
+        reinterpret_cast<ctran::regcache::IpcRegElem*>(regHdl->ipcRegElem);
+    auto ipcMem = ipcRegElem->ipcMem.rlock();
+    EXPECT_EQ(ipcDesc.desc.range, ipcMem->getRange());
+    EXPECT_EQ(ipcDesc.desc.totalSegments, static_cast<int>(numSegments));
+    EXPECT_EQ(ipcDesc.desc.numInlineSegments(), CTRAN_IPC_INLINE_SEGMENTS);
+    ASSERT_EQ(extraSegments.size(), numSegments - CTRAN_IPC_INLINE_SEGMENTS);
+    for (int i = 0; i < CTRAN_IPC_INLINE_SEGMENTS; i++) {
+      EXPECT_NE(ipcDesc.desc.segments[i].sharedHandle.fd, 0);
+      EXPECT_GT(ipcDesc.desc.segments[i].range, 0);
+    }
+    for (size_t i = 0; i < extraSegments.size(); i++) {
+      EXPECT_NE(extraSegments[i].sharedHandle.fd, 0);
+      EXPECT_GT(extraSegments[i].range, 0);
+    }
+
+    // Send via notifyRemoteIpcExport (async socket path)
+    ctran::regcache::IpcReqCb exportReqCb;
+    COMMCHECK_TEST(ipcRegCache->notifyRemoteIpcExport(
+        myId, peerServerAddrs[peer], ipcDesc, extraSegments, &exportReqCb));
+
+    while (!exportReqCb.completed.load()) {
+    }
+
+    oobBarrier();
+
+    // Cleanup
+    COMMCHECK_TEST(regCache->globalDeregister(data, bufSize));
+    ctran::CtranNcclTestHelpers::releaseBuf(
+        data, bufSize, kCuMemAllocDisjoint, numSegments);
+
+  } else if (globalRank == 1) {
+    const int peer = 0;
+    auto peerId = comm_->statex_->gPid(peer);
+
+    // Wait for the async socket import to complete
+    while (ipcRegCache->getNumRemReg(peerId) == 0) {
+      std::this_thread::yield();
+    }
+    EXPECT_EQ(ipcRegCache->getNumRemReg(peerId), 1);
+
+    oobBarrier();
+    // Cleanup remote registrations
+    ipcRegCache->clearAllRemReg();
+    EXPECT_EQ(ipcRegCache->getNumRemReg(peerId), 0);
+
+  } else {
+    oobBarrier();
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     DistRegCacheInstance,
     DistRegCacheTestSuite,
@@ -438,7 +514,7 @@ INSTANTIATE_TEST_SUITE_P(
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
-  ::testing::AddGlobalTestEnvironment(new DistEnvironmentBase);
+  ::testing::AddGlobalTestEnvironment(new ctran::CtranDistEnvironment);
   folly::Init init(&argc, &argv);
   return RUN_ALL_TESTS();
 }

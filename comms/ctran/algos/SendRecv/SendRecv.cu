@@ -22,13 +22,13 @@ __global__ void __launch_bounds__(1024, 1) ncclKernelSend(
   const auto tId = threadIdx.x;
   const auto bId = blockIdx.x;
 
-  // TODO(T243528798): remove this preload of devstate by splitting h2d/d2h
-  // channels.
-  devStateLoadToShm(&flag[bId], devState);
-
   if (flag && tId == 0) {
     ctran::device::KernelStartGpe(&flag[bId]);
   }
+
+  // TODO(T243528798): remove this preload of devstate by splitting h2d/d2h
+  // channels.
+  devStateLoadToShm(&flag[bId], devState);
 
   // For now kernel always ack GPE thread once put completes for timepoint
   // tracing
@@ -52,13 +52,13 @@ __global__ void __launch_bounds__(1024, 1) ncclKernelRecv(
   const auto tId = threadIdx.x;
   const auto bId = blockIdx.x;
 
-  // TODO(T243528798): remove this preload of devstate by splitting h2d/d2h
-  // channels.
-  devStateLoadToShm(&flag[bId], devState);
-
   if (flag && tId == 0) {
     ctran::device::KernelStartGpe(&flag[bId]);
   }
+
+  // TODO(T243528798): remove this preload of devstate by splitting h2d/d2h
+  // channels.
+  devStateLoadToShm(&flag[bId], devState);
 
 #ifndef CTRAN_DISABLE_TCPDM
   if (UNPACK) {
@@ -87,13 +87,13 @@ __global__ void __launch_bounds__(1024, 1) ncclKernelSendRecv(
   const auto tId = threadIdx.x;
   const auto bId = blockIdx.x;
 
-  // TODO(T243528798): remove this preload of devstate by splitting h2d/d2h
-  // channels.
-  devStateLoadToShm(&flag[bId], devState);
-
   if (flag && tId == 0) {
     ctran::device::KernelStartGpe(&flag[bId]);
   }
+
+  // TODO(T243528798): remove this preload of devstate by splitting h2d/d2h
+  // channels.
+  devStateLoadToShm(&flag[bId], devState);
 
 #ifndef CTRAN_DISABLE_TCPDM
   if (UNPACK) {
@@ -118,80 +118,6 @@ __global__ void __launch_bounds__(1024, 1) ncclKernelSendRecv(
 
   if (flag && tId == 0) {
     ctran::device::KernelWaitGpeTerminate(&flag[bId]);
-  }
-}
-
-__global__ void __launch_bounds__(1024, 1) ncclKernelSendRecvNotifyOnly(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernelSendRecvArgs args) {
-  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
-
-  if (flag && gtIdx == 0) {
-    ctran::device::devLoadAbortFlags(flag, devState);
-    ctran::device::KernelStartGpe(flag);
-  }
-
-  devStateLoadToShm(devState);
-
-  if (args.putNotifyList != nullptr) {
-    ctranKernMultiNotifyOnly<false /* Complete */, true /* Free */>(
-        args.putNotifyList);
-  }
-
-  if (args.waitNotifyList != nullptr) {
-    ctranKernMultiWaitNotifyOnly<false /* Complete */, true /* Free */>(
-        args.waitNotifyList);
-  }
-
-  if (flag && gtIdx == 0) {
-    ctran::device::KernelWaitGpeTerminate(flag);
-  }
-}
-
-__global__ void __launch_bounds__(1024, 1) ncclKernelSendNotifyOnly(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernelSendArgs args) {
-  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
-
-  if (flag && gtIdx == 0) {
-    ctran::device::devLoadAbortFlags(flag, devState);
-    ctran::device::KernelStartGpe(flag);
-  }
-
-  devStateLoadToShm(devState);
-
-  if (args.putNotifyList != nullptr) {
-    ctranKernMultiNotifyOnly<false /* Complete */, true /* Free */>(
-        args.putNotifyList);
-  }
-
-  if (flag && gtIdx == 0) {
-    ctran::device::KernelWaitGpeTerminate(flag);
-  }
-}
-
-__global__ void __launch_bounds__(1, 1) ncclKernelRecvNotifyOnly(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernelRecvArgs args) {
-  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
-
-  if (flag && gtIdx == 0) {
-    ctran::device::devLoadAbortFlags(flag, devState);
-    ctran::device::KernelStartGpe(flag);
-  }
-
-  devStateLoadToShm(devState);
-
-  if (args.waitNotifyList != nullptr) {
-    ctranKernMultiWaitNotifyOnly<false /* Complete */, true /* Free */>(
-        args.waitNotifyList);
-  }
-
-  if (flag && gtIdx == 0) {
-    ctran::device::KernelWaitGpeTerminate(flag);
   }
 }
 

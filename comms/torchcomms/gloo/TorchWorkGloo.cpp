@@ -4,8 +4,8 @@
 
 #include <thread>
 
-#include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/gloo/TorchCommGloo.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
 
 namespace torch::comms {
 
@@ -18,6 +18,7 @@ TorchWorkGloo::~TorchWorkGloo() {
 }
 
 void TorchWorkGloo::wait() {
+  runWaitHooks();
   return;
 }
 

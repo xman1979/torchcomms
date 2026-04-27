@@ -40,6 +40,7 @@ class CudaApi {
 
   // Device management
   [[nodiscard]] virtual cudaError_t setDevice(int device) = 0;
+  [[nodiscard]] virtual cudaError_t getDevice(int* device) = 0;
   [[nodiscard]] virtual cudaError_t getDeviceProperties(
       cudaDeviceProp* prop,
       int device) = 0;
@@ -81,6 +82,11 @@ class CudaApi {
       cudaUserObject_t object,
       unsigned int count,
       unsigned int flags) = 0;
+  [[nodiscard]] virtual cudaError_t userObjectRelease(
+      cudaUserObject_t object,
+      unsigned int count) = 0;
+  [[nodiscard]] virtual cudaError_t
+  launchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) = 0;
   [[nodiscard]] virtual cudaError_t streamGetCaptureInfo_v2(
       cudaStream_t stream,
       cudaStreamCaptureStatus* captureStatus_out,
@@ -90,6 +96,10 @@ class CudaApi {
       size_t* numDependencies_out) = 0;
   [[nodiscard]] virtual cudaError_t threadExchangeStreamCaptureMode(
       enum cudaStreamCaptureMode* mode) = 0;
+
+  [[nodiscard]] virtual cudaError_t
+  hostAlloc(void** pHost, size_t size, unsigned int flags) = 0;
+  [[nodiscard]] virtual cudaError_t hostFree(void* ptr) = 0;
 
   // Memory management
   [[nodiscard]] virtual cudaError_t malloc(void** devPtr, size_t size) = 0;
@@ -112,6 +122,10 @@ class CudaApi {
   [[nodiscard]] virtual cudaError_t eventRecord(
       cudaEvent_t event,
       cudaStream_t stream) = 0;
+  [[nodiscard]] virtual cudaError_t eventRecordWithFlags(
+      cudaEvent_t event,
+      cudaStream_t stream,
+      unsigned int flags) = 0;
   [[nodiscard]] virtual cudaError_t eventQuery(cudaEvent_t event) = 0;
 
   // Error handling
@@ -127,6 +141,7 @@ class DefaultCudaApi : public CudaApi {
 
   // Device management
   [[nodiscard]] cudaError_t setDevice(int device) override;
+  [[nodiscard]] cudaError_t getDevice(int* device) override;
   [[nodiscard]] cudaError_t getDeviceProperties(
       cudaDeviceProp* prop,
       int device) override;
@@ -168,6 +183,11 @@ class DefaultCudaApi : public CudaApi {
       cudaUserObject_t object,
       unsigned int count,
       unsigned int flags) override;
+  [[nodiscard]] cudaError_t userObjectRelease(
+      cudaUserObject_t object,
+      unsigned int count) override;
+  [[nodiscard]] cudaError_t
+  launchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) override;
   [[nodiscard]] cudaError_t streamGetCaptureInfo_v2(
       cudaStream_t stream,
       cudaStreamCaptureStatus* captureStatus_out,
@@ -177,6 +197,10 @@ class DefaultCudaApi : public CudaApi {
       size_t* numDependencies_out) override;
   [[nodiscard]] cudaError_t threadExchangeStreamCaptureMode(
       enum cudaStreamCaptureMode* mode) override;
+
+  [[nodiscard]] cudaError_t
+  hostAlloc(void** pHost, size_t size, unsigned int flags) override;
+  [[nodiscard]] cudaError_t hostFree(void* ptr) override;
 
   // Memory management
   [[nodiscard]] cudaError_t malloc(void** devPtr, size_t size) override;
@@ -201,6 +225,10 @@ class DefaultCudaApi : public CudaApi {
   [[nodiscard]] cudaError_t eventDestroy(cudaEvent_t event) override;
   [[nodiscard]] cudaError_t eventRecord(cudaEvent_t event, cudaStream_t stream)
       override;
+  [[nodiscard]] cudaError_t eventRecordWithFlags(
+      cudaEvent_t event,
+      cudaStream_t stream,
+      unsigned int flags) override;
   [[nodiscard]] cudaError_t eventQuery(cudaEvent_t event) override;
 
   // Error handling

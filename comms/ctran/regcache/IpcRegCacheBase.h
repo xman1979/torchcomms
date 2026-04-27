@@ -2,6 +2,7 @@
 #pragma once
 
 #include <fmt/core.h>
+#include <array>
 #include <cstring>
 #include <string>
 
@@ -9,8 +10,27 @@
 #include "comms/ctran/utils/CtranIpc.h"
 #include "comms/utils/commSpecs.h"
 
+// FIXME(alvinyc): move this IB constant to CtranIbBase.h once CtranIb doesn't
+// depend on CtranCtrl and CtranCtrl is removed
+constexpr int CTRAN_MAX_IB_DEVICES_PER_RANK{2};
+
 namespace ctran {
 namespace regcache {
+
+struct IBDesc {
+  uint64_t remoteAddr{0};
+  std::array<uint32_t, CTRAN_MAX_IB_DEVICES_PER_RANK> rkeys{};
+  int nKeys{0};
+
+  std::string toString() const {
+    std::string s =
+        fmt::format("[IB_EXPORT_MEM] remoteAddr: 0x{:x}", remoteAddr);
+    for (int i = 0; i < nKeys; i++) {
+      s += fmt::format(", rkeys[{}]: {}", i, rkeys[i]);
+    }
+    return s;
+  }
+};
 
 struct IpcDesc {
   ctran::utils::CtranIpcDesc desc;
@@ -32,10 +52,14 @@ struct IpcRelease {
   void* base{nullptr};
   // unique ID for tracking registrations
   uint32_t uid{0};
+  // Number of times this buffer was exported to the peer. The import side
+  // should decrement its refcount by this amount.
+  int32_t exportCount{1};
 
   std::string toString() const {
     std::stringstream ss;
-    ss << "[IPC_RELEASE_MEM] base: " << base << " uid: " << uid;
+    ss << "[IPC_RELEASE_MEM] base: " << base << " uid: " << uid
+       << " exportCount: " << exportCount;
     return ss.str();
   }
 };
@@ -73,23 +97,46 @@ struct IpcRegElem {
 
 struct IpcRemRegElem {
   ctran::utils::CtranIpcRemMem ipcRemMem;
+  // Reference count for how many communicators have imported this memory.
+  // Starts at 1 on first import, incremented on subsequent cache hits.
+  // Only freed when refCount reaches 0.
+  std::atomic<int> refCount{1};
 
  public:
   IpcRemRegElem(
       const ctran::utils::CtranIpcDesc& ipcDesc,
       int cudaDev,
       const struct CommLogData* logMetaData)
-      : ipcRemMem(ipcDesc, cudaDev, logMetaData, "IPC RemRegElem") {};
+      : ipcRemMem(ipcDesc, cudaDev, logMetaData, "IPC RemRegElem", {}) {};
+
+  IpcRemRegElem(
+      const ctran::utils::CtranIpcDesc& ipcDesc,
+      int cudaDev,
+      const struct CommLogData* logMetaData,
+      const std::vector<ctran::utils::CtranIpcSegDesc>& extraSegments)
+      : ipcRemMem(
+            ipcDesc,
+            cudaDev,
+            logMetaData,
+            "IPC RemRegElem",
+            extraSegments) {};
 
   std::string toString() const {
-    return ipcRemMem.toString();
+    return fmt::format(
+        "{} refCount: {}",
+        ipcRemMem.toString(),
+        refCount.load(std::memory_order_relaxed));
   }
 };
 
+// Maximum length for peer ID string (including null terminator)
+// Format: "hostname:pid" - hostname can be up to 255 chars (DNS limit)
+constexpr size_t kMaxPeerIdLen = 272;
+
 struct IpcRemHandle {
   // use peerId, basePtr and uid on peer to lookup the imported memory handle
-  // in local cache
-  std::string peerId;
+  // in local cache.
+  char peerId[kMaxPeerIdLen]{};
   void* basePtr;
   uint32_t uid;
 
@@ -104,10 +151,6 @@ enum class IpcReqType : uint8_t {
   kDesc = 0, // Memory descriptor for export
   kRelease = 1, // Release notification
 };
-
-// Maximum length for peer ID string (including null terminator)
-// Format: "hostname:pid" - hostname can be up to 255 chars (DNS limit)
-constexpr size_t kMaxPeerIdLen = 272;
 
 // Unified IPC request structure sent over the network.
 // Used for both memory export (IpcDesc) and release (IpcRelease) requests.
@@ -159,6 +202,23 @@ struct IpcReqCb {
 
   IpcReqCb() = default;
   explicit IpcReqCb(IpcReqType t, const std::string& id) : req(t, id) {}
+};
+
+// Forward declaration for RegElem (defined in RegCache.h)
+struct RegElem;
+
+// Abstract interface for any object that exports IPC memory and needs
+// to send remReleaseMem when memory is globally freed. Implementers
+// (e.g., CtranMapper) register with IpcRegCache so that globalDeregister
+// can iterate all active exporters.
+class IpcExportClient {
+ public:
+  virtual ~IpcExportClient() = default;
+
+  // Called by IpcRegCache::releaseFromAllClients when memory is globally freed.
+  // The implementer should look up the regElem in its own export cache,
+  // send release to the appropriate peers, and clean up.
+  virtual commResult_t remReleaseMem(RegElem* regElem) = 0;
 };
 
 } // namespace regcache

@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-strict
+# patternlint-disable fbcode-nonempty-init-py
 import ctypes
 import os
 import sys
@@ -42,6 +43,7 @@ def _load_libtorchcomms() -> None:
 
 _load_libtorchcomms()
 from torchcomms._comms import *  # noqa: E402, F401, F403
+import torchcomms.hooks as hooks  # noqa: E402, F401
 import torchcomms.objcol as objcol  # noqa: E402, F401, F403
 
 if torch_compile_supported_and_enabled:

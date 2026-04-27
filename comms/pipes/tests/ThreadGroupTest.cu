@@ -76,6 +76,129 @@ void testContiguousLocality(
   PIPES_KERNEL_LAUNCH_CHECK();
 }
 
+__global__ void testThreadSoloGroupKernel(
+    uint32_t* groupIds,
+    uint32_t* groupSizes,
+    uint32_t* threadIdsInGroup,
+    uint32_t* isLeader,
+    uint32_t* syncResults,
+    uint32_t* errorCount) {
+  auto solo = make_thread_solo();
+
+  uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x +
+      threadIdx.z * blockDim.x * blockDim.y;
+  uint32_t threads_per_block = blockDim.x * blockDim.y * blockDim.z;
+  uint32_t global_tid = blockIdx.x * threads_per_block + tid;
+  uint32_t total_threads = gridDim.x * threads_per_block;
+
+  // Verify group properties
+  if (solo.group_size != 1) {
+    atomicAdd(errorCount, 1);
+  }
+  if (solo.thread_id_in_group != 0) {
+    atomicAdd(errorCount, 1);
+  }
+  if (!solo.is_leader()) {
+    atomicAdd(errorCount, 1);
+  }
+  if (solo.group_id != global_tid) {
+    atomicAdd(errorCount, 1);
+  }
+  if (solo.total_groups != total_threads) {
+    atomicAdd(errorCount, 1);
+  }
+  if (solo.scope != SyncScope::THREAD) {
+    atomicAdd(errorCount, 1);
+  }
+
+  // Record properties for host-side verification
+  groupIds[global_tid] = solo.group_id;
+  groupSizes[global_tid] = solo.group_size;
+  threadIdsInGroup[global_tid] = solo.thread_id_in_group;
+  isLeader[global_tid] = solo.is_leader() ? 1u : 0u;
+
+  // Verify sync() completes (compiler barrier only — no hardware sync needed).
+  // Write a value before sync, call sync, then write a different value after.
+  // The fact that this completes without deadlock is the meaningful assertion.
+  syncResults[global_tid] = 0u;
+  solo.sync();
+  syncResults[global_tid] = 1u;
+}
+
+void testThreadSoloGroup(
+    uint32_t* groupIds_d,
+    uint32_t* groupSizes_d,
+    uint32_t* threadIdsInGroup_d,
+    uint32_t* isLeader_d,
+    uint32_t* syncResults_d,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize) {
+  testThreadSoloGroupKernel<<<numBlocks, blockSize>>>(
+      groupIds_d,
+      groupSizes_d,
+      threadIdsInGroup_d,
+      isLeader_d,
+      syncResults_d,
+      errorCount_d);
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+// =============================================================================
+// Strided Locality Tests
+// =============================================================================
+
+template <SyncScope Scope>
+__global__ void testStridedLocalityKernel(
+    uint32_t* groupIds,
+    uint32_t numItems,
+    uint32_t* errorCount) {
+  auto group = make_thread_group(Scope);
+
+  group.for_each_item_strided(numItems, [&](uint32_t item_id) {
+    if (item_id >= numItems) {
+      atomicAdd(errorCount, 1);
+      return;
+    }
+
+    groupIds[item_id] = group.group_id;
+  });
+
+  __syncthreads();
+
+  if (group.is_global_leader()) {
+    for (uint32_t item_id = 0; item_id < numItems; item_id++) {
+      uint32_t expected_group_id = item_id % group.total_groups;
+      if (groupIds[item_id] != expected_group_id) {
+        atomicAdd(errorCount, 1);
+      }
+    }
+  }
+}
+
+void testStridedLocality(
+    uint32_t* groupIds_d,
+    uint32_t numItems,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize,
+    SyncScope scope) {
+  if (scope == SyncScope::WARP) {
+    testStridedLocalityKernel<SyncScope::WARP>
+        <<<numBlocks, blockSize>>>(groupIds_d, numItems, errorCount_d);
+  } else if (scope == SyncScope::MULTIWARP) {
+    testStridedLocalityKernel<SyncScope::MULTIWARP>
+        <<<numBlocks, blockSize>>>(groupIds_d, numItems, errorCount_d);
+  } else if (scope == SyncScope::BLOCK) {
+    testStridedLocalityKernel<SyncScope::BLOCK>
+        <<<numBlocks, blockSize>>>(groupIds_d, numItems, errorCount_d);
+  } else {
+    testStridedLocalityKernel<SyncScope::CLUSTER>
+        <<<numBlocks, blockSize>>>(groupIds_d, numItems, errorCount_d);
+  }
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
 // =============================================================================
 // Block Group Tests
 // =============================================================================
@@ -469,7 +592,6 @@ __global__ void testMultiwarpSyncKernel(
 
   // Phase 2: Each thread verifies all threads in its multiwarp wrote their
   // values
-  constexpr uint32_t kMultiwarpSize = 128;
   uint32_t multiwarpStart = (tid / kMultiwarpSize) * kMultiwarpSize;
 
   for (uint32_t i = 0; i < kMultiwarpSize; i++) {
@@ -565,6 +687,110 @@ __global__ void testBlockClusterSyncKernel(
   if (cluster.is_leader()) {
     syncResults[cluster.group_id] = 1;
   }
+}
+
+// =============================================================================
+// to_warp_group() Tests
+// =============================================================================
+
+template <SyncScope Scope>
+__global__ void testToWarpGroupKernel(
+    uint32_t* groupIds,
+    uint32_t* totalGroupsOut,
+    uint32_t* errorCount) {
+  auto group = make_thread_group(Scope);
+  auto warp = group.to_warp_group();
+
+  uint32_t lane_id = threadIdx.x % kWarpSize;
+
+  // Device-side validation for every thread
+  if (warp.thread_id_in_group != lane_id) {
+    atomicAdd(errorCount, 1);
+  }
+  if (warp.group_size != kWarpSize) {
+    atomicAdd(errorCount, 1);
+  }
+  if (warp.scope != SyncScope::WARP) {
+    atomicAdd(errorCount, 1);
+  }
+
+  // Warp leaders write group_id and total_groups
+  if (warp.is_leader()) {
+    groupIds[warp.group_id] = warp.group_id;
+    totalGroupsOut[warp.group_id] = warp.total_groups;
+  }
+}
+
+void testToWarpGroup(
+    uint32_t* groupIds_d,
+    uint32_t* totalGroupsOut_d,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize,
+    SyncScope scope) {
+  if (scope == SyncScope::WARP) {
+    testToWarpGroupKernel<SyncScope::WARP>
+        <<<numBlocks, blockSize>>>(groupIds_d, totalGroupsOut_d, errorCount_d);
+  } else if (scope == SyncScope::BLOCK) {
+    testToWarpGroupKernel<SyncScope::BLOCK>
+        <<<numBlocks, blockSize>>>(groupIds_d, totalGroupsOut_d, errorCount_d);
+  } else if (scope == SyncScope::MULTIWARP) {
+    testToWarpGroupKernel<SyncScope::MULTIWARP>
+        <<<numBlocks, blockSize>>>(groupIds_d, totalGroupsOut_d, errorCount_d);
+  }
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+// =============================================================================
+// partition() then to_warp_group() Tests
+// =============================================================================
+
+__global__ void testPartitionThenToWarpGroupKernel(
+    uint32_t* warpGroupIds,
+    uint32_t* warpTotalGroups,
+    uint32_t* partitionIds,
+    uint32_t numPartitions,
+    uint32_t* errorCount) {
+  auto block = make_block_group();
+  auto [partition_id, subgroup] = block.partition(numPartitions);
+  auto warp = subgroup.to_warp_group();
+
+  // Device-side validation for every thread
+  if (warp.scope != SyncScope::WARP) {
+    atomicAdd(errorCount, 1);
+  }
+  if (warp.group_size != kWarpSize) {
+    atomicAdd(errorCount, 1);
+  }
+
+  // Compute global warp index for output buffer indexing
+  uint32_t warps_per_block = blockDim.x / kWarpSize;
+  uint32_t warp_in_block = threadIdx.x / kWarpSize;
+  uint32_t global_warp = blockIdx.x * warps_per_block + warp_in_block;
+
+  // Warp leaders write results
+  if (warp.is_leader()) {
+    warpGroupIds[global_warp] = warp.group_id;
+    warpTotalGroups[global_warp] = warp.total_groups;
+    partitionIds[global_warp] = partition_id;
+  }
+}
+
+void testPartitionThenToWarpGroup(
+    uint32_t* warpGroupIds_d,
+    uint32_t* warpTotalGroups_d,
+    uint32_t* partitionIds_d,
+    uint32_t numPartitions,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize) {
+  testPartitionThenToWarpGroupKernel<<<numBlocks, blockSize>>>(
+      warpGroupIds_d,
+      warpTotalGroups_d,
+      partitionIds_d,
+      numPartitions,
+      errorCount_d);
+  PIPES_KERNEL_LAUNCH_CHECK();
 }
 
 } // namespace comms::pipes::test

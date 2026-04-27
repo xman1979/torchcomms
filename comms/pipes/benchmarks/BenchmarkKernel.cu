@@ -17,7 +17,7 @@ __global__ void p2pSend(
     Timeout timeout) {
   timeout.start();
   auto group = make_thread_group(groupScope);
-  p2p.send(group, srcBuff, nBytes, 0, timeout);
+  p2p.send_group(group, srcBuff, nBytes, timeout);
 }
 
 __global__ void p2pRecv(
@@ -28,7 +28,7 @@ __global__ void p2pRecv(
     Timeout timeout) {
   timeout.start();
   auto group = make_thread_group(groupScope);
-  p2p.recv(group, dstBuff, nBytes, 0, timeout);
+  p2p.recv_group(group, dstBuff, nBytes, timeout);
 }
 
 __global__ void p2pSendTimed(
@@ -45,7 +45,7 @@ __global__ void p2pSendTimed(
     stats->startCycle = clock64();
   }
 
-  p2p.send(group, srcBuff, nBytes);
+  p2p.send_group(group, srcBuff, nBytes);
 
   // Only first thread globally records end time
   if (globalThreadId == 0) {
@@ -69,7 +69,7 @@ __global__ void p2pRecvTimed(
     stats->startCycle = clock64();
   }
 
-  p2p.recv(group, dstBuff, nBytes);
+  p2p.recv_group(group, dstBuff, nBytes);
 
   // Only first thread globally records end time
   if (globalThreadId == 0) {
@@ -79,7 +79,7 @@ __global__ void p2pRecvTimed(
   }
 }
 
-__global__ void p2pBidirectional(
+__global__ __launch_bounds__(512, 1) void p2pBidirectional(
     P2pNvlTransportDevice p2p,
     void* sendBuff,
     void* recvBuff,
@@ -92,9 +92,9 @@ __global__ void p2pBidirectional(
   // Partition groups into 2: half for send, half for recv
   auto [partition_id, subgroup] = group.partition_interleaved(2);
   if (partition_id == 0) {
-    p2p.send(subgroup, sendBuff, nBytes, 0, timeout);
+    p2p.send_group(subgroup, sendBuff, nBytes, timeout);
   } else {
-    p2p.recv(subgroup, recvBuff, nBytes, 0, timeout);
+    p2p.recv_group(subgroup, recvBuff, nBytes, timeout);
   }
 }
 
@@ -112,45 +112,49 @@ __global__ void p2pSignalBenchKernel(
   // - Wait on local signal buffer (local read)
   // multiple times before the other reads.
   for (int step = 1; step <= nSteps; ++step) {
-    p2p.signal_threadgroup(group, signal_id, SignalOp::SIGNAL_ADD, 1);
-    p2p.wait_signal_until_threadgroup(
+    p2p.signal(group, signal_id, SignalOp::SIGNAL_ADD, 1);
+    p2p.wait_signal_until(
         group, signal_id, CmpOp::CMP_EQ, static_cast<uint64_t>(step));
   }
 }
 
-__global__ void p2pSendOne(
+__global__ void p2pLl128Send(
     P2pNvlTransportDevice p2p,
     void* srcBuff,
     std::size_t nBytes,
-    SyncScope groupScope) {
-  auto group = make_thread_group(groupScope);
-  p2p.send_one(group, srcBuff, nBytes);
+    Timeout timeout) {
+  timeout.start();
+  auto group = make_warp_group();
+  p2p.ll128_send_group(
+      group, static_cast<const char*>(srcBuff), nBytes, timeout);
 }
 
-__global__ void
-p2pRecvOne(P2pNvlTransportDevice p2p, void* dstBuff, SyncScope groupScope) {
-  auto group = make_thread_group(groupScope);
-  std::size_t nbytes;
-  p2p.recv_one(group, dstBuff, &nbytes);
-}
-
-__global__ void p2pSendMultiple(
-    P2pNvlTransportDevice p2p,
-    void* srcBuff,
-    DeviceSpan<const std::size_t> chunkSizes,
-    DeviceSpan<const std::size_t> chunkIndices,
-    SyncScope groupScope) {
-  auto group = make_thread_group(groupScope);
-  p2p.send_multiple(group, srcBuff, chunkSizes, chunkIndices);
-}
-
-__global__ void p2pRecvMultiple(
+__global__ void p2pLl128Recv(
     P2pNvlTransportDevice p2p,
     void* dstBuff,
-    DeviceSpan<std::size_t> chunkSizes,
-    SyncScope groupScope) {
-  auto group = make_thread_group(groupScope);
-  p2p.recv_multiple(group, dstBuff, chunkSizes);
+    std::size_t nBytes,
+    Timeout timeout) {
+  timeout.start();
+  auto group = make_warp_group();
+  p2p.ll128_recv_group(group, static_cast<char*>(dstBuff), nBytes, timeout);
+}
+
+__global__ void p2pLl128Bidirectional(
+    P2pNvlTransportDevice p2p,
+    void* sendBuff,
+    void* recvBuff,
+    std::size_t nBytes,
+    Timeout timeout) {
+  timeout.start();
+  auto group = make_warp_group();
+  auto [partition_id, subgroup] = group.partition_interleaved(2);
+  if (partition_id == 0) {
+    p2p.ll128_send_group(
+        subgroup, static_cast<const char*>(sendBuff), nBytes, timeout);
+  } else {
+    p2p.ll128_recv_group(
+        subgroup, static_cast<char*>(recvBuff), nBytes, timeout);
+  }
 }
 
 } // namespace comms::pipes::benchmark

@@ -7,6 +7,7 @@
 
 #include "comms/common/CudaWrap.h"
 #include "comms/pipes/MultiPeerNvlTransport.h"
+#include "comms/pipes/TimeoutUtils.h"
 #include "comms/pipes/benchmarks/BenchmarkMacros.h"
 #include "comms/pipes/collectives/AllToAllv.h"
 #include "comms/testinfra/BenchmarkTestFixture.h"
@@ -163,6 +164,8 @@ class AllToAllvBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
           ncclComm_,
           stream_));
     }
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    bootstrap->barrierAll();
 
     // Benchmark
     CUDA_CHECK(cudaEventRecord(start.get(), stream_));
@@ -241,26 +244,7 @@ class AllToAllvBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
     MultiPeerNvlTransport transport(globalRank, nranks, bootstrap, nvlConfig);
     transport.exchange();
 
-    // Create transport array: self for my rank, P2P for others
-    P2pSelfTransportDevice selfTransport;
-    std::vector<Transport> h_transports;
-    h_transports.reserve(nranks);
-
-    for (int rank = 0; rank < nranks; rank++) {
-      if (rank == globalRank) {
-        h_transports.emplace_back(selfTransport);
-      } else {
-        h_transports.emplace_back(transport.getP2pTransportDevice(rank));
-      }
-    }
-
-    // Copy transports to device
-    DeviceBuffer d_transports(sizeof(Transport) * nranks);
-    CUDA_CHECK(cudaMemcpy(
-        d_transports.get(),
-        h_transports.data(),
-        sizeof(Transport) * nranks,
-        cudaMemcpyHostToDevice));
+    auto transports_span = transport.getDeviceTransports();
 
     // Create chunk info arrays (equal size for all peers)
     std::vector<ChunkInfo> h_send_chunks, h_recv_chunks;
@@ -283,8 +267,6 @@ class AllToAllvBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
         cudaMemcpyHostToDevice));
 
     // Create device spans
-    DeviceSpan<Transport> transports_span(
-        static_cast<Transport*>(d_transports.get()), nranks);
     DeviceSpan<ChunkInfo> send_chunk_infos(
         static_cast<ChunkInfo*>(d_send_chunks.get()), nranks);
     DeviceSpan<ChunkInfo> recv_chunk_infos(
@@ -294,8 +276,11 @@ class AllToAllvBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
     void* recvBuff_d = recvBuffer.get();
     const void* sendBuff_d = sendBuffer.get();
 
-    // Use default timeout (0ms = no timeout)
-    std::chrono::milliseconds timeout{0};
+    // Pre-build Timeout once to avoid per-call
+    // cudaGetDevice/cudaDeviceGetAttribute overhead.
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    Timeout timeout_config = makeTimeout(0, device);
 
     CudaEvent start, stop;
     const int nIter = 100;
@@ -318,7 +303,7 @@ class AllToAllvBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
           transports_span,
           send_chunk_infos,
           recv_chunk_infos,
-          timeout,
+          timeout_config,
           nullptr, // stream
           config.numBlocks,
           config.numThreads,
@@ -337,7 +322,7 @@ class AllToAllvBenchmarkFixture : public meta::comms::BenchmarkTestFixture {
           transports_span,
           send_chunk_infos,
           recv_chunk_infos,
-          timeout,
+          timeout_config,
           nullptr, // stream
           config.numBlocks,
           config.numThreads,

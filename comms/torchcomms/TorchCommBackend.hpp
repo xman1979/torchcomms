@@ -6,9 +6,9 @@
 #include <c10/core/Device.h>
 #include <c10/util/intrusive_ptr.h>
 #include <comms/torchcomms/TorchCommBatch.hpp>
+#include <comms/torchcomms/TorchCommHooks.hpp>
 #include <comms/torchcomms/TorchCommOptions.hpp>
 #include <comms/torchcomms/TorchCommTypes.hpp>
-#include <comms/torchcomms/TorchCommUtils.hpp>
 #include <comms/torchcomms/TorchCommWindow.hpp>
 #include <comms/torchcomms/TorchWork.hpp>
 #include <memory>
@@ -44,6 +44,13 @@ class TorchCommBackend {
 
   // Name of the backend impl that's the same for all instances of a backend.
   virtual std::string_view getBackendName() const = 0;
+
+  virtual std::string_view getBackendVersion() const {
+    throw std::logic_error(
+        "[TorchCommBackend]: version not implemented for communicator:" +
+        std::string(getCommName()));
+  }
+
   // Unique name for this instance of the communicator.
   virtual std::string_view getCommName() const = 0;
 
@@ -149,6 +156,23 @@ class TorchCommBackend {
       bool async_op,
       const GatherOptions& options = {}) = 0;
 
+  virtual c10::intrusive_ptr<TorchWork> gather_single(
+      at::Tensor& output,
+      const at::Tensor& input,
+      int root,
+      bool async_op,
+      const GatherSingleOptions& /*options*/ = {}) {
+    // Default: split output along dim-0 into getSize() views and delegate to
+    // gather. The views share the same underlying storage so data lands
+    // contiguously in the original output tensor.
+    std::vector<at::Tensor> output_list;
+    if (getRank() == root) {
+      output_list = output.chunk(getSize(), /*dim=*/0);
+    }
+    GatherOptions gather_opts;
+    return gather(output_list, input, root, async_op, gather_opts);
+  }
+
   // Communicator Management
   virtual std::shared_ptr<TorchCommBackend> split(
       const std::vector<int>& ranks,
@@ -161,10 +185,128 @@ class TorchCommBackend {
   // Window & One-sided Operations, not required for all backends, so we added
   // default implementation here
   virtual std::shared_ptr<TorchCommWindow> new_window(
-      const std::optional<at::Tensor>& tensor = std::nullopt) {
+      [[maybe_unused]] const std::optional<at::Tensor>& tensor = std::nullopt) {
     throw std::logic_error(
         "[TorchCommBackend]: new_window not implemented for communicator:" +
         std::string(getCommName()));
+  }
+
+  // Abort hook support (AbortHook defined in TorchCommHooks.hpp)
+  // Called before aborting when a collective times out or fails.
+  // Multiple hooks can be registered and will be called in order.
+
+  virtual void registerAbortHook(int64_t hookId, AbortHook hook) {
+    abortHooks_.emplace(hookId, std::move(hook));
+  }
+
+  virtual void unregisterAbortHook(int64_t hookId) {
+    abortHooks_.erase(hookId);
+  }
+
+  std::unordered_map<int64_t, AbortHook> abortHooks_;
+
+  // Persistent AllGather operations
+  // Handle type for persistent AllGather (opaque pointer)
+  using AllGatherPHandle = void*;
+
+  // Initialize persistent AllGather operation
+  // Returns a handle that can be used for multiple executions
+  virtual AllGatherPHandle all_gather_p_init(
+      at::Tensor& /* output */,
+      const AllGatherPInitOptions& /* options */ = {}) {
+    throw std::logic_error(
+        "[TorchCommBackend]: all_gather_p_init not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+  // Execute persistent AllGather
+  // Can be called multiple times with the same handle
+  virtual c10::intrusive_ptr<TorchWork> all_gather_p_exec(
+      AllGatherPHandle /* handle */,
+      const at::Tensor& /* input */,
+      bool /* async_op */,
+      const AllGatherPExecOptions& /* options */ = {}) {
+    throw std::logic_error(
+        "[TorchCommBackend]: all_gather_p_exec not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+  // Free persistent AllGather handle
+  virtual void all_gather_p_free(AllGatherPHandle /* handle */) {
+    throw std::logic_error(
+        "[TorchCommBackend]: all_gather_p_free not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+  // Fault Tolerance API
+
+  /**
+   * Check if this backend supports reconfigure for fault tolerance.
+   * Override this method in backends that support reconfigure.
+   *
+   * @return True if the backend supports reconfigure, false otherwise.
+   */
+  virtual bool supportsReconfigure() const {
+    return false;
+  }
+
+  /**
+   * Get the initialization handle for this backend.
+   * In dynamic regime, this URL encodes information required by the backend
+   * to complete the initialization process via reconfigure().
+   *
+   * @return An InitHandle containing the initialization URL/handle.
+   * @throws std::runtime_error if not implemented by the backend.
+   */
+  virtual InitHandle getInitHandle() const {
+    throw std::runtime_error(
+        "[TorchCommBackend]: getInitHandle not implemented for communicator:" +
+        std::string(getCommName()));
+  }
+
+  /**
+   * Reconfigure the communicator with a new set of peers.
+   * In dynamic regime, this method initializes the communicator with the
+   * provided set of peers. After a successful reconfigure call, the
+   * communicator is fully initialized and collective operations are permitted.
+   *
+   * @param opts ReconfigureOptions containing uuid, handles, timeout, and
+   * hints.
+   * @return A TorchWork handle that can be used to wait for completion.
+   * @throws std::runtime_error if not implemented by the backend.
+   */
+  virtual c10::intrusive_ptr<TorchWork> reconfigure(
+      const ReconfigureOptions& /*opts*/) {
+    throw std::runtime_error(
+        "[TorchCommBackend]: reconfigure not implemented for communicator:" +
+        std::string(getCommName()));
+  }
+
+  // Device Transport API
+  // Returns a device pointer (as int64) to a transport handle for use in
+  // Triton/CUDA kernels. Only supported by backends with pipes transport.
+  virtual int64_t get_device_transport() {
+    throw std::runtime_error(
+        "[TorchCommBackend]: get_device_transport not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+ protected:
+  void runAbortHooks() {
+    for (const auto& [_, hook] : abortHooks_) {
+      try {
+        hook();
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "[TorchCommBackend] Abort hook threw exception: "
+                   << e.what();
+      } catch (...) {
+        LOG(ERROR) << "[TorchCommBackend] Abort hook threw unknown exception.";
+      }
+    }
   }
 };
 

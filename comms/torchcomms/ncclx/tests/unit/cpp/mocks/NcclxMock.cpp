@@ -33,12 +33,28 @@ void NcclxMock::setupDefaultBehaviors() {
 
   ON_CALL(*this, commAbort(_)).WillByDefault(Return(ncclSuccess));
 
+  ON_CALL(*this, commRevoke(_)).WillByDefault(Return(ncclSuccess));
+
   ON_CALL(*this, commGetAsyncError(_, _))
       .WillByDefault(DoAll(SetArgPointee<1>(ncclSuccess), Return(ncclSuccess)));
 
   ON_CALL(*this, commSplit(_, _, _, _, _))
       .WillByDefault(DoAll(
           SetArgPointee<3>(reinterpret_cast<ncclComm_t>(0x4000)),
+          Return(ncclSuccess)));
+
+  ON_CALL(*this, commShrink(_, _, _, _, _, _))
+      .WillByDefault(DoAll(
+          SetArgPointee<3>(reinterpret_cast<ncclComm_t>(0x6000)),
+          Return(ncclSuccess)));
+
+  ON_CALL(*this, commGetUniqueId(_, _))
+      .WillByDefault(
+          DoAll(SetArgPointee<1>(ncclUniqueId{}), Return(ncclSuccess)));
+
+  ON_CALL(*this, commGrow(_, _, _, _, _, _))
+      .WillByDefault(DoAll(
+          SetArgPointee<4>(reinterpret_cast<ncclComm_t>(0x7000)),
           Return(ncclSuccess)));
 
   // Memory registration - return success by default
@@ -72,6 +88,11 @@ void NcclxMock::setupDefaultBehaviors() {
   ON_CALL(*this, reduceScatter(_, _, _, _, _, _, _))
       .WillByDefault(Return(ncclSuccess));
 
+#ifdef NCCL_REDUCE_SCATTER_QUANTIZE_SUPPORTED
+  ON_CALL(*this, reduceScatterQuantize(_, _, _, _, _, _, _, _, _))
+      .WillByDefault(Return(ncclSuccess));
+#endif
+
   ON_CALL(*this, alltoallvDedupInit(_, _, _, _, _, _, _, _))
       .WillByDefault(Return(ncclSuccess));
   ON_CALL(*this, alltoallvDedupExec(_, _, _, _, _, _, _))
@@ -104,6 +125,8 @@ void NcclxMock::setupDefaultBehaviors() {
       .WillByDefault(DoAll(SetArgPointee<1>(0), Return(ncclSuccess)));
   ON_CALL(*this, commCount(_, _))
       .WillByDefault(DoAll(SetArgPointee<1>(1), Return(ncclSuccess)));
+
+  ON_CALL(*this, commDump(_, _)).WillByDefault(Return(ncclSuccess));
 
   ON_CALL(*this, redOpCreatePreMulSum(_, _, _, _, _))
       .WillByDefault(Return(ncclSuccess));

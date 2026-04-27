@@ -1,11 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 #pragma once
 
+#include <fmt/format.h>
 #include <folly/Synchronized.h>
 #include <memory>
 #include <queue>
 #include <unordered_map>
 
+#include "comms/ctran/backends/ib/CtranIbSingleton.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CtranAvlTree.h"
@@ -269,7 +271,29 @@ class RegCache {
   void init();
   commResult_t destroy();
 
+  // Global registration using the globally-set backends.
+  // This allows registration without requiring a communicator.
+  // Backends are initialized from NCCL_CTRAN_BACKENDS cvar in init().
+  // If forceReg is true, registration happens even in async/lazy mode.
+  // deviceId is optional: if not assigned, infer it from getCudaDevFromPtr()
+  commResult_t globalRegister(
+      const void* buf,
+      size_t len,
+      bool forceReg = false,
+      bool ncclManaged = false,
+      int deviceId = -1);
+
+  // Global deregistration using pointer lookup.
+  // Frees cached segments and their associated registrations.
+  commResult_t globalDeregister(
+      const void* buf,
+      size_t len,
+      bool skipRemRelease = false,
+      int deviceId = -1);
+
   // Thread-safe functions to cache a buffer range into the global cache.
+  // This function uses pinRange to discover all physical segments underlying
+  // the given buffer and caches each one individually.
   // input:
   //   - buf: the buffer to be cached
   //   - len: the length of the buffer
@@ -343,10 +367,15 @@ class RegCache {
   commResult_t deregDynamic(regcache::RegElem* regHdl);
 
   // Thread-safe functions to free a cached segment from the global cache and
-  // deregister any associated registration. If the segment is still in use by
-  // any communicator, this call is a no-op.
+  // deregister any associated registration. If the segment is already freed
+  // (e.g. by a prior globalDeregister), this is a no-op. If the segment is
+  // still in use by any communicator (refCount > 0), this call is a no-op
+  // unless forceFree is true.
   // input:
   //   - segHdl: the handle of the cached segment
+  //   - forceFree: if true, skip the refCount check and always free the
+  //                segment. Used by globalDeregister when the underlying
+  //                physical memory is about to be freed.
   // output:
   //   - freed: whether or not the segment is freed from the global cache
   //   - ncclManaged: whether or not the segment is managed by NCCL
@@ -357,13 +386,20 @@ class RegCache {
       void* segHdl,
       bool& freed,
       bool& ncclManaged,
-      std::vector<std::unique_ptr<regcache::RegElem>>& regElems);
+      std::vector<std::unique_ptr<regcache::RegElem>>& regElems,
+      bool forceFree = false);
 
   regcache::Segment* getSegment(void* segHdl);
 
   // Get vector of regElem associated with the specified segHdl.
   // If no regElem is associated, empty vector is returned
   std::vector<regcache::RegElem*> getRegElems(const void* segHdl) const;
+
+  // Get deduplicated regElems associated with multiple segHdls.
+  // Deduplication is needed because a single regElem can span multiple
+  // segments.
+  std::vector<regcache::RegElem*> getRegElems(
+      const std::vector<void*>& segHdls) const;
 
   // Thread-safe functions to get a list of all cached segments in the global
   // cache.
@@ -398,15 +434,68 @@ class RegCache {
   // Thread-safe function to check if a given <ptr, len> range is registered.
   bool isRegistered(const void* ptr, const size_t len);
 
+  // Thread-safe function to search for a RegElem containing [ptr, ptr+len)
+  // and return its ibRegElem. If the buffer is cached but not yet registered,
+  // it will perform registration via regRange(). Returns nullptr if not cached.
+  void* searchIbRegHandle(const void* ptr, size_t len, int deviceId = -1);
+
   // Thread-safe function to wait on all async registration requests to finish.
   // Used by test only.
   void waitAsyncRegComplete();
+
+  // Global API to register all cached segments. This is useful in lazy
+  // registration mode where segments are cached but not immediately registered.
+  // Instead of registering each segment individually via
+  // searchRegHandle/regRange, this function discovers all contiguous memory
+  // regions among the cached segments and registers each region separately.
+  //
+  // This function does NOT assume all cached segments form a single
+  // contiguous region. It finds ALL contiguous regions (which may be
+  // non-adjacent in memory) and creates one registration per region.
+  //
+  // The function:
+  // 1. Retrieves all cached segments from the AVL tree
+  // 2. Sorts segments by starting address
+  // 3. Groups adjacent segments into contiguous regions (where one segment's
+  //    end address equals the next segment's start address)
+  // 4. Registers each contiguous region separately
+  //
+  // Example: If segments are at addresses [0x1000-0x2000], [0x2000-0x3000],
+  // [0x5000-0x6000], this creates TWO registrations:
+  //   - Region 1: [0x1000-0x3000] (first two segments are contiguous)
+  //   - Region 2: [0x5000-0x6000] (third segment is isolated)
+  //
+  // This function does NOT check for existing registrations.
+  // Callers should call deregAll() before regAll() if they want to avoid
+  // duplicate registrations.
+  //
+  // Returns commSuccess if successful, or error code otherwise.
+  static commResult_t regAll();
+
+  // Deregister all non-dynamic registration elements from the global cache.
+  // This removes all registrations that were created via regAll() or
+  // regRange(), but does NOT remove the cached segments themselves (they can be
+  // re-registered later). Dynamic registrations (created via regDynamic) are
+  // not affected.
+  //
+  // Returns commSuccess if successful, or error code otherwise.
+  static commResult_t deregAll();
 
   // Profiler to record the events of the global cache.
   // Check its APIs for more details.
   folly::Synchronized<regcache::Profiler> profiler;
 
  private:
+  // Hold a reference to CtranIbSingleton to ensure proper destruction order.
+  // By holding this shared_ptr, we guarantee CtranIbSingleton stays alive
+  // as long as RegCache exists, preventing use-after-free during
+  // deregistration.
+  std::shared_ptr<CtranIbSingleton> ibSingleton_;
+
+  // Global backends configuration, initialized from NCCL_CTRAN_BACKENDS in
+  // init().
+  std::vector<bool> globalBackends_;
+
   // AVL tree based segment cache
   folly::Synchronized<CtranAvlTree> segmentsAvl_;
   class RegElemMaps {
@@ -438,6 +527,22 @@ class RegCache {
 
   // Thread-safe function to search given <ptr, len> range in regElem cache.
   regcache::RegElem* searchRegElem(const void* ptr, const size_t len);
+
+  // Helper function to perform backend registration for a set of segments.
+  // Creates a RegElem, registers with backends, and updates regElemsMaps.
+  // Caller must hold segmentsAvl lock (for thread safety with segment
+  // pointers). This function acquires regElemsMaps_ lock internally.
+  //
+  // Returns commSuccess on success, or error code on failure.
+  // On success, *regHdl is set to the created RegElem pointer.
+  commResult_t registerSegmentsTogether(
+      void* ptr,
+      size_t len,
+      int cudaDev,
+      std::vector<regcache::Segment*>& segments,
+      const std::vector<bool>& backends,
+      bool ncclManaged,
+      regcache::RegElem** regHdl);
 
   commResult_t deregElem(regcache::RegElem* regElem);
 };

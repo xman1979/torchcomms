@@ -18,7 +18,7 @@ __device__ __forceinline__ void sendImpl(
   for (auto i = 0; i < numSends; i++) {
     const auto nbytes = sends[i].nbytes;
     const auto peerLocalRank = sends[i].peerLocalRank;
-    nvlTransportsBase[peerLocalRank].send(group, sends[i].buff, nbytes);
+    nvlTransportsBase[peerLocalRank].send_group(group, sends[i].buff, nbytes);
   }
 }
 
@@ -30,11 +30,11 @@ __device__ __forceinline__ void recvImpl(
   for (auto i = 0; i < numRecvs; i++) {
     const auto nbytes = recvs[i].nbytes;
     const auto peerLocalRank = recvs[i].peerLocalRank;
-    nvlTransportsBase[peerLocalRank].recv(group, recvs[i].buff, nbytes);
+    nvlTransportsBase[peerLocalRank].recv_group(group, recvs[i].buff, nbytes);
   }
 }
 
-__global__ void ncclKernelSendRecvP2p(
+__global__ __launch_bounds__(512, 1) void ncclKernelSendRecvP2p(
     int* flag,
     CtranAlgoDeviceState* devState, // TODO: this is not needed for now, but
                                     // maybe needed for fault-tolerance

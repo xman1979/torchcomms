@@ -9,6 +9,7 @@ import unittest
 import torch
 from torchcomms.tests.integration.py.TorchCommTestHelpers import (
     get_dtype_name,
+    is_full_sweep,
     TorchCommTestWrapper,
 )
 
@@ -17,8 +18,8 @@ class AllGatherVTest(unittest.TestCase):
     """Test class for all_gather_v operations in TorchComm."""
 
     # Class variables for test parameters
-    counts = [0, 4, 1024, 1024 * 1024]
-    dtypes = [torch.float, torch.int, torch.int8]
+    counts = [0, 4, 1024, 1024 * 1024] if is_full_sweep() else [4, 1024 * 1024]
+    dtypes = [torch.float, torch.int, torch.int8] if is_full_sweep() else [torch.float]
     num_replays = 4
 
     def get_wrapper(self):
@@ -39,8 +40,8 @@ class AllGatherVTest(unittest.TestCase):
         self.wrapper = None
 
     @unittest.skipIf(
-        os.getenv("TEST_BACKEND") != "ncclx",
-        "Skipping all_gather_v test for non-NCCLX backend",
+        os.getenv("TEST_BACKEND") not in ["ncclx", "xccl"],
+        f"Skipping all_gather_v test for {os.getenv('TEST_BACKEND')} backend",
     )
     def _sync_all_gather_v(self, count, dtype):
         """Test synchronous all_gather_v with work object."""
@@ -103,8 +104,8 @@ class AllGatherVTest(unittest.TestCase):
                 )
 
     @unittest.skipIf(
-        os.getenv("TEST_BACKEND") != "ncclx",
-        "Skipping all_gather_v test for non-NCCLX backends",
+        os.getenv("TEST_BACKEND") not in ["ncclx", "xccl"],
+        f"Skipping all_gather_v test for {os.getenv('TEST_BACKEND')} backend",
     )
     def test_sync_all_gather_v(self):
         """Test synchronous all_gather with work object."""

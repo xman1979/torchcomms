@@ -13,6 +13,10 @@ cudaError_t DefaultCudaApi::setDevice(int device) {
   return cudaSetDevice(device);
 }
 
+cudaError_t DefaultCudaApi::getDevice(int* device) {
+  return cudaGetDevice(device);
+}
+
 cudaError_t DefaultCudaApi::getDeviceProperties(
     cudaDeviceProp* prop,
     int device) {
@@ -89,6 +93,19 @@ cudaError_t DefaultCudaApi::graphRetainUserObject(
   return cudaGraphRetainUserObject(graph, object, count, flags);
 }
 
+cudaError_t DefaultCudaApi::userObjectRelease(
+    cudaUserObject_t object,
+    unsigned int count) {
+  return cudaUserObjectRelease(object, count);
+}
+
+cudaError_t DefaultCudaApi::launchHostFunc(
+    cudaStream_t stream,
+    cudaHostFn_t fn,
+    void* userData) {
+  return cudaLaunchHostFunc(stream, fn, userData);
+}
+
 cudaError_t DefaultCudaApi::streamGetCaptureInfo_v2(
     cudaStream_t stream,
     cudaStreamCaptureStatus* captureStatus_out,
@@ -119,6 +136,15 @@ cudaError_t DefaultCudaApi::streamGetCaptureInfo_v2(
 cudaError_t DefaultCudaApi::threadExchangeStreamCaptureMode(
     enum cudaStreamCaptureMode* mode) {
   return cudaThreadExchangeStreamCaptureMode(mode);
+}
+
+cudaError_t
+DefaultCudaApi::hostAlloc(void** pHost, size_t size, unsigned int flags) {
+  return cudaHostAlloc(pHost, size, flags);
+}
+
+cudaError_t DefaultCudaApi::hostFree(void* ptr) {
+  return cudaFreeHost(ptr);
 }
 
 cudaError_t DefaultCudaApi::malloc(void** devPtr, size_t size) {
@@ -164,6 +190,13 @@ cudaError_t DefaultCudaApi::eventRecord(
     cudaEvent_t event,
     cudaStream_t stream) {
   return cudaEventRecord(event, stream);
+}
+
+cudaError_t DefaultCudaApi::eventRecordWithFlags(
+    cudaEvent_t event,
+    cudaStream_t stream,
+    unsigned int flags) {
+  return cudaEventRecordWithFlags(event, stream, flags);
 }
 
 cudaError_t DefaultCudaApi::eventQuery(cudaEvent_t event) {

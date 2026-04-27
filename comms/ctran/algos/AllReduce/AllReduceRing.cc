@@ -1,6 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include <algorithm>
 #include <chrono>
+#include <mutex>
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -15,48 +17,133 @@
 #include "comms/ctran/CtranComm.h"
 
 #include "comms/ctran/algos/AllReduce/AllReduceImpl.h"
+#include "comms/ctran/algos/AllReduce/AllReduceRingAutoTune.h"
 #include "comms/ctran/algos/AllReduce/AllReduceRingCommon.cuh"
+#include "comms/ctran/algos/AllReduce/Types.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/CtranAlgoConsts.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/profiler/Profiler.h"
+#include "comms/ctran/utils/CudaUtils.h"
 #include "comms/utils/commSpecs.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 #include "comms/utils/logger/LogUtils.h"
 
-CTRAN_DATATYPE_REDOP_TO_FUNC_MAPPER(typeToFunc, ncclKernelAllReduceCtranRing);
+// Helper macro for 3-arg template kernel function map entries
+#define CTRAN_RING_REDOP_FUNCMAP(dtype, type, bidir)               \
+  {std::make_pair(dtype, commSum),                                 \
+   reinterpret_cast<const void*>(                                  \
+       &ncclKernelAllReduceCtranRing<type, commSum, bidir>)},      \
+      {std::make_pair(dtype, commProd),                            \
+       reinterpret_cast<const void*>(                              \
+           &ncclKernelAllReduceCtranRing<type, commProd, bidir>)}, \
+      {std::make_pair(dtype, commAvg),                             \
+       reinterpret_cast<const void*>(                              \
+           &ncclKernelAllReduceCtranRing<type, commAvg, bidir>)},  \
+      {std::make_pair(dtype, commMax),                             \
+       reinterpret_cast<const void*>(                              \
+           &ncclKernelAllReduceCtranRing<type, commMax, bidir>)},  \
+  {                                                                \
+    std::make_pair(dtype, commMin),                                \
+        reinterpret_cast<const void*>(                             \
+            &ncclKernelAllReduceCtranRing<type, commMin, bidir>)   \
+  }
+
+// Bi-directional AG kernel map (EnableBidirAg=true)
+static const std::unordered_map<
+    std::pair<commDataType_t, commRedOp_t>,
+    const void*,
+    CtranPairHash>
+    typeToFuncBidir = {
+        CTRAN_RING_REDOP_FUNCMAP(commInt8, int8_t, true),
+        CTRAN_RING_REDOP_FUNCMAP(commUint8, uint8_t, true),
+        CTRAN_RING_REDOP_FUNCMAP(commInt32, int32_t, true),
+        CTRAN_RING_REDOP_FUNCMAP(commUint32, uint32_t, true),
+        CTRAN_RING_REDOP_FUNCMAP(commInt64, int64_t, true),
+        CTRAN_RING_REDOP_FUNCMAP(commUint64, uint64_t, true),
+        CTRAN_RING_REDOP_FUNCMAP(commFloat16, half, true),
+        CTRAN_RING_REDOP_FUNCMAP(commFloat32, float, true),
+        CTRAN_RING_REDOP_FUNCMAP(commFloat64, double, true),
+#if defined(__CUDA_BF16_TYPES_EXIST__)
+        CTRAN_RING_REDOP_FUNCMAP(commBfloat16, __nv_bfloat16, true),
+#endif
+};
+
+// Simple kernel map (EnableBidirAg=false, lower register usage)
+static const std::unordered_map<
+    std::pair<commDataType_t, commRedOp_t>,
+    const void*,
+    CtranPairHash>
+    typeToFuncSimple = {
+        CTRAN_RING_REDOP_FUNCMAP(commInt8, int8_t, false),
+        CTRAN_RING_REDOP_FUNCMAP(commUint8, uint8_t, false),
+        CTRAN_RING_REDOP_FUNCMAP(commInt32, int32_t, false),
+        CTRAN_RING_REDOP_FUNCMAP(commUint32, uint32_t, false),
+        CTRAN_RING_REDOP_FUNCMAP(commInt64, int64_t, false),
+        CTRAN_RING_REDOP_FUNCMAP(commUint64, uint64_t, false),
+        CTRAN_RING_REDOP_FUNCMAP(commFloat16, half, false),
+        CTRAN_RING_REDOP_FUNCMAP(commFloat32, float, false),
+        CTRAN_RING_REDOP_FUNCMAP(commFloat64, double, false),
+#if defined(__CUDA_BF16_TYPES_EXIST__)
+        CTRAN_RING_REDOP_FUNCMAP(commBfloat16, __nv_bfloat16, false),
+#endif
+};
+
+namespace {
+
+commResult_t getGpuArch(ctran::allreduce::ring::GpuArch* arch) {
+  *arch = ctran::allreduce::ring::GpuArch::Default;
+  int cudaDev = 0;
+  FB_CUDACHECK(cudaGetDevice(&cudaDev));
+  auto cudaArch = ctran::utils::getCudaArch(cudaDev);
+  if (!cudaArch.hasValue()) {
+    CLOGF(ERR, "{}", cudaArch.error());
+    return commUnhandledCudaError;
+  }
+  if (cudaArch.value() < 1000) {
+    *arch = ctran::allreduce::ring::GpuArch::Hopper;
+  }
+  return commSuccess;
+}
+
+} // namespace
 
 namespace ctran::allreduce::ring {
 
-struct HostArgs {
-  int32_t rank{-1};
-  int32_t leftRank{-1};
-  int32_t rightRank{-1};
+// Check if bi-directional AllGather should be enabled based on CVAR and
+// message size.
+// Returns true if bidir AG should be used, false for simple kernel.
+//
+// CVAR values:
+//   0  = disabled
+//  -1  = enabled for all sizes
+//  -2  = auto-tune per GPU architecture (GB200: 128MB, H100: 4MB)
+//  >0  = enabled for messages up to that size in bytes
+inline bool shouldEnableBidirAg(size_t messageBytes, GpuArch arch) {
+  int64_t maxSize = NCCL_CTRAN_ALLREDUCE_RING_BIDIR_AG_MAX_SIZE;
+  if (maxSize == 0) {
+    // Explicitly disabled
+    return false;
+  }
+  if (maxSize == -1) {
+    // Enable for all sizes
+    return true;
+  }
+  if (maxSize == -2) {
+    // Auto-tune: select threshold based on GPU architecture
+    maxSize = (arch == GpuArch::Hopper)
+        ? static_cast<int64_t>(kHopperBidirAgMaxSize)
+        : static_cast<int64_t>(kDefaultBidirAgMaxSize);
+  }
+  if (maxSize < 0) {
+    // Any other negative value: treat as enabled for all sizes
+    return true;
+  }
+  // Enable only for messages up to maxSize
+  return messageBytes <= static_cast<size_t>(maxSize);
+}
 
-  size_t minShardSize{0};
-
-  unsigned int numBlocks{0};
-  unsigned int numThreads{0};
-
-  // Remote receive buffer on right
-  void* rightRemBuf{nullptr};
-  CtranMapperRemoteAccessKey rightRemKey;
-
-  // Local receive buffer notify from left
-  std::unique_ptr<CtranMapperNotify> leftNotify{nullptr};
-};
-struct HostResource {
-  CtranComm* comm{nullptr};
-
-  ctran::algos::GpeKernelSync* sendCopySync{nullptr};
-  ctran::algos::GpeKernelSync* recvRedCopySync{nullptr};
-  ctran::algos::GpeKernelSync* partitionSync{nullptr};
-
-  size_t chunkSize{0};
-  size_t numChunks{0};
-  void* tmpSendBuf{nullptr};
-  void* tmpSendBufHdl{nullptr};
-  void* tmpRecvBuf{nullptr};
-  void* tmpRecvBufHdl{nullptr};
-};
+// HostArgs and HostResource are defined in AllReduce/Types.h
 
 namespace {
 
@@ -246,9 +333,8 @@ inline void progressSendPostTrans(
   char* tmpSendBuf = reinterpret_cast<char*>(resource.tmpSendBuf) +
       tmpChunkId * algoCtx.chunkSize;
 
-  // Get allreduce specific IB config
-  static thread_local auto allReduceConfig =
-      resource.comm->ctran_->algo->getCollToVcConfig(CollType::ALLREDUCE);
+  CtranIbConfig* allReduceConfig =
+      resource.ibConfig ? &*resource.ibConfig : nullptr;
 
   CtranMapperRequest* req;
   FB_COMMCHECKTHROW_EX(
@@ -536,6 +622,303 @@ inline void progressRecv(
   }
 }
 
+// ===== Reverse direction progress functions for bi-directional AllGather =====
+
+inline void prePostRevRecvRemRecvBuf(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revBufSyncRResps) {
+  int totalRounds = algoCtx.opRounds[Op::kRevSendTrans].totalRounds;
+  if (totalRounds == 0)
+    return;
+
+  // Pre-post recvCtrls to receive postRecvBuf sync from left neighbor
+  revBufSyncRResps.resize(totalRounds);
+  for (int round = 0; round < totalRounds; round++) {
+    CtranMapperRequest* req;
+    FB_COMMCHECKTHROW_EX(
+        resource.comm->ctran_->mapper->irecvCtrl(args.leftRank, &req),
+        resource.comm->logMetaData_);
+    revBufSyncRResps.at(round).reset(req);
+  }
+}
+
+inline bool progressRevSendCheckSendBuf(const AlgoContext& algoCtx) {
+  int round = algoCtx.opRounds[Op::kRevSendCopy].post;
+  if (round < algoCtx.numChunks)
+    return true;
+  int prevRound = round - algoCtx.numChunks;
+  return algoCtx.opRounds[Op::kRevSendTrans].done > prevRound;
+}
+
+inline void progressRevSendPostCopyKern(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx) {
+  int round = algoCtx.opRounds[Op::kRevSendCopy].post;
+  resource.revSendCopySync->post(round);
+}
+
+inline bool progressRevSendCheckCopyKern(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx) {
+  int round = algoCtx.opRounds[Op::kRevSendCopy].done;
+  return resource.revSendCopySync->isComplete(round);
+}
+
+inline bool progressRevSendCheckRemRecvBuf(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revBufSyncRResps) {
+  int round = algoCtx.opRounds[Op::kRevSendTrans].post;
+  int prevRound = round - algoCtx.numChunks;
+  if (prevRound < 0)
+    return true;
+
+  auto& resp = revBufSyncRResps.at(prevRound);
+  FB_CHECKTHROW_EX(
+      resp != nullptr,
+      resource.comm->logMetaData_,
+      fmt::format(
+          "revBufSyncRResps is not initialized at round {}", prevRound));
+  bool isComplete = false;
+  FB_COMMCHECKTHROW_EX(
+      resource.comm->ctran_->mapper->testRequest(resp.get(), &isComplete),
+      resource.comm->logMetaData_);
+  return isComplete;
+}
+
+inline void progressRevSendPostTrans(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revDataSResps) {
+  int round = algoCtx.opRounds[Op::kRevSendTrans].post;
+  auto& opStep = algoCtx.opRounds[Op::kRevSendTrans].postStep;
+
+  int tmpChunkId = getTmpChunkId(algoCtx, round);
+  auto chunkArg = getRevRoundArgs<Op::kRevSendTrans>(algoCtx, round, opStep);
+  FB_CHECKTHROW_EX(
+      chunkArg.numel > 0,
+      resource.comm->logMetaData_,
+      "Unexpected empty chunk in rev send");
+
+  // iput to left neighbor's tmpRecvBufRev
+  char* tmpRemoteRecvBufRev = reinterpret_cast<char*>(args.leftRemBufRev) +
+      tmpChunkId * algoCtx.chunkSize;
+  char* tmpSendBufRev = reinterpret_cast<char*>(resource.tmpSendBufRev) +
+      tmpChunkId * algoCtx.chunkSize;
+
+  CtranIbConfig* allReduceConfig =
+      resource.ibConfig ? &*resource.ibConfig : nullptr;
+
+  CtranMapperRequest* req;
+  FB_COMMCHECKTHROW_EX(
+      resource.comm->ctran_->mapper->iput(
+          tmpSendBufRev,
+          tmpRemoteRecvBufRev,
+          chunkArg.numel * algoCtx.typeSize,
+          args.leftRank,
+          CtranMapperConfig{
+              .memHdl_ = resource.tmpSendBufRevHdl,
+              .remoteAccessKey_ = args.leftRemKeyRev,
+              .notify_ = true,
+              .ibConfig_ = allReduceConfig},
+          &req),
+      resource.comm->logMetaData_);
+  revDataSResps.at(round).reset(req);
+}
+
+inline void progressRevSendCheckTrans(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revDataSResps) {
+  int startRound = algoCtx.opRounds[Op::kRevSendTrans].done;
+  int lastRound = algoCtx.opRounds[Op::kRevSendTrans].post;
+  for (int r = startRound; r < lastRound; r++) {
+    auto& resp = revDataSResps.at(r);
+    if (resp) {
+      bool isComplete = false;
+      FB_COMMCHECKTHROW_EX(
+          resource.comm->ctran_->mapper->testRequest(resp.get(), &isComplete),
+          resource.comm->logMetaData_);
+      if (isComplete) {
+        opUpdateDone<Op::kRevSendTrans>(algoCtx);
+      }
+    }
+  }
+}
+
+inline bool progressRevRecvCheckTrans(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx) {
+  bool done = false;
+  FB_COMMCHECKTHROW_EX(
+      resource.comm->ctran_->mapper->checkNotify(args.rightNotify.get(), &done),
+      resource.comm->logMetaData_);
+  return done;
+}
+
+inline void progressRevRecvPostFlush(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revFlushResps) {
+  int round = algoCtx.opRounds[Op::kRevRecvFlush].post;
+  int tmpChunkId = getTmpChunkId(algoCtx, round);
+  char* tmpRecvBufRev = reinterpret_cast<char*>(resource.tmpRecvBufRev) +
+      tmpChunkId * algoCtx.chunkSize;
+
+  CtranMapperRequest* req = nullptr;
+  FB_COMMCHECKTHROW_EX(
+      resource.comm->ctran_->mapper->iflush(
+          tmpRecvBufRev, resource.tmpRecvBufRevHdl, &req),
+      resource.comm->logMetaData_);
+  revFlushResps.at(round).reset(req);
+}
+
+inline bool progressRevRecvCheckFlush(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revFlushResps) {
+  int round = algoCtx.opRounds[Op::kRevRecvFlush].done;
+  auto& resp = revFlushResps.at(round);
+  FB_CHECKTHROW_EX(
+      resp != nullptr,
+      resource.comm->logMetaData_,
+      fmt::format("Rev flush resp is not initialized at round {}", round));
+  bool isComplete = false;
+  FB_COMMCHECKTHROW_EX(
+      resource.comm->ctran_->mapper->testRequest(resp.get(), &isComplete),
+      resource.comm->logMetaData_);
+  return isComplete;
+}
+
+inline bool progressRevRecvCheckSendBuf(const AlgoContext& algoCtx) {
+  int round = algoCtx.opRounds[Op::kRevRecvCopy].post;
+  int step = algoCtx.opRounds[Op::kRevRecvCopy].postStep.step;
+  if (!isRevRecvFwd(algoCtx, step))
+    return true;
+
+  // The rev recv copy also copies to tmpSendBufRev for forwarding.
+  // The corresponding send round is firstRevShardChunks + round.
+  int firstRevShardChunks = algoCtx.opRounds[Op::kRevSendCopy].totalRounds;
+  int fwdRound = firstRevShardChunks + round;
+  int prevRound = fwdRound - algoCtx.numChunks;
+  return algoCtx.opRounds[Op::kRevSendTrans].done > prevRound;
+}
+
+inline void progressRevRecvPostCopyKern(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx) {
+  int round = algoCtx.opRounds[Op::kRevRecvCopy].post;
+  resource.revRecvCopySync->post(round);
+}
+
+inline bool progressRevRecvCheckCopyKern(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx) {
+  int round = algoCtx.opRounds[Op::kRevRecvCopy].done;
+  return resource.revRecvCopySync->isComplete(round);
+}
+
+inline void progressRevRecvPostRecvBuf(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    const AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revBufSyncSResps) {
+  int round = algoCtx.opRounds[Op::kRevRecvCopy].done;
+
+  CtranMapperRequest* req;
+  FB_COMMCHECKTHROW_EX(
+      resource.comm->ctran_->mapper->isendCtrl(args.rightRank, &req),
+      resource.comm->logMetaData_);
+  revBufSyncSResps.at(round).reset(req);
+}
+
+inline void progressRevSend(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revDataSResps,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revBufSyncRResps) {
+  if (algoCtx.numRevAgSteps == 0)
+    return;
+
+  if (opReadyToPost<Op::kRevSendCopy>(algoCtx) &&
+      progressRevSendCheckSendBuf(algoCtx)) {
+    progressRevSendPostCopyKern(args, resource, algoCtx);
+    opUpdatePost<Op::kRevSendCopy>(algoCtx);
+  }
+
+  if (opHasPosted<Op::kRevSendCopy>(algoCtx) &&
+      progressRevSendCheckCopyKern(args, resource, algoCtx)) {
+    opUpdateDone<Op::kRevSendCopy>(algoCtx);
+  }
+
+  if (opReadyToPost<Op::kRevSendTrans>(algoCtx)) {
+    if (progressRevSendCheckRemRecvBuf(
+            args, resource, algoCtx, revBufSyncRResps)) {
+      progressRevSendPostTrans(args, resource, algoCtx, revDataSResps);
+      opUpdatePost<Op::kRevSendTrans>(algoCtx);
+    }
+  }
+
+  progressRevSendCheckTrans(args, resource, algoCtx, revDataSResps);
+}
+
+inline void progressRevRecv(
+    const ctran::allreduce::ring::HostArgs& args,
+    ctran::allreduce::ring::HostResource& resource,
+    AlgoContext& algoCtx,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revBufSyncSResps,
+    std::vector<std::unique_ptr<CtranMapperRequest>>& revFlushResps) {
+  if (algoCtx.numRevAgSteps == 0)
+    return;
+
+  if (opReadyToPost<Op::kRevRecvTrans>(algoCtx) &&
+      progressRevRecvCheckTrans(args, resource, algoCtx)) {
+    opUpdatePost<Op::kRevRecvTrans>(algoCtx);
+    opUpdateDone<Op::kRevRecvTrans>(algoCtx);
+  }
+
+  if (opReadyToPost<Op::kRevRecvFlush>(algoCtx)) {
+    progressRevRecvPostFlush(args, resource, algoCtx, revFlushResps);
+    opUpdatePost<Op::kRevRecvFlush>(algoCtx);
+  }
+
+  if (opHasPosted<Op::kRevRecvFlush>(algoCtx)) {
+    if (progressRevRecvCheckFlush(args, resource, algoCtx, revFlushResps)) {
+      opUpdateDone<Op::kRevRecvFlush>(algoCtx);
+    }
+  }
+
+  if (opReadyToPost<Op::kRevRecvCopy>(algoCtx)) {
+    int step = algoCtx.opRounds[Op::kRevRecvCopy].postStep.step;
+    if (!isRevRecvFwd(algoCtx, step) || progressRevRecvCheckSendBuf(algoCtx)) {
+      progressRevRecvPostCopyKern(args, resource, algoCtx);
+      opUpdatePost<Op::kRevRecvCopy>(algoCtx);
+    }
+  }
+
+  if (opHasPosted<Op::kRevRecvCopy>(algoCtx)) {
+    if (progressRevRecvCheckCopyKern(args, resource, algoCtx)) {
+      progressRevRecvPostRecvBuf(args, resource, algoCtx, revBufSyncSResps);
+      opUpdateDone<Op::kRevRecvCopy>(algoCtx);
+    }
+  }
+}
+
+// ===== End reverse direction progress functions =====
+
 inline int waitAllResps(
     std::vector<std::unique_ptr<CtranMapperRequest>>& reqs,
     CtranComm* comm,
@@ -555,7 +938,11 @@ inline void updatePartitionCtxHost(
     const ctran::allreduce::ring::HostArgs& args,
     ctran::allreduce::ring::HostResource& resource,
     AlgoContext& algoCtx) {
-  updatePartitionCtx(algoCtx);
+  if (args.enableBidirAg) {
+    updatePartitionCtx<true>(algoCtx);
+  } else {
+    updatePartitionCtx<false>(algoCtx);
+  }
   if (algoCtx.partition > 0) {
     // Sync with kernel to start the new partition if not the first one.
     resource.partitionSync->post(algoCtx.partition);
@@ -566,12 +953,15 @@ inline void exchangePeerTmpBufs(
     CtranComm* comm,
     ctran::allreduce::ring::HostArgs& args) {
   // complete resource setup for ones needing the EpochLock
+  // Capture both right (for forward) and left (for reverse) remote buf info
   if (comm->statex_->rank() % 2 == 0) {
     std::tie(args.rightRemBuf, args.rightRemKey) =
         comm->ctran_->algo->getRemoteTmpBufInfo(args.rightRank);
-    comm->ctran_->algo->getRemoteTmpBufInfo(args.leftRank);
+    std::tie(args.leftRemBufRev, args.leftRemKeyRev) =
+        comm->ctran_->algo->getRemoteTmpBufInfo(args.leftRank);
   } else {
-    comm->ctran_->algo->getRemoteTmpBufInfo(args.leftRank);
+    std::tie(args.leftRemBufRev, args.leftRemKeyRev) =
+        comm->ctran_->algo->getRemoteTmpBufInfo(args.leftRank);
     std::tie(args.rightRemBuf, args.rightRemKey) =
         comm->ctran_->algo->getRemoteTmpBufInfo(args.rightRank);
   }
@@ -583,6 +973,7 @@ inline commResult_t completeHostResourceSetup(
     ctran::allreduce::ring::HostResource& resource) {
   exchangePeerTmpBufs(comm, args);
 
+  // Forward: notifications from left on tmpRecvBuf
   args.leftNotify.reset(new CtranMapperNotify());
   FB_COMMCHECK(comm->ctran_->mapper->initNotify(
       args.leftRank, resource.tmpRecvBufHdl, args.leftNotify.get()));
@@ -591,15 +982,72 @@ inline commResult_t completeHostResourceSetup(
       CtranAlgo::TmpbufType::RING_TMP_RECV_BUF);
   args.rightRemBuf = (char*)args.rightRemBuf + offsetRingTmpRecv;
 
+  // Reverse: notifications from right on tmpRecvBufRev
+  args.rightNotify.reset(new CtranMapperNotify());
+  FB_COMMCHECK(comm->ctran_->mapper->initNotify(
+      args.rightRank, resource.tmpRecvBufRevHdl, args.rightNotify.get()));
+
+  // Point leftRemBufRev to left neighbor's tmpRecvBufRev segment
+  size_t offsetRingTmpRecvRev = comm->ctran_->algo->getTmpBufOffset(
+      CtranAlgo::TmpbufType::RING_TMP_RECV_BUF_REV);
+  args.leftRemBufRev = (char*)args.leftRemBufRev + offsetRingTmpRecvRev;
+
   return commSuccess;
 }
 
 } // namespace
 
-#define HOST_ABORT()                                                \
-  if (comm->testAbort()) {                                          \
-    throw ctran::utils::Exception("comm aborted", commRemoteError); \
+#define HOST_ABORT(desc)                                                     \
+  if (comm->testAbort()) {                                                   \
+    auto _abort = comm->getAbort();                                          \
+    std::string _ctx =                                                       \
+        _abort->TimedOut() ? "comm aborted due to timeout" : "comm aborted"; \
+    throw ctran::utils::Exception(                                           \
+        _ctx,                                                                \
+        commRemoteError,                                                     \
+        comm->logMetaData_.rank,                                             \
+        comm->logMetaData_.commHash,                                         \
+        std::string(desc));                                                  \
   }
+
+// Dedicated ctrl exchange for straggler detection, separate from the data
+// credit flow. Each rank signals "I'm ready" to both ring neighbors and waits
+// for both to signal back. The measured duration captures pure setup latency
+// (how long until the slowest neighbor is ready) with no data transfer noise.
+static void neighborReadinessBarrier(
+    CtranComm* comm,
+    const ctran::allreduce::ring::HostArgs& args) {
+  CtranMapperRequest recvFromRight;
+  CtranMapperRequest recvFromLeft;
+  CtranMapperRequest sendToLeft;
+  CtranMapperRequest sendToRight;
+
+  // Post receives first to avoid missed signals
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->irecvCtrl(args.rightRank, &recvFromRight),
+      comm->logMetaData_);
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->irecvCtrl(args.leftRank, &recvFromLeft),
+      comm->logMetaData_);
+
+  // Signal both neighbors
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->isendCtrl(args.leftRank, &sendToLeft),
+      comm->logMetaData_);
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->isendCtrl(args.rightRank, &sendToRight),
+      comm->logMetaData_);
+
+  // Wait for peer readiness
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->waitRequest(&recvFromRight), comm->logMetaData_);
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->waitRequest(&recvFromLeft), comm->logMetaData_);
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->waitRequest(&sendToLeft), comm->logMetaData_);
+  FB_COMMCHECKTHROW_EX(
+      comm->ctran_->mapper->waitRequest(&sendToRight), comm->logMetaData_);
+}
 
 static commResult_t impl(
     const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
@@ -609,16 +1057,27 @@ static commResult_t impl(
   CtranComm* comm = opGroup.front()->comm_;
   CtranAlgoLogger logger(allReduceAlgoName(myAlgo), op->opCount, comm);
 
-  using HostArgs = ctran::allreduce::ring::HostArgs;
-  using HostResource = ctran::allreduce::ring::HostResource;
-  auto argsGuard = std::unique_ptr<HostArgs>(
-      reinterpret_cast<HostArgs*>(op->allreduce.args));
-  auto resourceGuard = std::unique_ptr<HostResource>(
-      reinterpret_cast<HostResource*>(op->allreduce.resource));
-  auto& args = *argsGuard;
-  auto& resource = *resourceGuard;
+  ctran::Profiler* profiler = comm->ctran_->profiler.get();
+  if (profiler) {
+    profiler->initForEachColl(
+        op->opCount, NCCL_CTRAN_ALGO_PROFILING_SAMPLING_WEIGHT);
+  }
 
-  FB_COMMCHECK(completeHostResourceSetup(comm, args, resource));
+  // hostArgs/hostResource are direct members of OpElem — owned by OpElem,
+  // destroyed when OpElem is destroyed (after single impl() in eager mode,
+  // when graph is destroyed in CUDA graph persistent mode).
+  auto& args = op->allreduce.hostArgs;
+  auto& resource = op->allreduce.hostResource;
+
+  CTRAN_PROFILER_IF(
+      profiler, profiler->startEvent(ctran::ProfilerEvent::ALGO_CTRL));
+  if (!resource.setupComplete) {
+    FB_COMMCHECK(completeHostResourceSetup(comm, args, resource));
+    resource.setupComplete = true;
+  }
+  neighborReadinessBarrier(comm, args);
+  CTRAN_PROFILER_IF(
+      profiler, profiler->endEvent(ctran::ProfilerEvent::ALGO_CTRL));
 
   // setup algoCtx
   AlgoContext algoCtx = {
@@ -632,21 +1091,31 @@ static commResult_t impl(
   };
   setupAlgoCtxImpl(algoCtx);
 
+  const size_t messageSize =
+      op->allreduce.count * commTypeSize(op->allreduce.datatype);
+  CTRAN_PROFILER_IF(profiler, {
+    auto& algoContext = profiler->algoContext;
+    algoContext.algorithmName = allReduceAlgoName(myAlgo);
+    algoContext.sendContext.totalBytes = messageSize;
+    algoContext.sendContext.messageSizes = std::to_string(messageSize);
+    algoContext.recvContext.totalBytes = messageSize;
+    algoContext.recvContext.messageSizes = std::to_string(messageSize);
+  });
+
+  // Forward direction request vectors
   std::vector<std::unique_ptr<CtranMapperRequest>> dataSResps;
-  // - Responses for sync control send to left neighbor. Need wait for a
-  // previous response to finish when want to post the same recvBuf chunk.
   std::vector<std::unique_ptr<CtranMapperRequest>> bufSyncSResps;
-  // - Responses for sync control recv from right neighbor. Need wait for a
-  // previous recvCtrl to finish when want to post irecvCtrl for the same
-  // remote recvBuf chunk.
   std::vector<std::unique_ptr<CtranMapperRequest>> bufSyncRResps;
-  // - Responses for local flush received data.
   std::vector<std::unique_ptr<CtranMapperRequest>> flushResps;
 
-  // Split data into 1~N partitions, each partition is up to chunkSize *
-  // numChunks * contextSize bytes. For each partition, we perform a
-  // ReduceScatter phase and an AllGather phase to complete the transfer before
-  // we move to next partition.
+  // Reverse direction request vectors
+  std::vector<std::unique_ptr<CtranMapperRequest>> revDataSResps;
+  std::vector<std::unique_ptr<CtranMapperRequest>> revBufSyncSResps;
+  std::vector<std::unique_ptr<CtranMapperRequest>> revBufSyncRResps;
+  std::vector<std::unique_ptr<CtranMapperRequest>> revFlushResps;
+
+  CTRAN_PROFILER_IF(
+      profiler, profiler->startEvent(ctran::ProfilerEvent::ALGO_DATA));
   while (algoCtx.partitionOffset < algoCtx.numElements) {
     updatePartitionCtxHost(args, resource, algoCtx);
     CLOGF_TRACE(
@@ -657,23 +1126,35 @@ static commResult_t impl(
     int totalSendTrans = algoCtx.opRounds[Op::kSendTrans].totalRounds;
     int totalRecvTrans = algoCtx.opRounds[Op::kRecvTrans].totalRounds;
     dataSResps.resize(totalSendTrans);
-    // - Responses for sync control send to left neighbor. Need wait for a
-    // previous response to finish when want to post the same recvBuf chunk.
     bufSyncSResps.resize(totalRecvTrans);
-    // - Responses for sync control recv from right neighbor. Need wait for a
-    // previous recvCtrl to finish when want to post irecvCtrl for the same
-    // remote recvBuf chunk.
     bufSyncRResps.resize(totalSendTrans);
-    // - Responses for local flush received data.
     flushResps.resize(totalRecvTrans);
 
-    prePostRecvRemRecvBuf(args, resource, algoCtx, bufSyncRResps);
+    int totalRevSendTrans = algoCtx.opRounds[Op::kRevSendTrans].totalRounds;
+    int totalRevRecvTrans = algoCtx.opRounds[Op::kRevRecvTrans].totalRounds;
+    revDataSResps.resize(totalRevSendTrans);
+    revBufSyncSResps.resize(totalRevRecvTrans);
+    revBufSyncRResps.resize(totalRevSendTrans);
+    revFlushResps.resize(totalRevRecvTrans);
 
-    // Ring main loop
-    while (algoCtx.opRounds[Op::kSendTrans].done <
-               algoCtx.opRounds[Op::kSendTrans].totalRounds ||
-           algoCtx.opRounds[Op::kRecvRedCopy].done <
-               algoCtx.opRounds[Op::kRecvRedCopy].totalRounds) {
+    prePostRecvRemRecvBuf(args, resource, algoCtx, bufSyncRResps);
+    prePostRevRecvRemRecvBuf(args, resource, algoCtx, revBufSyncRResps);
+
+    // Ring main loop: forward + reverse directions
+    auto fwdNotDone = [&]() {
+      return algoCtx.opRounds[Op::kSendTrans].done <
+          algoCtx.opRounds[Op::kSendTrans].totalRounds ||
+          algoCtx.opRounds[Op::kRecvRedCopy].done <
+          algoCtx.opRounds[Op::kRecvRedCopy].totalRounds;
+    };
+    auto revNotDone = [&]() {
+      return algoCtx.opRounds[Op::kRevSendTrans].done <
+          algoCtx.opRounds[Op::kRevSendTrans].totalRounds ||
+          algoCtx.opRounds[Op::kRevRecvCopy].done <
+          algoCtx.opRounds[Op::kRevRecvCopy].totalRounds;
+    };
+
+    while (fwdNotDone() || revNotDone()) {
       if (op->allreduce.datatype == commInt8 ||
           op->allreduce.datatype == commChar ||
           op->allreduce.datatype == commUint8 ||
@@ -695,62 +1176,110 @@ static commResult_t impl(
             commInvalidArgument);
       }
       progressSend(args, resource, algoCtx, dataSResps, bufSyncRResps);
-      HOST_ABORT();
       progressRecv(args, resource, algoCtx, bufSyncSResps, flushResps);
-      HOST_ABORT();
+      progressRevSend(args, resource, algoCtx, revDataSResps, revBufSyncRResps);
+      progressRevRecv(args, resource, algoCtx, revBufSyncSResps, revFlushResps);
+      HOST_ABORT(
+          fmt::format(
+              "ctring partition {}, rightPeer={}, leftPeer={}",
+              algoCtx.partition,
+              args.rightRank,
+              args.leftRank));
     }
 
     // Release any remaining resps before moving to next partition
-    int numDataSResps = waitAllResps(dataSResps, comm, "wait final dataSResps");
-    int numSyncSResps =
-        waitAllResps(bufSyncSResps, comm, "wait final bufSyncSResps");
-    int numSyncRResps =
-        waitAllResps(bufSyncRResps, comm, "wait final bufSyncRResps");
+    waitAllResps(dataSResps, comm, "wait final dataSResps");
+    waitAllResps(bufSyncSResps, comm, "wait final bufSyncSResps");
+    waitAllResps(bufSyncRResps, comm, "wait final bufSyncRResps");
+    waitAllResps(revDataSResps, comm, "wait final revDataSResps");
+    waitAllResps(revBufSyncSResps, comm, "wait final revBufSyncSResps");
+    waitAllResps(revBufSyncRResps, comm, "wait final revBufSyncRResps");
 
-    CLOGF_TRACE(
-        COLL,
-        "Partition {} offset {} numel {} finished with {} syncSResps {} syncRResps {} dataSResps",
-        algoCtx.partition,
-        algoCtx.partitionOffset,
-        algoCtx.partitionNumel,
-        numSyncSResps,
-        numSyncRResps,
-        numDataSResps);
-
-    // Reset flags for next partition to reuse.
-    // Kernel will wait for partitionSync update before checking the sync flags
-    // for the next partition.
+    // Reset flags for next partition to reuse
     resource.sendCopySync->resetStatus();
     resource.recvRedCopySync->resetStatus();
+    resource.revSendCopySync->resetStatus();
+    resource.revRecvCopySync->resetStatus();
 
-    // update local context
     updatePartitionDone(algoCtx);
-    HOST_ABORT();
+    HOST_ABORT(fmt::format("ctring after partition {}", algoCtx.partition));
   } // end of partition loop
+  CTRAN_PROFILER_IF(
+      profiler, profiler->endEvent(ctran::ProfilerEvent::ALGO_DATA));
 
-  // Reset flags for next allreduce to reuse
-  resource.sendCopySync->reset();
-  resource.recvRedCopySync->reset();
-  resource.partitionSync->reset();
+  CTRAN_PROFILER_IF(profiler, { profiler->reportToScuba(); });
+
+  // Reset flags for next allreduce to reuse. Only clear sync status (post/
+  // complete flags); do not release to pool (inuse stays true). Pool release
+  // happens in ~OpElem when the owning OpElem is destroyed, which for
+  // graph-captured operations occurs at graph destruction time.
+  resource.sendCopySync->resetStatus();
+  resource.recvRedCopySync->resetStatus();
+  resource.partitionSync->resetStatus();
+  resource.revSendCopySync->resetStatus();
+  resource.revRecvCopySync->resetStatus();
 
   return commSuccess;
 }
 
 commResult_t
 getNumBlocksAndThreads(int* numBlocks, int* numThreads, const void* func) {
-  // Allow user to customize thread block size if specified
   FB_CUDACHECK(cudaOccupancyMaxPotentialBlockSize(
       numBlocks,
       numThreads,
       func,
       0 /* dynamicSMemSize */,
       0 /* blockSizeLimit */));
-  if (*numBlocks > NCCL_CTRAN_ALLREDUCE_RING_MAX_NUM_THREAD_BLOCKS) {
-    *numBlocks = NCCL_CTRAN_ALLREDUCE_RING_MAX_NUM_THREAD_BLOCKS;
+
+  return commSuccess;
+}
+
+commResult_t getPipelineConfiguration(
+    size_t messageBytes,
+    int nRanks,
+    const void* func,
+    int* numBlocks,
+    int* numThreads,
+    size_t* pipelineNumChunks,
+    size_t* pipelineChunkSize,
+    bool log_decision,
+    size_t typeSize,
+    GpuArch arch,
+    CtranComm* comm,
+    std::optional<CtranIbConfig>* ibConfig) {
+  int cudaOccupancyNumBlocks, cudaOccupancyBlockSize;
+  FB_COMMCHECK(
+      ctran::allreduce::ring::getNumBlocksAndThreads(
+          &cudaOccupancyNumBlocks, &cudaOccupancyBlockSize, func));
+
+  if (log_decision) {
+    static std::once_flag logFlag;
+    std::call_once(logFlag, [&] {
+      ctran::allreduce::ring::logAutoTuneDecisions(
+          nRanks,
+          cudaOccupancyNumBlocks,
+          cudaOccupancyBlockSize,
+          typeSize,
+          arch);
+    });
   }
-  if (*numThreads > NCCL_CTRAN_ALLREDUCE_RING_THREAD_BLOCK_SIZE) {
-    *numThreads = NCCL_CTRAN_ALLREDUCE_RING_THREAD_BLOCK_SIZE;
-  }
+
+  auto params = ctran::allreduce::ring::getAutoTunedParams(
+      messageBytes,
+      nRanks,
+      cudaOccupancyNumBlocks,
+      cudaOccupancyBlockSize,
+      typeSize,
+      arch);
+  *pipelineChunkSize = params.pipeline.chunkSize;
+  *pipelineNumChunks = params.pipeline.numChunks;
+  *numBlocks = params.block.numBlocks;
+  *numThreads = params.block.blockSize;
+
+  *ibConfig = ctran::allreduce::ring::resolveIbConfig(
+      comm->ctran_->algo->getCollToVcConfig(CollType::ALLREDUCE),
+      arch,
+      params.pipeline.chunkSize);
 
   return commSuccess;
 }
@@ -810,6 +1339,16 @@ commResult_t ctranAllReduceRing(
   std::vector<std::unique_ptr<struct OpElem>> opGroup;
   std::unique_ptr<struct OpElem> op;
 
+  const size_t messageBytes = count * typeSize;
+
+  auto arch = ctran::allreduce::ring::GpuArch::Default;
+  FB_COMMCHECK(getGpuArch(&arch));
+
+  // Select kernel based on bi-directional AG CVAR and message size
+  const bool enableBidirAg =
+      ctran::allreduce::ring::shouldEnableBidirAg(messageBytes, arch);
+  const auto& typeToFunc = enableBidirAg ? typeToFuncBidir : typeToFuncSimple;
+
   FB_CHECKTHROW_EX(
       typeToFunc.contains(std::make_pair(datatype, redOp)),
       comm->logMetaData_,
@@ -821,9 +1360,24 @@ commResult_t ctranAllReduceRing(
 
   int numBlocks = 0;
   int numThreads = 0;
+  size_t pipelineChunkSize = 0;
+  size_t pipelineNumChunks = 0;
+  std::optional<CtranIbConfig> ibConfig;
+
   FB_COMMCHECK(
-      ctran::allreduce::ring::getNumBlocksAndThreads(
-          &numBlocks, &numThreads, func));
+      ctran::allreduce::ring::getPipelineConfiguration(
+          messageBytes,
+          nRanks,
+          func,
+          &numBlocks,
+          &numThreads,
+          &pipelineNumChunks,
+          &pipelineChunkSize,
+          /*log_decision=*/rank == 0,
+          typeSize,
+          arch,
+          comm,
+          &ibConfig));
 
   FB_COMMCHECK(comm->ctran_->algo->initTmpBufs());
 
@@ -837,37 +1391,56 @@ commResult_t ctranAllReduceRing(
   op->allreduce.datatype = datatype;
   op->allreduce.op = redOp;
 
-  auto* hostResource = new ctran::allreduce::ring::HostResource();
-  op->allreduce.resource = hostResource;
-  hostResource->comm = comm;
+  auto& hostResource = op->allreduce.hostResource;
+  hostResource.comm = comm;
   std::vector<ctran::algos::GpeKernelSync*> gpeKernelSyncs;
-  constexpr size_t kAllReduceRingNumSyncs = 3;
+  // 3 forward (sendCopy, recvRedCopy, partition) + 2 reverse (revSendCopy,
+  // revRecvCopy)
+  constexpr size_t kAllReduceRingNumSyncs = 5;
   FB_COMMCHECK(comm->ctran_->gpe->allocGpeKernelSyncs(
       kAllReduceRingNumSyncs, numBlocks, gpeKernelSyncs));
   FB_CHECKTHROW_EX(
       gpeKernelSyncs.size() == kAllReduceRingNumSyncs,
       comm->logMetaData_,
       "Failed to allocate GpeKernelSync");
-  hostResource->sendCopySync = gpeKernelSyncs[0];
-  hostResource->recvRedCopySync = gpeKernelSyncs[1];
-  hostResource->partitionSync = gpeKernelSyncs[2];
-  hostResource->chunkSize = NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_CHUNK_SIZE;
-  hostResource->numChunks = NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_NUM_CHUNKS;
-  std::tie(hostResource->tmpSendBuf, hostResource->tmpSendBufHdl) =
+  hostResource.sendCopySync = gpeKernelSyncs[0];
+  hostResource.recvRedCopySync = gpeKernelSyncs[1];
+  hostResource.partitionSync = gpeKernelSyncs[2];
+  hostResource.revSendCopySync = gpeKernelSyncs[3];
+  hostResource.revRecvCopySync = gpeKernelSyncs[4];
+  hostResource.chunkSize = pipelineChunkSize;
+  hostResource.numChunks = pipelineNumChunks;
+  hostResource.ibConfig = ibConfig;
+
+  std::tie(hostResource.tmpSendBuf, hostResource.tmpSendBufHdl) =
       comm->ctran_->algo->getTmpBufInfo(
           CtranAlgo::TmpbufType::RING_TMP_SEND_BUF);
-  std::tie(hostResource->tmpRecvBuf, hostResource->tmpRecvBufHdl) =
+  std::tie(hostResource.tmpRecvBuf, hostResource.tmpRecvBufHdl) =
       comm->ctran_->algo->getTmpBufInfo(
           CtranAlgo::TmpbufType::RING_TMP_RECV_BUF);
+  std::tie(hostResource.tmpSendBufRev, hostResource.tmpSendBufRevHdl) =
+      comm->ctran_->algo->getTmpBufInfo(
+          CtranAlgo::TmpbufType::RING_TMP_SEND_BUF_REV);
+  std::tie(hostResource.tmpRecvBufRev, hostResource.tmpRecvBufRevHdl) =
+      comm->ctran_->algo->getTmpBufInfo(
+          CtranAlgo::TmpbufType::RING_TMP_RECV_BUF_REV);
+  CLOGF(
+      DBG,
+      "AutoTune: {} blocks of {} threads, tmpbuf {} x {} chunks, bidirAg={}",
+      numBlocks,
+      numThreads,
+      hostResource.numChunks,
+      hostResource.chunkSize,
+      enableBidirAg);
 
-  auto* hostArgs = new ctran::allreduce::ring::HostArgs();
-  op->allreduce.args = hostArgs;
-  hostArgs->rank = rank;
-  hostArgs->leftRank = (rank - 1 + nRanks) % nRanks;
-  hostArgs->rightRank = (rank + 1) % nRanks;
-  hostArgs->minShardSize = NCCL_CTRAN_ALLREDUCE_RING_MIN_SHARD_SIZE;
-  hostArgs->numBlocks = numBlocks;
-  hostArgs->numThreads = numThreads;
+  auto& hostArgs = op->allreduce.hostArgs;
+  hostArgs.rank = rank;
+  hostArgs.leftRank = (rank - 1 + nRanks) % nRanks;
+  hostArgs.rightRank = (rank + 1) % nRanks;
+  hostArgs.minShardSize = NCCL_CTRAN_ALLREDUCE_RING_MIN_SHARD_SIZE;
+  hostArgs.numBlocks = numBlocks;
+  hostArgs.numThreads = numThreads;
+  hostArgs.enableBidirAg = enableBidirAg;
   // rightRemBuf, rightRemKey, leftNotify init from gpe thread for EpochLock
 
   opGroup.push_back(std::move(op));
@@ -887,14 +1460,18 @@ commResult_t ctranAllReduceRing(
       .datatype = datatype,
       .redOp = redOp,
       .count = count,
-      .chunkSize = hostResource->chunkSize,
-      .numChunks = hostResource->numChunks,
-      .minShardSize = hostArgs->minShardSize,
-      .sendCopySync = hostResource->sendCopySync,
-      .recvRedCopySync = hostResource->recvRedCopySync,
-      .partitionSync = hostResource->partitionSync,
-      .tmpSendBuf = hostResource->tmpSendBuf,
-      .tmpRecvBuf = hostResource->tmpRecvBuf,
+      .chunkSize = hostResource.chunkSize,
+      .numChunks = hostResource.numChunks,
+      .minShardSize = hostArgs.minShardSize,
+      .sendCopySync = hostResource.sendCopySync,
+      .recvRedCopySync = hostResource.recvRedCopySync,
+      .partitionSync = hostResource.partitionSync,
+      .tmpSendBuf = hostResource.tmpSendBuf,
+      .tmpRecvBuf = hostResource.tmpRecvBuf,
+      .revSendCopySync = hostResource.revSendCopySync,
+      .revRecvCopySync = hostResource.revRecvCopySync,
+      .tmpSendBufRev = hostResource.tmpSendBufRev,
+      .tmpRecvBufRev = hostResource.tmpRecvBufRev,
   };
   // Used only in gpe->submit, copied as a Kernel Launch Arg.
   config.algoArgs = &kernArgs;

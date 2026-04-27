@@ -2,9 +2,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <tuple>
+
+// Default to full parameter sweep if not specified via compiler flag.
+// Build with -DTEST_FULL_SWEEP=0 for a reduced smoke test.
+#ifndef TEST_FULL_SWEEP
+#define TEST_FULL_SWEEP 1
+#endif
 
 #include <ATen/ATen.h>
 #include <c10/core/Device.h>
@@ -17,6 +24,9 @@ std::string getDtypeName(at::ScalarType dtype);
 std::string getOpName(const torch::comms::ReduceOp& op);
 std::tuple<int, int> getRankAndSize();
 c10::intrusive_ptr<c10d::Store> createStore();
+c10::intrusive_ptr<c10d::Store> wrapPrefixStore(
+    const std::string& name,
+    c10::intrusive_ptr<c10d::Store> store);
 void destroyStore(
     c10::intrusive_ptr<c10d::Store>&& store,
     const std::shared_ptr<torch::comms::TorchComm>& torchcomm);
@@ -25,6 +35,30 @@ void destroyStore(
 inline bool isRunningOnCPU() {
   const char* test_device_env = std::getenv("TEST_DEVICE");
   return test_device_env && std::string(test_device_env) == "cpu";
+}
+
+// Check if RMA tests should be skipped. RMA window ops require the ncclx
+// backend with CTran enabled. Returns empty string if tests should run, or a
+// non-empty skip reason string.
+inline std::string shouldSkipRmaTest() {
+  const auto envLower = [](const char* name) {
+    const char* val = std::getenv(name);
+    std::string s(val ? val : "");
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s;
+  };
+  // Match NCCL's env2bool: y/yes/t/true/1 are truthy (case-insensitive)
+  const auto envBool = [&envLower](const char* name) {
+    const auto s = envLower(name);
+    return s == "1" || s == "y" || s == "yes" || s == "t" || s == "true";
+  };
+  if (envLower("TEST_BACKEND") != "ncclx") {
+    return "RMA window ops require ncclx backend";
+  }
+  if (!envBool("NCCL_CTRAN_ENABLE")) {
+    return "RMA window ops require ctran (NCCL_CTRAN_ENABLE not set)";
+  }
+  return "";
 }
 
 // Convert a tensor to a string representation with nested brackets for each

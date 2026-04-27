@@ -3,6 +3,7 @@
 #include "comms/torchcomms/rcclx/TorchWorkRCCLX.hpp"
 #include <ATen/hip/HIPContext.h> // @manual
 #include "comms/torchcomms/rcclx/TorchCommRCCLX.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
 
 namespace torch::comms {
 
@@ -130,7 +131,8 @@ TorchWorkRCCLX::WorkStatus TorchWorkRCCLX::checkStatus() {
 
     // Check if the operation has timed out
     if (elapsed_milliseconds > timeout_ms_) {
-      // Operation has timed out
+      TC_LOG(ERROR, comm_.get()) << "Operation timed out after "
+                                 << elapsed_milliseconds.count() << " ms";
       setStatus(WorkStatus::TIMEDOUT);
     }
   } else {
@@ -141,6 +143,8 @@ TorchWorkRCCLX::WorkStatus TorchWorkRCCLX::checkStatus() {
 }
 
 void TorchWorkRCCLX::wait() {
+  runWaitHooks();
+
   // If already completed, return immediately
   WorkStatus local_state = status();
   if (local_state == WorkStatus::COMPLETED ||
@@ -148,7 +152,7 @@ void TorchWorkRCCLX::wait() {
     return;
   }
 
-  TorchCommTracingGuard g(
+  TracingGuard g(
       std::string(comm_->getCommName()),
       comm_->getSize(),
       "wait",

@@ -2,17 +2,10 @@ name: xpu-test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   pull_request:
-    paths:
-      - .github/workflows/xpu_test.yml
-      - .github/scripts/xpu_test.sh
-      - CMakeLists.txt
-      - comms/torchcomms/TorchComm.hpp
-      - comms/torchcomms/device/XpuApi.cpp
-      - comms/torchcomms/device/XpuApi.hpp
-      - comms/torchcomms/tests/integration/py/TorchCommTestHelpers.py
-      - comms/torchcomms/xccl
-      - setup.py
 
 permissions:
   id-token: write

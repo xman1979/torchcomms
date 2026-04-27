@@ -33,6 +33,13 @@ Browse the documentation and Examples
         Complete API documentation for all torchcomms classes,
         functions, and backends.
 
+    .. grid-item-card:: 🔗 Hooks
+        :link: hooks
+        :link-type: doc
+
+        Learn how to use hooks to monitor and debug collective
+        operations with FlightRecorderHook.
+
     .. grid-item-card:: 💻 Code Examples
         :link: https://github.com/meta-pytorch/torchcomms/tree/main/comms/torchcomms/examples
 
@@ -73,6 +80,7 @@ torchcomms supports several communication backends out of the box:
 * **RCCLX**: Meta's enhanced RCCL implementation with additional optimizations
 * **NCCL**: NVIDIA's Collective Communications Library for multi-GPU communication
 * **RCCL**: AMD ROCm Collective Communications Library for AMD GPUs
+* **XCCL**: Intel's Collective Communications Library for Intel GPUs
 * **Gloo**: Facebook's collective communications library for both CPU and GPU
 
 Comprehensive Collective Operations
@@ -107,3 +115,4 @@ Create and manage process groups with ease:
 
    getting_started
    api
+   hooks

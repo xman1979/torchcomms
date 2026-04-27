@@ -11,6 +11,8 @@
 
 #include "comms/pipes/MultiPeerNvlTransport.h"
 #include "comms/pipes/P2pNvlTransportDevice.cuh"
+#include "comms/pipes/TiledBuffer.cuh"
+#include "comms/pipes/benchmarks/TileSendRecv.cuh"
 #include "comms/pipes/tests/P2pNvlTransportTest.cuh"
 #include "comms/pipes/tests/Utils.cuh"
 #include "comms/testinfra/TestXPlatUtils.h"
@@ -22,22 +24,25 @@ using namespace meta::comms;
 
 namespace comms::pipes::tests {
 
-// Parameters for transfer size tests: (nbytes, dataBufferSize, chunkSize, name)
+// Parameters for transfer size tests: (nbytes, dataBufferSize, chunkSize, name,
+// useDualStateBuffer, useCudaGraph)
 struct TransferSizeParams {
   size_t nbytes;
   size_t dataBufferSize;
   size_t chunkSize;
+  bool useDualStateBuffer;
   bool useCudaGraph;
   std::string name;
 };
 
 // Parameters for group type tests: (groupType, numBlocks, blockSize,
-// blocksPerGroup, name)
+// blocksPerGroup, useDualStateBuffer, useCudaGraph, name)
 struct GroupTypeParams {
   test::GroupType groupType;
   int numBlocks;
   int blockSize;
   int blocksPerGroup;
+  bool useDualStateBuffer;
   bool useCudaGraph;
   std::string name;
 };
@@ -75,7 +80,8 @@ TEST_F(P2pNvlTransportTestFixture, IpcMemAccess) {
   transport.exchange();
   XLOGF(INFO, "Rank {} created transport and exchanged IPC", globalRank);
 
-  auto p2p = transport.getP2pTransportDevice(peerRank);
+  // Get host-side copy to access buffer pointers from host
+  auto p2p = transport.buildP2pTransportDevice(peerRank);
 
   auto localAddr =
       static_cast<int*>(static_cast<void*>(p2p.getLocalState().dataBuffer));
@@ -152,7 +158,7 @@ void verifyReceivedData(
 // Helper to run a single send/recv iteration with verification
 void runSendRecvIteration(
     int globalRank,
-    P2pNvlTransportDevice& p2p,
+    P2pNvlTransportDevice* p2p,
     int* src_d,
     int* dst_d,
     size_t nbytes,
@@ -219,10 +225,31 @@ class TransportTestHelper {
                 config)) {
     CUDACHECK_TEST(cudaSetDevice(localRank));
     transport_->exchange();
+
+    // Build a host copy of P2pNvlTransportDevice for tests that need
+    // to access buffer pointers from the host side (e.g., for cudaMemset)
+    // Use unique_ptr because P2pNvlTransportDevice has const members and
+    // cannot be copy-assigned
+    p2pHost_ = std::make_unique<P2pNvlTransportDevice>(
+        transport_->buildP2pTransportDevice(peerRank_));
+
+    p2pDevice_ = std::make_unique<DeviceBuffer>(sizeof(P2pNvlTransportDevice));
+    CUDACHECK_TEST(cudaMemcpy(
+        p2pDevice_->get(),
+        p2pHost_.get(),
+        sizeof(P2pNvlTransportDevice),
+        cudaMemcpyHostToDevice));
   }
 
-  P2pNvlTransportDevice getDevice() {
-    return transport_->getP2pTransportDevice(peerRank_);
+  // Returns pointer to preallocated P2pNvlTransportDevice on device
+  // This pointer is managed by MultiPeerNvlTransport
+  P2pNvlTransportDevice* getDevicePtr() {
+    return static_cast<P2pNvlTransportDevice*>(p2pDevice_->get());
+  }
+
+  // Returns reference to host copy (for accessing state pointers from host)
+  P2pNvlTransportDevice& getHostDevice() {
+    return *p2pHost_;
   }
 
   int peerRank() const {
@@ -239,6 +266,8 @@ class TransportTestHelper {
   int peerRank_;
   std::shared_ptr<meta::comms::MpiBootstrap> bootstrap_;
   std::unique_ptr<MultiPeerNvlTransport> transport_;
+  std::unique_ptr<P2pNvlTransportDevice> p2pHost_;
+  std::unique_ptr<DeviceBuffer> p2pDevice_;
 };
 
 // =============================================================================
@@ -253,7 +282,7 @@ void runBasicSendRecvTest(
     int nIter = 1,
     test::GroupType groupType = test::GroupType::WARP,
     bool useCudaGraph = false) {
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   DeviceBuffer srcBuffer(nbytes);
   DeviceBuffer dstBuffer(nbytes);
@@ -347,6 +376,582 @@ void runBasicSendRecvTest(
 }
 
 // =============================================================================
+// Tile sendrecv multi-call correctness test
+// =============================================================================
+
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvMultiCall) {
+  if (numRanks != 2) {
+    XLOGF(WARNING, "Skipping: requires 2 ranks, got {}", numRanks);
+    return;
+  }
+
+  int peerRank = (globalRank == 0) ? 1 : 0;
+  const size_t nBytes = 8 * 1024 * 1024; // 8MB
+  const int numSendBlocks = 4;
+  const int nIters = 5; // call sendrecv 5 times with different data
+
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = 8 * 1024 * 1024, // 8MB slot
+      .chunkSize = 8 * 1024 * 1024,
+      .pipelineDepth = 2,
+  };
+
+  auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+  MultiPeerNvlTransport transport(globalRank, numRanks, bootstrap, config);
+  transport.exchange();
+  auto p2pHost = transport.buildP2pTransportDevice(peerRank);
+
+  DeviceBuffer sendBuf(nBytes);
+  DeviceBuffer recvBuf(nBytes);
+
+  dim3 grid(numSendBlocks * 2);
+  dim3 block(256);
+
+  Timeout timeout;
+
+  for (int iter = 0; iter < nIters; iter++) {
+    const int pattern = 0x10 + globalRank + iter * 0x20;
+    const int peerPattern = 0x10 + peerRank + iter * 0x20;
+
+    CUDACHECK_TEST(cudaMemset(sendBuf.get(), pattern, nBytes));
+    CUDACHECK_TEST(cudaMemset(recvBuf.get(), 0, nBytes));
+
+    comms::pipes::TiledBuffer<char> sendTiles(
+        static_cast<char*>(sendBuf.get()), nBytes, numSendBlocks);
+    comms::pipes::TiledBuffer<char> recvTiles(
+        static_cast<char*>(recvBuf.get()), nBytes, numSendBlocks);
+    int numBlocksArg = numSendBlocks;
+    std::size_t maxSignalBytes = 0;
+    void* args[] = {
+        &p2pHost,
+        &sendTiles,
+        &recvTiles,
+        &numBlocksArg,
+        &maxSignalBytes,
+        &timeout};
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    CUDACHECK_TEST(cudaLaunchKernel(
+        (void*)comms::pipes::benchmark::p2pTileSendRecv,
+        grid,
+        block,
+        args,
+        0,
+        nullptr));
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    // Verify received data
+    std::vector<char> hostBuf(nBytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        hostBuf.data(), recvBuf.get(), nBytes, cudaMemcpyDeviceToHost));
+
+    for (size_t i = 0; i < nBytes; i++) {
+      EXPECT_EQ(
+          static_cast<unsigned char>(hostBuf[i]),
+          static_cast<unsigned char>(peerPattern))
+          << "Iter " << iter << ": Mismatch at byte " << i;
+      if (static_cast<unsigned char>(hostBuf[i]) !=
+          static_cast<unsigned char>(peerPattern)) {
+        break;
+      }
+    }
+  }
+}
+
+// =============================================================================
+// send / recv (per-group) Tests
+// =============================================================================
+
+// Helper: run tile sendrecv with given params and verify correctness
+static void runTileTest(
+    int globalRank,
+    int numRanks,
+    std::shared_ptr<meta::comms::MpiBootstrap> bootstrap,
+    size_t nBytes,
+    size_t dataBufferSize,
+    size_t chunkSize,
+    size_t pipelineDepth,
+    int numSendBlocks,
+    int nIters,
+    int threadCount = 256) {
+  int peerRank = (globalRank == 0) ? 1 : 0;
+
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = dataBufferSize,
+      .chunkSize = chunkSize,
+      .pipelineDepth = pipelineDepth,
+  };
+
+  MultiPeerNvlTransport transport(globalRank, numRanks, bootstrap, config);
+  transport.exchange();
+  auto p2pHost = transport.buildP2pTransportDevice(peerRank);
+
+  DeviceBuffer sendBuf(nBytes);
+  DeviceBuffer recvBuf(nBytes);
+
+  dim3 grid(numSendBlocks * 2);
+  dim3 block(threadCount);
+
+  Timeout timeout;
+
+  for (int iter = 0; iter < nIters; iter++) {
+    const int pattern = 0x10 + globalRank + iter * 0x20;
+    const int peerPattern = 0x10 + peerRank + iter * 0x20;
+
+    CUDACHECK_TEST(cudaMemset(sendBuf.get(), pattern, nBytes));
+    CUDACHECK_TEST(cudaMemset(recvBuf.get(), 0, nBytes));
+
+    comms::pipes::TiledBuffer<char> sendTiles(
+        static_cast<char*>(sendBuf.get()), nBytes, numSendBlocks);
+    comms::pipes::TiledBuffer<char> recvTiles(
+        static_cast<char*>(recvBuf.get()), nBytes, numSendBlocks);
+    int numBlocksArg = numSendBlocks;
+    std::size_t maxSignalBytes = 0;
+    void* args[] = {
+        &p2pHost,
+        &sendTiles,
+        &recvTiles,
+        &numBlocksArg,
+        &maxSignalBytes,
+        &timeout};
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    CUDACHECK_TEST(cudaLaunchKernel(
+        (void*)comms::pipes::benchmark::p2pTileSendRecv,
+        grid,
+        block,
+        args,
+        0,
+        nullptr));
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    std::vector<char> hostBuf(nBytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        hostBuf.data(), recvBuf.get(), nBytes, cudaMemcpyDeviceToHost));
+
+    for (size_t i = 0; i < nBytes; i++) {
+      EXPECT_EQ(
+          static_cast<unsigned char>(hostBuf[i]),
+          static_cast<unsigned char>(peerPattern))
+          << "Iter " << iter << ": Mismatch at byte " << i
+          << " (nBytes=" << nBytes << ", blocks=" << numSendBlocks
+          << ", slot=" << dataBufferSize << ", chunk=" << chunkSize
+          << ", pd=" << pipelineDepth << ")";
+      if (static_cast<unsigned char>(hostBuf[i]) !=
+          static_cast<unsigned char>(peerPattern)) {
+        return; // stop on first failure
+      }
+    }
+  }
+}
+
+// Test various message sizes with default config
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvMessageSizes) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+
+  // Small sizes
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      4096,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      16384,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      65536,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      1);
+
+  // Medium sizes
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      1 * 1024 * 1024,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      8,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      16,
+      1);
+
+  // Large sizes
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      64 * 1024 * 1024,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      16,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      256 * 1024 * 1024,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      16,
+      1);
+}
+
+// Test signal granularity (chunkSize < slotSize)
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvSignalGranularity) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+  const size_t nBytes = 32 * 1024 * 1024; // 32MB
+
+  // Per-slot signaling (chunkSize == slotSize)
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      16,
+      1);
+
+  // 128KB signal granularity
+  runTileTest(
+      globalRank, numRanks, bs, nBytes, 8 * 1024 * 1024, 128 * 1024, 2, 16, 1);
+
+  // 512KB signal granularity
+  runTileTest(
+      globalRank, numRanks, bs, nBytes, 8 * 1024 * 1024, 512 * 1024, 2, 16, 1);
+
+  // 1MB signal granularity
+  runTileTest(
+      globalRank, numRanks, bs, nBytes, 8 * 1024 * 1024, 1024 * 1024, 2, 16, 1);
+}
+
+// Test different block counts
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvBlockCounts) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+  const size_t nBytes = 16 * 1024 * 1024; // 16MB
+
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      1,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      2,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      8,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      16,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      32,
+      1);
+}
+
+// Test pipeline depth variations
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvPipelineDepth) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+  const size_t nBytes = 32 * 1024 * 1024;
+
+  runTileTest(
+      globalRank, numRanks, bs, nBytes, 8 * 1024 * 1024, 128 * 1024, 2, 16, 1);
+  runTileTest(
+      globalRank, numRanks, bs, nBytes, 8 * 1024 * 1024, 128 * 1024, 4, 16, 1);
+}
+
+// Test multi-call with persistent step state
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvMultiCallPersistentStep) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+
+  // 5 iterations with same size — tests step counter persistence
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      5);
+
+  // 5 iterations with 128KB signal — more steps per call
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      128 * 1024,
+      2,
+      4,
+      5);
+}
+
+// Test multi-call with different message sizes per call
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvMultiCallDifferentSizes) {
+  if (numRanks != 2) {
+    return;
+  }
+  int peerRank = (globalRank == 0) ? 1 : 0;
+
+  const int numSendBlocks = 4;
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = 8 * 1024 * 1024,
+      .chunkSize = 8 * 1024 * 1024,
+      .pipelineDepth = 2,
+  };
+
+  auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+  MultiPeerNvlTransport transport(globalRank, numRanks, bootstrap, config);
+  transport.exchange();
+  auto p2pHost = transport.buildP2pTransportDevice(peerRank);
+
+  // Different sizes for each call
+  std::vector<size_t> sizes = {
+      2 * 1024 * 1024, // 2MB
+      8 * 1024 * 1024, // 8MB
+      1 * 1024 * 1024, // 1MB (smaller than first)
+      16 * 1024 * 1024, // 16MB
+  };
+
+  dim3 grid(numSendBlocks * 2);
+  dim3 block(256);
+  Timeout timeout;
+
+  for (size_t callIdx = 0; callIdx < sizes.size(); callIdx++) {
+    size_t nBytes = sizes[callIdx];
+    const int pattern = 0x30 + globalRank + static_cast<int>(callIdx) * 0x10;
+    const int peerPattern = 0x30 + peerRank + static_cast<int>(callIdx) * 0x10;
+
+    DeviceBuffer sendBuf(nBytes);
+    DeviceBuffer recvBuf(nBytes);
+    CUDACHECK_TEST(cudaMemset(sendBuf.get(), pattern, nBytes));
+    CUDACHECK_TEST(cudaMemset(recvBuf.get(), 0, nBytes));
+
+    comms::pipes::TiledBuffer<char> sendTiles(
+        static_cast<char*>(sendBuf.get()), nBytes, numSendBlocks);
+    comms::pipes::TiledBuffer<char> recvTiles(
+        static_cast<char*>(recvBuf.get()), nBytes, numSendBlocks);
+    int numBlocksArg = numSendBlocks;
+    std::size_t maxSignalBytes = 0;
+    void* args[] = {
+        &p2pHost,
+        &sendTiles,
+        &recvTiles,
+        &numBlocksArg,
+        &maxSignalBytes,
+        &timeout};
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    CUDACHECK_TEST(cudaLaunchKernel(
+        (void*)comms::pipes::benchmark::p2pTileSendRecv,
+        grid,
+        block,
+        args,
+        0,
+        nullptr));
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    std::vector<char> hostBuf(nBytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        hostBuf.data(), recvBuf.get(), nBytes, cudaMemcpyDeviceToHost));
+
+    for (size_t i = 0; i < nBytes; i++) {
+      EXPECT_EQ(
+          static_cast<unsigned char>(hostBuf[i]),
+          static_cast<unsigned char>(peerPattern))
+          << "Call " << callIdx << " (size=" << nBytes << "): Mismatch at byte "
+          << i;
+      if (static_cast<unsigned char>(hostBuf[i]) !=
+          static_cast<unsigned char>(peerPattern)) {
+        break;
+      }
+    }
+  }
+}
+
+// Test partial tiles (nbytes not evenly divisible by numBlocks)
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvPartialTiles) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+
+  // nBytes not divisible by numBlocks — last block gets fewer bytes
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      1000000,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      1);
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      3000000,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      8,
+      1);
+
+  // Odd sizes
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      7 * 1024 * 1024 + 12345,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      4,
+      1);
+}
+
+// Test with different staging buffer sizes
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvStagingSizes) {
+  if (numRanks != 2) {
+    return;
+  }
+  auto bs = std::make_shared<meta::comms::MpiBootstrap>();
+  const size_t nBytes = 16 * 1024 * 1024;
+
+  // 4MB staging
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      2,
+      8,
+      1);
+
+  // 8MB staging
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      8 * 1024 * 1024,
+      8 * 1024 * 1024,
+      2,
+      8,
+      1);
+
+  // 16MB staging
+  runTileTest(
+      globalRank,
+      numRanks,
+      bs,
+      nBytes,
+      16 * 1024 * 1024,
+      16 * 1024 * 1024,
+      2,
+      8,
+      1);
+}
+
+// =============================================================================
 // Parameterized Test Fixture for Transfer Size Variations
 // =============================================================================
 
@@ -369,17 +974,19 @@ TEST_P(TransferSizeTestFixture, SendRecv) {
   const auto& params = GetParam();
   XLOGF(
       INFO,
-      "Running transfer size test: {} (nbytes={}, bufferSize={}, chunkSize={}, cudaGraph={})",
+      "Running transfer size test: {} (nbytes={}, bufferSize={}, chunkSize={}, dualState={}, cudaGraph={})",
       params.name,
       params.nbytes,
       params.dataBufferSize,
       params.chunkSize,
+      params.useDualStateBuffer,
       params.useCudaGraph);
 
   MultiPeerNvlTransportConfig config{
       .dataBufferSize = params.dataBufferSize,
       .chunkSize = params.chunkSize,
       .pipelineDepth = 4,
+      .useDualStateBuffer = params.useDualStateBuffer,
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
@@ -408,151 +1015,174 @@ INSTANTIATE_TEST_SUITE_P(
     TransferSizeVariations,
     TransferSizeTestFixture,
     ::testing::Values(
+        // ===== SINGLE STATE BUFFER MODE (default) =====
         // Small transfer: nbytes < chunkSize
         TransferSizeParams{
             .nbytes = 512,
             .dataBufferSize = 4096,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "SmallTransfer_LessThanChunk"},
+            .name = "SmallTransfer_LessThanChunk_SingleState"},
         TransferSizeParams{
             .nbytes = 512,
             .dataBufferSize = 4096,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "SmallTransfer_LessThanChunk"},
+            .name = "SmallTransfer_LessThanChunk_SingleState"},
         // Single chunk: nbytes == chunkSize
         TransferSizeParams{
             .nbytes = 1024,
             .dataBufferSize = 4096,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "SingleChunk_ExactMatch"},
+            .name = "SingleChunk_ExactMatch_SingleState"},
         TransferSizeParams{
             .nbytes = 1024,
             .dataBufferSize = 4096,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "SingleChunk_ExactMatch"},
+            .name = "SingleChunk_ExactMatch_SingleState"},
         // Transfer not aligned to chunk size
         TransferSizeParams{
             .nbytes = 1000,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "UnalignedToChunk"},
+            .name = "UnalignedToChunk_SingleState"},
         TransferSizeParams{
             .nbytes = 1000,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "UnalignedToChunk"},
+            .name = "UnalignedToChunk_SingleState"},
         // Transfer not aligned to vector size (16 bytes)
         TransferSizeParams{
             .nbytes = 1000,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "NonVectorAligned_1000bytes"},
+            .name = "NonVectorAligned_1000bytes_SingleState"},
         TransferSizeParams{
             .nbytes = 1000,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "NonVectorAligned_1000bytes"},
+            .name = "NonVectorAligned_1000bytes_SingleState"},
         // Another non-vector-aligned size
         TransferSizeParams{
             .nbytes = 100,
             .dataBufferSize = 1024,
             .chunkSize = 64,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "NonVectorAligned_100bytes"},
+            .name = "NonVectorAligned_100bytes_SingleState"},
         TransferSizeParams{
             .nbytes = 100,
             .dataBufferSize = 1024,
             .chunkSize = 64,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "NonVectorAligned_100bytes"},
+            .name = "NonVectorAligned_100bytes_SingleState"},
         // Transfer exactly equals buffer size (single step)
         TransferSizeParams{
             .nbytes = 4096,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "ExactBufferSize"},
+            .name = "ExactBufferSize_SingleState"},
         TransferSizeParams{
             .nbytes = 4096,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "ExactBufferSize"},
+            .name = "ExactBufferSize_SingleState"},
         // Multiple steps: transfer > buffer size
         TransferSizeParams{
             .nbytes = 16 * 1024,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "MultipleSteps_4x"},
+            .name = "MultipleSteps_4x_SingleState"},
         TransferSizeParams{
             .nbytes = 16 * 1024,
             .dataBufferSize = 4096,
             .chunkSize = 256,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "MultipleSteps_4x"},
+            .name = "MultipleSteps_4x_SingleState"},
         // Large transfer with multiple steps
         TransferSizeParams{
             .nbytes = 4 * 1024 * 1024,
             .dataBufferSize = 1024 * 1024,
             .chunkSize = 4096,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "LargeMultiStep_4MB"},
+            .name = "LargeMultiStep_4MB_SingleState"},
         TransferSizeParams{
             .nbytes = 4 * 1024 * 1024,
             .dataBufferSize = 1024 * 1024,
             .chunkSize = 4096,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "LargeMultiStep_4MB"},
+            .name = "LargeMultiStep_4MB_SingleState"},
         // Very large transfer (64MB with 8MB buffer = 8 steps)
         TransferSizeParams{
             .nbytes = 64 * 1024 * 1024,
             .dataBufferSize = 8 * 1024 * 1024,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "VeryLargeMultiStep_64MB"},
+            .name = "VeryLargeMultiStep_64MB_SingleState"},
         TransferSizeParams{
             .nbytes = 64 * 1024 * 1024,
             .dataBufferSize = 8 * 1024 * 1024,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "VeryLargeMultiStep_64MB"},
+            .name = "VeryLargeMultiStep_64MB_SingleState"},
         // Edge case: stepBytes exactly divisible by chunkSize (no partial
         // chunk) Tests that we don't process any 0-byte chunks
         TransferSizeParams{
             .nbytes = 4096,
             .dataBufferSize = 4096,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "ExactChunkBoundary_4Chunks"},
+            .name = "ExactChunkBoundary_4Chunks_SingleState"},
         TransferSizeParams{
             .nbytes = 4096,
             .dataBufferSize = 4096,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "ExactChunkBoundary_4Chunks"},
+            .name = "ExactChunkBoundary_4Chunks_SingleState"},
         // Edge case: last chunk has minimal bytes (1 byte remainder)
         // stepBytes=4097, chunkSize=1024 → 5 chunks, last chunk = 1 byte
         TransferSizeParams{
             .nbytes = 4097,
             .dataBufferSize = 8192,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "MinimalLastChunk_1Byte"},
+            .name = "MinimalLastChunk_1Byte_SingleState"},
         TransferSizeParams{
             .nbytes = 4097,
             .dataBufferSize = 8192,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "MinimalLastChunk_1Byte"},
+            .name = "MinimalLastChunk_1Byte_SingleState"},
         // Edge case: multiple steps where each step ends exactly on chunk
         // boundary 8KB transfer, 4KB buffer, 1KB chunks → 2 steps × 4 chunks
         // each
@@ -560,28 +1190,124 @@ INSTANTIATE_TEST_SUITE_P(
             .nbytes = 8 * 1024,
             .dataBufferSize = 4 * 1024,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "MultiStep_ExactChunkBoundaries"},
+            .name = "MultiStep_ExactChunkBoundaries_SingleState"},
         TransferSizeParams{
             .nbytes = 8 * 1024,
             .dataBufferSize = 4 * 1024,
             .chunkSize = 1024,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "MultiStep_ExactChunkBoundaries"},
+            .name = "MultiStep_ExactChunkBoundaries_SingleState"},
         // Edge case: chunkSize larger than stepBytes
         // Forces single chunk per step with partial fill
         TransferSizeParams{
             .nbytes = 2048,
             .dataBufferSize = 1024,
             .chunkSize = 2048,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "ChunkLargerThanStep"},
+            .name = "ChunkLargerThanStep_SingleState"},
         TransferSizeParams{
             .nbytes = 2048,
             .dataBufferSize = 1024,
             .chunkSize = 2048,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "ChunkLargerThanStep"}),
+            .name = "ChunkLargerThanStep_SingleState"},
+
+        // ===== DUAL STATE BUFFER MODE =====
+        // Small transfer: nbytes < chunkSize
+        TransferSizeParams{
+            .nbytes = 512,
+            .dataBufferSize = 4096,
+            .chunkSize = 1024,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "SmallTransfer_LessThanChunk_DualState"},
+        TransferSizeParams{
+            .nbytes = 512,
+            .dataBufferSize = 4096,
+            .chunkSize = 1024,
+            .useDualStateBuffer = true,
+            .useCudaGraph = true,
+            .name = "SmallTransfer_LessThanChunk_DualState"},
+        // Single chunk: nbytes == chunkSize
+        TransferSizeParams{
+            .nbytes = 1024,
+            .dataBufferSize = 4096,
+            .chunkSize = 1024,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "SingleChunk_ExactMatch_DualState"},
+        TransferSizeParams{
+            .nbytes = 1024,
+            .dataBufferSize = 4096,
+            .chunkSize = 1024,
+            .useDualStateBuffer = true,
+            .useCudaGraph = true,
+            .name = "SingleChunk_ExactMatch_DualState"},
+        // Transfer not aligned to chunk size
+        TransferSizeParams{
+            .nbytes = 1000,
+            .dataBufferSize = 4096,
+            .chunkSize = 256,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "UnalignedToChunk_DualState"},
+        TransferSizeParams{
+            .nbytes = 1000,
+            .dataBufferSize = 4096,
+            .chunkSize = 256,
+            .useDualStateBuffer = true,
+            .useCudaGraph = true,
+            .name = "UnalignedToChunk_DualState"},
+        // Multiple steps: transfer > buffer size
+        TransferSizeParams{
+            .nbytes = 16 * 1024,
+            .dataBufferSize = 4096,
+            .chunkSize = 256,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "MultipleSteps_4x_DualState"},
+        TransferSizeParams{
+            .nbytes = 16 * 1024,
+            .dataBufferSize = 4096,
+            .chunkSize = 256,
+            .useDualStateBuffer = true,
+            .useCudaGraph = true,
+            .name = "MultipleSteps_4x_DualState"},
+        // Large transfer with multiple steps
+        TransferSizeParams{
+            .nbytes = 4 * 1024 * 1024,
+            .dataBufferSize = 1024 * 1024,
+            .chunkSize = 4096,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "LargeMultiStep_4MB_DualState"},
+        TransferSizeParams{
+            .nbytes = 4 * 1024 * 1024,
+            .dataBufferSize = 1024 * 1024,
+            .chunkSize = 4096,
+            .useDualStateBuffer = true,
+            .useCudaGraph = true,
+            .name = "LargeMultiStep_4MB_DualState"},
+        // Very large transfer (64MB with 8MB buffer = 8 steps)
+        TransferSizeParams{
+            .nbytes = 64 * 1024 * 1024,
+            .dataBufferSize = 8 * 1024 * 1024,
+            .chunkSize = 1024,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "VeryLargeMultiStep_64MB_DualState"},
+        TransferSizeParams{
+            .nbytes = 64 * 1024 * 1024,
+            .dataBufferSize = 8 * 1024 * 1024,
+            .chunkSize = 1024,
+            .useDualStateBuffer = true,
+            .useCudaGraph = true,
+            .name = "VeryLargeMultiStep_64MB_DualState"}),
     transferSizeParamName);
 
 // =============================================================================
@@ -607,10 +1333,11 @@ TEST_P(GroupTypeTestFixture, SendRecv) {
   const auto& params = GetParam();
   XLOGF(
       INFO,
-      "Running group type test: {} (numBlocks={}, blockSize={}, cudaGraph={})",
+      "Running group type test: {} (numBlocks={}, blockSize={}, dualState={}, cudaGraph={})",
       params.name,
       params.numBlocks,
       params.blockSize,
+      params.useDualStateBuffer,
       params.useCudaGraph);
 
   const size_t dataBufferSize = 1024 * 1024; // 1MB staging buffer
@@ -619,6 +1346,7 @@ TEST_P(GroupTypeTestFixture, SendRecv) {
       .dataBufferSize = dataBufferSize,
       .chunkSize = 1024,
       .pipelineDepth = 4,
+      .useDualStateBuffer = params.useDualStateBuffer,
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
@@ -644,78 +1372,117 @@ INSTANTIATE_TEST_SUITE_P(
     GroupTypeVariations,
     GroupTypeTestFixture,
     ::testing::Values(
+        // ===== SINGLE STATE BUFFER MODE (default) =====
         // Warp-based groups (32 threads per group)
         GroupTypeParams{
             .groupType = test::GroupType::WARP,
             .numBlocks = 4,
             .blockSize = 128,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "Warp_4Blocks_128Threads"},
+            .name = "Warp_4Blocks_128Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::WARP,
             .numBlocks = 4,
             .blockSize = 128,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "Warp_4Blocks_128Threads"},
+            .name = "Warp_4Blocks_128Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::WARP,
             .numBlocks = 8,
             .blockSize = 256,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "Warp_8Blocks_256Threads"},
+            .name = "Warp_8Blocks_256Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::WARP,
             .numBlocks = 8,
             .blockSize = 256,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "Warp_8Blocks_256Threads"},
+            .name = "Warp_8Blocks_256Threads_SingleState"},
         // Block-based groups (all threads in block form one group)
         GroupTypeParams{
             .groupType = test::GroupType::BLOCK,
             .numBlocks = 4,
             .blockSize = 128,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "Block_4Groups_128Threads"},
+            .name = "Block_4Groups_128Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::BLOCK,
             .numBlocks = 4,
             .blockSize = 128,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "Block_4Groups_128Threads"},
+            .name = "Block_4Groups_128Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::BLOCK,
             .numBlocks = 8,
             .blockSize = 256,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "Block_8Groups_256Threads"},
+            .name = "Block_8Groups_256Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::BLOCK,
             .numBlocks = 8,
             .blockSize = 256,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "Block_8Groups_256Threads"},
+            .name = "Block_8Groups_256Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::BLOCK,
             .numBlocks = 2,
             .blockSize = 512,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = false,
-            .name = "Block_2Groups_512Threads"},
+            .name = "Block_2Groups_512Threads_SingleState"},
         GroupTypeParams{
             .groupType = test::GroupType::BLOCK,
             .numBlocks = 2,
             .blockSize = 512,
             .blocksPerGroup = 1,
+            .useDualStateBuffer = false,
             .useCudaGraph = true,
-            .name = "Block_2Groups_512Threads"}),
+            .name = "Block_2Groups_512Threads_SingleState"},
+
+        // ===== DUAL STATE BUFFER MODE =====
+        // Warp-based groups (32 threads per group)
+        GroupTypeParams{
+            .groupType = test::GroupType::WARP,
+            .numBlocks = 4,
+            .blockSize = 128,
+            .blocksPerGroup = 1,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "Warp_4Blocks_128Threads_DualState"},
+        GroupTypeParams{
+            .groupType = test::GroupType::WARP,
+            .numBlocks = 8,
+            .blockSize = 256,
+            .blocksPerGroup = 1,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "Warp_8Blocks_256Threads_DualState"},
+        // Block-based groups (all threads in block form one group)
+        GroupTypeParams{
+            .groupType = test::GroupType::BLOCK,
+            .numBlocks = 4,
+            .blockSize = 128,
+            .blocksPerGroup = 1,
+            .useDualStateBuffer = true,
+            .useCudaGraph = false,
+            .name = "Block_4Groups_128Threads_DualState"}),
     groupTypeParamName);
 
 // =============================================================================
@@ -737,7 +1504,7 @@ TEST_F(P2pNvlTransportTestFixture, BidirectionalSendRecv) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   const size_t numInts = nbytes / sizeof(int);
 
@@ -862,7 +1629,7 @@ TEST_F(P2pNvlTransportTestFixture, SendRecvZeroBytes) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   // Allocate small buffers for the zero-byte transfer test
   const size_t bufferSize = 64;
@@ -925,7 +1692,7 @@ TEST_F(P2pNvlTransportTestFixture, MultiSendInKernel) {
 
   const size_t dataBufferSize = 512 * 1024; // 512KB staging buffer
   const size_t nbytesPerSend = 256 * 1024; // 256KB per send
-  const int numSends = 4;
+  const int numSends = 16;
   const size_t totalBytes = nbytesPerSend * numSends;
 
   MultiPeerNvlTransportConfig config{
@@ -935,7 +1702,7 @@ TEST_F(P2pNvlTransportTestFixture, MultiSendInKernel) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   DeviceBuffer srcBuffer(totalBytes);
   DeviceBuffer dstBuffer(totalBytes);
@@ -959,6 +1726,7 @@ TEST_F(P2pNvlTransportTestFixture, MultiSendInKernel) {
     test::testMultiSend(
         p2p, src_d, nbytesPerSend, numSends, numBlocks, blockSize);
     CUDACHECK_TEST(cudaDeviceSynchronize());
+    std::cout << "Rank 0: MultiSendInKernel test completed" << std::endl;
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   } else {
     CUDACHECK_TEST(cudaMemset(dst_d, 0, totalBytes));
@@ -967,6 +1735,7 @@ TEST_F(P2pNvlTransportTestFixture, MultiSendInKernel) {
     test::testMultiRecv(
         p2p, dst_d, nbytesPerSend, numSends, numBlocks, blockSize);
     CUDACHECK_TEST(cudaDeviceSynchronize());
+    std::cout << "Rank 1: MultiRecvKernel test completed" << std::endl;
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
     // Verify each segment
@@ -1015,7 +1784,7 @@ TEST_F(P2pNvlTransportTestFixture, MultiRecvInKernel) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   DeviceBuffer srcBuffer(totalBytes);
   DeviceBuffer dstBuffer(totalBytes);
@@ -1091,7 +1860,7 @@ TEST_F(P2pNvlTransportTestFixture, SimultaneousSendRecvInKernel) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   const size_t numInts = nbytes / sizeof(int);
 
@@ -1193,7 +1962,7 @@ TEST_P(WeightedPartitionTestFixture, SendRecv) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   const size_t numInts = nbytes / sizeof(int);
 
@@ -2002,7 +2771,7 @@ TEST_P(AsymmetricGroupTestFixture, SendRecv) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
 
   const size_t numInts = nbytes / sizeof(int);
 
@@ -2235,7 +3004,7 @@ INSTANTIATE_TEST_SUITE_P(
 // Helper to run a write() test with verification
 void runPutTest(
     int globalRank,
-    P2pNvlTransportDevice& p2p,
+    P2pNvlTransportDevice* p2p,
     char* localSrc,
     char* remoteDst,
     size_t nbytes,
@@ -2308,11 +3077,12 @@ TEST_F(P2pNvlTransportTestFixture, PutBasic) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
+  auto& p2pHost = helper.getHostDevice();
 
   // Get remote destination (peer's local data buffer)
-  char* localSrc = p2p.getLocalState().dataBuffer;
-  char* remoteDst = p2p.getRemoteState().dataBuffer;
+  char* localSrc = p2pHost.getLocalState().dataBuffer;
+  char* remoteDst = p2pHost.getRemoteState().dataBuffer;
 
   runPutTest(globalRank, p2p, localSrc, remoteDst, nbytes, 4, 128, "PutBasic");
 
@@ -2355,10 +3125,11 @@ TEST_P(PutTransferSizeTestFixture, Put) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
+  auto& p2pHost = helper.getHostDevice();
 
-  char* localSrc = p2p.getLocalState().dataBuffer;
-  char* remoteDst = p2p.getRemoteState().dataBuffer;
+  char* localSrc = p2pHost.getLocalState().dataBuffer;
+  char* remoteDst = p2pHost.getRemoteState().dataBuffer;
 
   runPutTest(
       globalRank, p2p, localSrc, remoteDst, params.nbytes, 4, 128, params.name);
@@ -2445,11 +3216,12 @@ TEST_P(PutUnalignedTestFixture, Put) {
   };
 
   TransportTestHelper helper(globalRank, numRanks, localRank, config);
-  auto p2p = helper.getDevice();
+  auto p2p = helper.getDevicePtr();
+  auto& p2pHost = helper.getHostDevice();
 
   // Get remote and local destination with offset applied
-  char* localSrc = p2p.getLocalState().dataBuffer;
-  char* remoteDst = p2p.getRemoteState().dataBuffer;
+  char* localSrc = p2pHost.getLocalState().dataBuffer;
+  char* remoteDst = p2pHost.getRemoteState().dataBuffer;
   if (globalRank == 0) {
     localSrc += params.srcOffset;
     remoteDst += params.dstOffset;
@@ -2547,6 +3319,262 @@ INSTANTIATE_TEST_SUITE_P(
             .nbytes = 100,
             .name = "DiffMisalign_1_9_100Bytes"}),
     putUnalignedParamName);
+
+// Regression test for multi-chunk accumulation bug
+// Tests that put() correctly handles multiple chunks per thread group.
+// The bug caused chunkBytes to accumulate across iterations, leading to
+// buffer overflows and data corruption.
+TEST_F(P2pNvlTransportTestFixture, PutMultiChunkAccumulationRegression) {
+  if (numRanks != 2) {
+    XLOGF(WARNING, "Skipping test: requires exactly 2 ranks, got {}", numRanks);
+    return;
+  }
+
+  // Parameters chosen to trigger multi-chunk per group:
+  // numBlocks=4, blockSize=128 -> total_groups=16
+  // nbytes=257 -> numChunks=17, so groups process 2 chunks each
+  const size_t nbytes = 257;
+  const size_t paddedSize = nbytes + 64; // Extra space to detect overflow
+  const char sentinelValue = static_cast<char>(0xDE);
+
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = paddedSize,
+      .chunkSize = 1,
+      .pipelineDepth = 1,
+  };
+
+  TransportTestHelper helper(globalRank, numRanks, localRank, config);
+  auto* p2p = helper.getDevicePtr(); // device pointer for kernel calls
+  auto& p2pHost = helper.getHostDevice(); // host reference for buffer access
+  char* localSrc =
+      p2pHost.getLocalState().dataBuffer; // dataBuffer is a device ptr
+  char* remoteDst = p2pHost.getRemoteState().dataBuffer;
+
+  const uint64_t signal_id = 0;
+
+  if (globalRank == 0) {
+    // Fill with sequential pattern [0, 1, 2, ..., nbytes-1]
+    std::vector<char> pattern(paddedSize, sentinelValue);
+    for (size_t i = 0; i < nbytes; ++i) {
+      pattern[i] = static_cast<char>(i % 256);
+    }
+    CUDACHECK_TEST(cudaMemcpy(
+        localSrc, pattern.data(), paddedSize, cudaMemcpyHostToDevice));
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    test::testPutWithSignal(
+        p2p, remoteDst, localSrc, signal_id, nbytes, 4, 128);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+  } else {
+    // Fill destination with sentinel to detect any writes
+    CUDACHECK_TEST(cudaMemset(localSrc, sentinelValue, paddedSize));
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    test::testWait(p2p, CmpOp::CMP_GE, signal_id, nbytes, 4, 128);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+
+    // Verify sequential pattern
+    std::vector<char> result(paddedSize);
+    CUDACHECK_TEST(cudaMemcpy(
+        result.data(), localSrc, paddedSize, cudaMemcpyDeviceToHost));
+
+    // Check data bytes have correct pattern
+    for (size_t i = 0; i < nbytes; ++i) {
+      EXPECT_EQ(
+          static_cast<unsigned char>(result[i]),
+          static_cast<unsigned char>(i % 256))
+          << "Data mismatch at byte " << i << " - accumulation bug detected";
+    }
+
+    // Check sentinel bytes are untouched (no overflow)
+    for (size_t i = nbytes; i < paddedSize; ++i) {
+      EXPECT_EQ(
+          static_cast<unsigned char>(result[i]),
+          static_cast<unsigned char>(sentinelValue))
+          << "Buffer overflow detected at byte " << i;
+    }
+  }
+}
+
+// =============================================================================
+// LL128 Buffer Wiring Tests
+// Verify MultiPeerNvlTransport correctly wires LL128 buffer pointers into
+// P2pNvlTransportDevice handles.
+// =============================================================================
+
+TEST_F(P2pNvlTransportTestFixture, Ll128BufferWiring_Enabled) {
+  if (numRanks != 2) {
+    XLOGF(WARNING, "Skipping test: requires exactly 2 ranks, got {}", numRanks);
+    return;
+  }
+
+  int peerRank = (globalRank == 0) ? 1 : 0;
+
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = 4096,
+      .chunkSize = 256,
+      .pipelineDepth = 2,
+      .ll128BufferSize = ll128_buffer_size(4096),
+  };
+
+  auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+  MultiPeerNvlTransport transport(globalRank, numRanks, bootstrap, config);
+  transport.exchange();
+
+  auto p2p = transport.buildP2pTransportDevice(peerRank);
+
+  ASSERT_NE(p2p.getLocalState().ll128Buffer, nullptr)
+      << "Rank " << globalRank
+      << ": localState.ll128Buffer should be non-null when ll128BufferSize > 0";
+  ASSERT_NE(p2p.getRemoteState().ll128Buffer, nullptr)
+      << "Rank " << globalRank
+      << ": remoteState.ll128Buffer should be non-null when ll128BufferSize > 0";
+  ASSERT_NE(p2p.getLocalState().ll128Buffer, p2p.getRemoteState().ll128Buffer)
+      << "Rank " << globalRank
+      << ": local and remote ll128Buffer should point to different ranks' buffers";
+
+  XLOGF(INFO, "Rank {}: Ll128BufferWiring_Enabled test completed", globalRank);
+}
+
+TEST_F(P2pNvlTransportTestFixture, Ll128BufferWiring_Disabled) {
+  if (numRanks != 2) {
+    XLOGF(WARNING, "Skipping test: requires exactly 2 ranks, got {}", numRanks);
+    return;
+  }
+
+  int peerRank = (globalRank == 0) ? 1 : 0;
+
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = 4096,
+      .chunkSize = 256,
+      .pipelineDepth = 2,
+  };
+
+  auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+  MultiPeerNvlTransport transport(globalRank, numRanks, bootstrap, config);
+  transport.exchange();
+
+  auto p2p = transport.buildP2pTransportDevice(peerRank);
+
+  ASSERT_EQ(p2p.getLocalState().ll128Buffer, nullptr)
+      << "Rank " << globalRank
+      << ": localState.ll128Buffer should be null when ll128BufferSize == 0";
+  ASSERT_EQ(p2p.getRemoteState().ll128Buffer, nullptr)
+      << "Rank " << globalRank
+      << ": remoteState.ll128Buffer should be null when ll128BufferSize == 0";
+
+  XLOGF(INFO, "Rank {}: Ll128BufferWiring_Disabled test completed", globalRank);
+}
+
+// =============================================================================
+// Dynamic block count tests
+// =============================================================================
+// Verify that changing numBlocks between send/recv rounds works
+// correctly with the maxBlocks layout and host-side barrier.
+
+TEST_F(P2pNvlTransportTestFixture, TileSendRecvDynamicBlockCount) {
+  if (numRanks != 2) {
+    XLOGF(WARNING, "Skipping: requires 2 ranks, got {}", numRanks);
+    return;
+  }
+
+  int peerRank = (globalRank == 0) ? 1 : 0;
+  constexpr int maxBlocks = 32;
+
+  MultiPeerNvlTransportConfig config{
+      .dataBufferSize = 8 * 1024 * 1024, // 8MB slot
+      .chunkSize = 8 * 1024 * 1024,
+      .pipelineDepth = 2,
+      .p2pBarrierCount = static_cast<std::size_t>(maxBlocks),
+      .tile_max_groups = maxBlocks,
+  };
+
+  auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+  MultiPeerNvlTransport transport(globalRank, numRanks, bootstrap, config);
+  transport.exchange();
+  auto p2pHost = transport.buildP2pTransportDevice(peerRank);
+
+  // Sequence of rounds with different block counts and message sizes
+  struct Round {
+    int numBlocks;
+    size_t nBytes;
+  };
+  std::vector<Round> rounds = {
+      {16, 8 * 1024 * 1024}, // 16 blocks, 8MB
+      {32, 16 * 1024 * 1024}, // 32 blocks, 16MB (increase blocks)
+      {8, 4 * 1024 * 1024}, // 8 blocks, 4MB (decrease blocks)
+      {16, 8 * 1024 * 1024}, // 16 blocks again, 8MB
+      {32, 32 * 1024 * 1024}, // 32 blocks, 32MB
+      {4, 1 * 1024 * 1024}, // 4 blocks, 1MB (small)
+      {16, 64 * 1024 * 1024}, // 16 blocks, 64MB (large)
+  };
+
+  Timeout timeout;
+  int prevBlocks = 0;
+
+  for (size_t roundIdx = 0; roundIdx < rounds.size(); roundIdx++) {
+    int numBlocks = rounds[roundIdx].numBlocks;
+    size_t nBytes = rounds[roundIdx].nBytes;
+    int totalBlocks = numBlocks * 2;
+
+    // Unique pattern per round
+    const int pattern = 0x10 + globalRank + static_cast<int>(roundIdx) * 0x20;
+    const int peerPattern = 0x10 + peerRank + static_cast<int>(roundIdx) * 0x20;
+
+    DeviceBuffer sendBuf(nBytes);
+    DeviceBuffer recvBuf(nBytes);
+    CUDACHECK_TEST(cudaMemset(sendBuf.get(), pattern, nBytes));
+    CUDACHECK_TEST(cudaMemset(recvBuf.get(), 0, nBytes));
+
+    comms::pipes::TiledBuffer<char> sendTiles(
+        static_cast<char*>(sendBuf.get()), nBytes, numBlocks);
+    comms::pipes::TiledBuffer<char> recvTiles(
+        static_cast<char*>(recvBuf.get()), nBytes, numBlocks);
+
+    bool needsBarrier = (prevBlocks != 0 && prevBlocks != numBlocks);
+    int numBlocksArg = numBlocks;
+    void* args[] = {
+        &p2pHost,
+        &sendTiles,
+        &recvTiles,
+        &numBlocksArg,
+        &needsBarrier,
+        &timeout};
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    CUDACHECK_TEST(cudaLaunchKernel(
+        (void*)comms::pipes::benchmark::p2pTileSendRecvDynamic,
+        dim3(totalBlocks),
+        dim3(256),
+        args,
+        0,
+        nullptr));
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    // Verify received data
+    std::vector<char> hostBuf(nBytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        hostBuf.data(), recvBuf.get(), nBytes, cudaMemcpyDeviceToHost));
+
+    for (size_t i = 0; i < nBytes; i++) {
+      EXPECT_EQ(
+          static_cast<unsigned char>(hostBuf[i]),
+          static_cast<unsigned char>(peerPattern))
+          << "Round " << roundIdx << " (blocks=" << numBlocks
+          << ", size=" << nBytes << "): Mismatch at byte " << i;
+      if (static_cast<unsigned char>(hostBuf[i]) !=
+          static_cast<unsigned char>(peerPattern)) {
+        break;
+      }
+    }
+
+    prevBlocks = numBlocks;
+  }
+}
 
 } // namespace comms::pipes::tests
 

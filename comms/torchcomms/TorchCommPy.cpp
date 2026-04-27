@@ -9,9 +9,11 @@
 #include <torch/csrc/utils/pybind.h>
 
 #include "comms/torchcomms/BackendWrapper.hpp"
-#include "comms/torchcomms/StoreManager.hpp"
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchWork.hpp"
+
+// Forward declaration for flight recorder submodule init
+void init_flight_recorder_bindings(py::module_& m);
 
 namespace py = pybind11;
 using namespace torch::comms;
@@ -46,7 +48,7 @@ auto py_opaque_class(py::module_& m, const char* name, Extra&&... extra) {
   }
 }
 
-PYBIND11_MODULE(_comms, m) {
+PYBIND11_MODULE(_comms, m, py::mod_gil_not_used()) {
   m.doc() = "Python bindings for TorchComm";
 
   // Bind RedOpType enum
@@ -73,7 +75,7 @@ PYBIND11_MODULE(_comms, m) {
       .def("__copy__", [](const ReduceOp& self) { return self; })
       .def(
           "__deepcopy__",
-          [](const ReduceOp& self, py::dict memo) {
+          [](const ReduceOp& self, const py::dict& memo) {
             auto self_obj = py::cast(self);
             auto self_id =
                 py::cast(reinterpret_cast<uintptr_t>(self_obj.ptr()));
@@ -122,6 +124,10 @@ PYBIND11_MODULE(_comms, m) {
           &CommOptions::store,
           "Store for communication between processes")
       .def_readwrite(
+          "enable_reconfigure",
+          &CommOptions::enable_reconfigure,
+          "If true, enables reconfigure() for fault tolerance")
+      .def_readwrite(
           "hints",
           &CommOptions::hints,
           "Dictionary of string hints for backend-specific options");
@@ -131,6 +137,57 @@ PYBIND11_MODULE(_comms, m) {
       .def(py::init<>(), "Create default BatchP2POptions")
       .def_readwrite("hints", &BatchP2POptions::hints, "Hints dictionary")
       .def_readwrite("timeout", &BatchP2POptions::timeout, "Timeout");
+
+  // ReconfigureOptions for Fault Tolerance API
+  py::class_<ReconfigureOptions>(
+      m,
+      "ReconfigureOptions",
+      R"(
+Options for the reconfigure() fault tolerance API.
+
+The reconfigure call initializes the communicator with a user-provided set
+of peers. After a successful reconfigure call, the communicator is fully
+initialized and collective operations are permitted.
+      )")
+      .def(py::init<>(), "Create default ReconfigureOptions")
+      .def(
+          py::init(
+              [](int64_t uuid,
+                 std::variant<
+                     std::unordered_set<InitHandle>,
+                     std::vector<InitHandle>> handles,
+                 std::optional<std::chrono::milliseconds> timeout,
+                 std::optional<std::unordered_map<std::string, std::string>>
+                     hints) {
+                ReconfigureOptions opts;
+                opts.uuid = uuid;
+                opts.handles = std::move(handles);
+                opts.timeout = timeout;
+                if (hints) {
+                  opts.hints = *hints;
+                }
+                return opts;
+              }),
+          py::arg("uuid"),
+          py::arg("init_handles"),
+          py::arg("timeout") = std::nullopt,
+          py::arg("hints") = std::nullopt)
+      .def_readwrite(
+          "uuid",
+          &ReconfigureOptions::uuid,
+          "Uniquely identifies this instance of the communicator")
+      .def_readwrite(
+          "init_handles",
+          &ReconfigureOptions::handles,
+          "Init handles of ranks that will participate in this communicator")
+      .def_readwrite(
+          "timeout",
+          &ReconfigureOptions::timeout,
+          "How long to allow reconfiguration to take before failing")
+      .def_readwrite(
+          "hints",
+          &ReconfigureOptions::hints,
+          "Additional configuration key-value pairs");
 
   // Bind TorchWork class
   intrusive_ptr_class_<TorchWork>(
@@ -179,6 +236,21 @@ Block the current stream until the work is completed.
 
 See https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-streams for more details.
           )",
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "wait_blocking",
+          &TorchWork::waitBlocking,
+          R"(
+Block the CPU thread until the work is completed.
+
+Unlike wait(), which blocks only the current CUDA stream, this method
+blocks the CPU thread itself until the operation completes. This is useful
+for fault tolerance scenarios where you need to ensure an operation has
+completed before proceeding.
+
+Raises:
+    RuntimeError: If not implemented by the backend.
+          )",
           py::call_guard<py::gil_scoped_release>());
 
   py::enum_<TorchCommWinAccessType>(
@@ -189,6 +261,252 @@ See https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-streams for more d
       .value(
           "WIN_ACCESS_TYPE_SEPARATE",
           TorchCommWinAccessType::WIN_ACCESS_TYPE_SEPARATE);
+
+  // Bind OpName enum for hooks
+  py::enum_<OpName>(m, "OpName", "Collective operation name for hooks.")
+      .value("send", OpName::send)
+      .value("recv", OpName::recv)
+      .value("broadcast", OpName::broadcast)
+      .value("all_reduce", OpName::all_reduce)
+      .value("reduce", OpName::reduce)
+      .value("all_gather", OpName::all_gather)
+      .value("all_gather_v", OpName::all_gather_v)
+      .value("all_gather_single", OpName::all_gather_single)
+      .value("reduce_scatter", OpName::reduce_scatter)
+      .value("reduce_scatter_v", OpName::reduce_scatter_v)
+      .value("reduce_scatter_single", OpName::reduce_scatter_single)
+      .value("all_to_all_single", OpName::all_to_all_single)
+      .value("all_to_all_v_single", OpName::all_to_all_v_single)
+      .value("all_to_all", OpName::all_to_all)
+      .value("barrier", OpName::barrier)
+      .value("scatter", OpName::scatter)
+      .value("gather", OpName::gather)
+      .value("gather_single", OpName::gather_single)
+      .value("split", OpName::split)
+      .value("new_window", OpName::new_window);
+
+  // Bind RemovableHandle class for hook management
+  py::class_<RemovableHandle, std::unique_ptr<RemovableHandle>>(
+      m,
+      "RemovableHandle",
+      R"(
+Handle for removing a registered hook.
+
+Call remove() to unregister the hook. The hook will be automatically
+unregistered when the handle is garbage collected if remove() was not called.
+      )")
+      .def(
+          "remove",
+          &RemovableHandle::remove,
+          "Unregister the hook associated with this handle.");
+
+  // -- Python-only pre-hook args structs (value types, no references) --
+  // These mirror the C++ PreHookArgs but with value members so pybind can
+  // handle them. Constructed in the hook registration lambda from the C++
+  // reference-based args.
+
+  // In-place collectives
+  struct PySendPreHookArgs {
+    at::Tensor tensor;
+    int peer;
+    bool async_op;
+  };
+  struct PyRecvPreHookArgs {
+    at::Tensor tensor;
+    int peer;
+    bool async_op;
+  };
+  struct PyBroadcastPreHookArgs {
+    at::Tensor tensor;
+    int root;
+    bool async_op;
+  };
+  struct PyAllReducePreHookArgs {
+    at::Tensor tensor;
+    bool async_op;
+  };
+  struct PyReducePreHookArgs {
+    at::Tensor tensor;
+    int root;
+    bool async_op;
+  };
+  // Distinct input/output
+  struct PyAllGatherPreHookArgs {
+    at::Tensor input;
+    std::vector<at::Tensor> output;
+    bool async_op;
+  };
+  struct PyAllGatherVPreHookArgs {
+    at::Tensor input;
+    std::vector<at::Tensor> output;
+    bool async_op;
+  };
+  struct PyAllGatherSinglePreHookArgs {
+    at::Tensor input;
+    at::Tensor output;
+    bool async_op;
+  };
+  struct PyReduceScatterPreHookArgs {
+    std::vector<at::Tensor> input;
+    at::Tensor output;
+    bool async_op;
+  };
+  struct PyReduceScatterVPreHookArgs {
+    std::vector<at::Tensor> input;
+    at::Tensor output;
+    bool async_op;
+  };
+  struct PyReduceScatterSinglePreHookArgs {
+    at::Tensor input;
+    at::Tensor output;
+    bool async_op;
+  };
+  struct PyAllToAllSinglePreHookArgs {
+    at::Tensor input;
+    at::Tensor output;
+    bool async_op;
+  };
+  struct PyAllToAllVSinglePreHookArgs {
+    at::Tensor input;
+    at::Tensor output;
+    std::vector<uint64_t> input_split_sizes;
+    std::vector<uint64_t> output_split_sizes;
+    bool async_op;
+  };
+  struct PyAllToAllPreHookArgs {
+    std::vector<at::Tensor> input;
+    std::vector<at::Tensor> output;
+    bool async_op;
+  };
+  struct PyBarrierPreHookArgs {
+    bool async_op;
+  };
+  struct PyScatterPreHookArgs {
+    at::Tensor output;
+    std::vector<at::Tensor> input;
+    int root;
+    bool async_op;
+  };
+  struct PyGatherPreHookArgs {
+    at::Tensor input;
+    std::vector<at::Tensor> output;
+    int root;
+    bool async_op;
+  };
+  struct PyGatherSinglePreHookArgs {
+    at::Tensor input;
+    at::Tensor output;
+    int root;
+    bool async_op;
+  };
+  struct PySplitPreHookArgs {
+    std::vector<int> ranks;
+    std::string name;
+  };
+  struct PyNewWindowPreHookArgs {};
+  struct PyBatchOpIssuePreHookArgs {
+    size_t num_ops;
+    bool async_op;
+  };
+
+  // Post-hook args (value types)
+  struct PyCollectivePostHookArgs {};
+  struct PySplitPostHookArgs {};
+  struct PyNewWindowPostHookArgs {};
+  struct PyBatchOpIssuePostHookArgs {};
+
+  // Register pre-hook arg types
+  py::class_<PySendPreHookArgs>(m, "SendPreHookArgs")
+      .def_readonly("tensor", &PySendPreHookArgs::tensor)
+      .def_readonly("peer", &PySendPreHookArgs::peer)
+      .def_readonly("async_op", &PySendPreHookArgs::async_op);
+  py::class_<PyRecvPreHookArgs>(m, "RecvPreHookArgs")
+      .def_readonly("tensor", &PyRecvPreHookArgs::tensor)
+      .def_readonly("peer", &PyRecvPreHookArgs::peer)
+      .def_readonly("async_op", &PyRecvPreHookArgs::async_op);
+  py::class_<PyBroadcastPreHookArgs>(m, "BroadcastPreHookArgs")
+      .def_readonly("tensor", &PyBroadcastPreHookArgs::tensor)
+      .def_readonly("root", &PyBroadcastPreHookArgs::root)
+      .def_readonly("async_op", &PyBroadcastPreHookArgs::async_op);
+  py::class_<PyAllReducePreHookArgs>(m, "AllReducePreHookArgs")
+      .def_readonly("tensor", &PyAllReducePreHookArgs::tensor)
+      .def_readonly("async_op", &PyAllReducePreHookArgs::async_op);
+  py::class_<PyReducePreHookArgs>(m, "ReducePreHookArgs")
+      .def_readonly("tensor", &PyReducePreHookArgs::tensor)
+      .def_readonly("root", &PyReducePreHookArgs::root)
+      .def_readonly("async_op", &PyReducePreHookArgs::async_op);
+  py::class_<PyAllGatherPreHookArgs>(m, "AllGatherPreHookArgs")
+      .def_readonly("input", &PyAllGatherPreHookArgs::input)
+      .def_readonly("output", &PyAllGatherPreHookArgs::output)
+      .def_readonly("async_op", &PyAllGatherPreHookArgs::async_op);
+  py::class_<PyAllGatherVPreHookArgs>(m, "AllGatherVPreHookArgs")
+      .def_readonly("input", &PyAllGatherVPreHookArgs::input)
+      .def_readonly("output", &PyAllGatherVPreHookArgs::output)
+      .def_readonly("async_op", &PyAllGatherVPreHookArgs::async_op);
+  py::class_<PyAllGatherSinglePreHookArgs>(m, "AllGatherSinglePreHookArgs")
+      .def_readonly("input", &PyAllGatherSinglePreHookArgs::input)
+      .def_readonly("output", &PyAllGatherSinglePreHookArgs::output)
+      .def_readonly("async_op", &PyAllGatherSinglePreHookArgs::async_op);
+  py::class_<PyReduceScatterPreHookArgs>(m, "ReduceScatterPreHookArgs")
+      .def_readonly("input", &PyReduceScatterPreHookArgs::input)
+      .def_readonly("output", &PyReduceScatterPreHookArgs::output)
+      .def_readonly("async_op", &PyReduceScatterPreHookArgs::async_op);
+  py::class_<PyReduceScatterVPreHookArgs>(m, "ReduceScatterVPreHookArgs")
+      .def_readonly("input", &PyReduceScatterVPreHookArgs::input)
+      .def_readonly("output", &PyReduceScatterVPreHookArgs::output)
+      .def_readonly("async_op", &PyReduceScatterVPreHookArgs::async_op);
+  py::class_<PyReduceScatterSinglePreHookArgs>(
+      m, "ReduceScatterSinglePreHookArgs")
+      .def_readonly("input", &PyReduceScatterSinglePreHookArgs::input)
+      .def_readonly("output", &PyReduceScatterSinglePreHookArgs::output)
+      .def_readonly("async_op", &PyReduceScatterSinglePreHookArgs::async_op);
+  py::class_<PyAllToAllSinglePreHookArgs>(m, "AllToAllSinglePreHookArgs")
+      .def_readonly("input", &PyAllToAllSinglePreHookArgs::input)
+      .def_readonly("output", &PyAllToAllSinglePreHookArgs::output)
+      .def_readonly("async_op", &PyAllToAllSinglePreHookArgs::async_op);
+  py::class_<PyAllToAllVSinglePreHookArgs>(m, "AllToAllVSinglePreHookArgs")
+      .def_readonly("input", &PyAllToAllVSinglePreHookArgs::input)
+      .def_readonly("output", &PyAllToAllVSinglePreHookArgs::output)
+      .def_readonly(
+          "input_split_sizes", &PyAllToAllVSinglePreHookArgs::input_split_sizes)
+      .def_readonly(
+          "output_split_sizes",
+          &PyAllToAllVSinglePreHookArgs::output_split_sizes)
+      .def_readonly("async_op", &PyAllToAllVSinglePreHookArgs::async_op);
+  py::class_<PyAllToAllPreHookArgs>(m, "AllToAllPreHookArgs")
+      .def_readonly("input", &PyAllToAllPreHookArgs::input)
+      .def_readonly("output", &PyAllToAllPreHookArgs::output)
+      .def_readonly("async_op", &PyAllToAllPreHookArgs::async_op);
+  py::class_<PyBarrierPreHookArgs>(m, "BarrierPreHookArgs")
+      .def_readonly("async_op", &PyBarrierPreHookArgs::async_op);
+  py::class_<PyScatterPreHookArgs>(m, "ScatterPreHookArgs")
+      .def_readonly("output", &PyScatterPreHookArgs::output)
+      .def_readonly("input", &PyScatterPreHookArgs::input)
+      .def_readonly("root", &PyScatterPreHookArgs::root)
+      .def_readonly("async_op", &PyScatterPreHookArgs::async_op);
+  py::class_<PyGatherPreHookArgs>(m, "GatherPreHookArgs")
+      .def_readonly("input", &PyGatherPreHookArgs::input)
+      .def_readonly("output", &PyGatherPreHookArgs::output)
+      .def_readonly("root", &PyGatherPreHookArgs::root)
+      .def_readonly("async_op", &PyGatherPreHookArgs::async_op);
+  py::class_<PyGatherSinglePreHookArgs>(m, "GatherSinglePreHookArgs")
+      .def_readonly("input", &PyGatherSinglePreHookArgs::input)
+      .def_readonly("output", &PyGatherSinglePreHookArgs::output)
+      .def_readonly("root", &PyGatherSinglePreHookArgs::root)
+      .def_readonly("async_op", &PyGatherSinglePreHookArgs::async_op);
+  py::class_<PySplitPreHookArgs>(m, "SplitPreHookArgs")
+      .def_readonly("ranks", &PySplitPreHookArgs::ranks)
+      .def_readonly("name", &PySplitPreHookArgs::name);
+  py::class_<PyNewWindowPreHookArgs>(m, "NewWindowPreHookArgs");
+  py::class_<PyBatchOpIssuePreHookArgs>(m, "BatchOpIssuePreHookArgs")
+      .def_readonly("num_ops", &PyBatchOpIssuePreHookArgs::num_ops)
+      .def_readonly("async_op", &PyBatchOpIssuePreHookArgs::async_op);
+
+  // Post-hook arg types
+  py::class_<PyCollectivePostHookArgs>(m, "CollectivePostHookArgs");
+  py::class_<PySplitPostHookArgs>(m, "SplitPostHookArgs");
+  py::class_<PyNewWindowPostHookArgs>(m, "NewWindowPostHookArgs");
+  py::class_<PyBatchOpIssuePostHookArgs>(m, "BatchOpIssuePostHookArgs");
 
   py::class_<TorchCommWindowAttr, std::shared_ptr<TorchCommWindowAttr>>(
       m, "TorchCommWindowAttr", "Window attributes.")
@@ -206,7 +524,8 @@ See https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-streams for more d
           [](const std::shared_ptr<TorchCommWindow>& self) { return self; })
       .def(
           "__deepcopy__",
-          [](const std::shared_ptr<TorchCommWindow>& self, py::dict memo) {
+          [](const std::shared_ptr<TorchCommWindow>& self,
+             const py::dict& memo) {
             auto self_obj = py::cast(self);
             auto self_id =
                 py::cast(reinterpret_cast<uintptr_t>(self_obj.ptr()));
@@ -230,8 +549,8 @@ See https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-streams for more d
           })
       .def(
           "tensor_register",
-          [](TorchCommWindow& self, const at::Tensor& tensor) {
-            self.tensor_register(tensor);
+          [](TorchCommWindow& self, const at::Tensor& tensor, bool owning) {
+            self.tensor_register(tensor, owning);
           },
           R"(
 Register a tensor buffer with the window for RMA operations.
@@ -239,11 +558,22 @@ Register a tensor buffer with the window for RMA operations.
 Args:
     tensor (torch.Tensor): Contiguous tensor to register. Must be allocated
         within a memory pool created via ``torchcomms.get_mem_allocator()``.
+    owning (bool): If True (default), the window holds a reference to the tensor,
+        keeping its storage alive. If False, the window does NOT hold a reference
+        — the caller must ensure the tensor remains alive for the window's lifetime.
+        Use ``owning=False`` in CUDA graph capture mode to allow tensor memory
+        reuse within the graph.
 
 Raises:
     RuntimeError: If tensor is not contiguous or a buffer is already registered.
 
-Example:
+Note:
+    When ``owning=False``, the window holds a **non-owned** reference to the
+    underlying buffer — it does not prevent the tensor from being deallocated.
+    The caller must ensure the tensor remains alive for the entire lifetime of
+    the window. Use this mode when capturing CUDA graphs to allow memory reuse.
+
+Example (standard usage with owning=True):
 
 .. code-block:: python
 
@@ -255,10 +585,45 @@ Example:
         buffer = torch.ones([size], dtype=dtype, device=device)
 
     window = comm.new_window()
-    window.tensor_register(buffer)
+    window.tensor_register(buffer)  # owning=True is default
+
+Example (CUDA graph capture with owning=False for memory reuse):
+
+.. code-block:: python
+
+    import torch
+    import torchcomms
+
+    # Create communicator and window outside the graph
+    comm = torchcomms.TorchCommNCCLX(...)
+    h_win = comm.new_window()
+
+    # Capture CUDA graph with non-owning tensor registration
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        buf = torch.empty([size], dtype=dtype, device=device)
+        h_win.tensor_register(buf, owning=False)
+        d_win = h_win.get_device_window()
+
+        # Launch kernels using d_win
+        kernel1(d_win)
+        kernel2(d_win)
+
+        # Now done using d_win and buf, delete it
+        del buf  # Physical memory can be reused within graph
+
+        # NOTE: d_win cannot be used for RMA ops after del buf in this capture,
+        # but it WILL work during graph replay (CUDA replays captured addresses)
+
+    # During replay, d_win uses the captured buffer address
+    graph.replay()
+
+    # NOTE: tensor_register() currently doesn't work inside graph capture as it
+    # calls cudaSyncrhonize() etc, this needs to be fixed separately.
 
       )",
           py::arg("tensor"),
+          py::arg("owning") = true,
           py::call_guard<py::gil_scoped_release>())
       .def(
           "tensor_deregister",
@@ -297,7 +662,9 @@ Returns:
 Get the registered tensor buffer, if any.
 
 Returns:
-    Optional[torch.Tensor]: The registered tensor, or None if no tensor is registered.
+    Optional[torch.Tensor]: The registered tensor, or ``None`` if no tensor is
+    registered or if the window was created in CUDA graph capture mode (where
+    the buffer is non-owned).
 
       )")
       .def_property_readonly(
@@ -544,7 +911,75 @@ Example:
 
       )",
           py::arg("rank"),
-          py::call_guard<py::gil_scoped_release>());
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_device_window",
+          [](TorchCommWindow& self, int sc, int cc, int bc) {
+            return reinterpret_cast<int64_t>(
+                self.get_device_window(sc, cc, bc));
+          },
+          R"(
+Get a device-side window handle for GPU-initiated operations.
+
+Returns a pointer (as int64) that can be passed to Triton kernels via
+the torchcomms_* extern functions (put_block, signal_block, etc.).
+
+The window is lazily created on first call and cached. Requires NCCLX
+backend with device API support (NCCLX 2.28+).
+
+Args:
+    signal_count: Number of signal slots to allocate (-1 for default).
+    counter_count: Number of counter slots to allocate (-1 for default).
+    barrier_count: Number of barrier slots to allocate (default 1).
+
+Returns:
+    int: Device window pointer as int64.
+
+Raises:
+    RuntimeError: If this backend does not yet support the device API.
+)",
+          py::arg("signal_count") = -1,
+          py::arg("counter_count") = -1,
+          py::arg("barrier_count") = 1,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "register_local_buffer",
+          [](TorchCommWindow& self, const at::Tensor& tensor) -> int64_t {
+            py::gil_scoped_release release;
+            return self.register_local_buffer_handle(tensor);
+          },
+          R"(
+Register a local buffer for use as source in device-side put operations.
+
+NON-COLLECTIVE. Must call tensor_register() then get_device_window() first.
+
+Args:
+    tensor: Source tensor to register as a local buffer.
+
+Returns:
+    int: Opaque device handle for use in Triton put_block() calls.
+         Pass this handle to deregister_local_buffer() when done.
+
+Raises:
+    RuntimeError: If this backend does not yet support the device API.
+)",
+          py::arg("tensor"))
+      .def(
+          "deregister_local_buffer",
+          [](TorchCommWindow& self, int64_t handle) {
+            py::gil_scoped_release release;
+            self.deregister_local_buffer_handle(handle);
+          },
+          R"(
+Deregister a previously registered local buffer. NON-COLLECTIVE.
+
+Args:
+    handle: Device handle returned by register_local_buffer().
+
+Raises:
+    RuntimeError: If this backend does not yet support the device API.
+)",
+          py::arg("handle"));
 
   // Bind BatchSendRecv::P2POp class
   py::class_<BatchSendRecv::P2POp>(
@@ -619,11 +1054,7 @@ Args:
           py::arg("async_op"),
           py::arg("options") = BatchP2POptions(),
           py::call_guard<py::gil_scoped_release>())
-      .def_readwrite(
-          "ops",
-          &BatchSendRecv::ops,
-          "List of P2P operations",
-          py::call_guard<py::gil_scoped_release>());
+      .def_readwrite("ops", &BatchSendRecv::ops, "List of P2P operations");
 
   m.def(
       "new_comm",
@@ -634,6 +1065,7 @@ Args:
          std::optional<std::chrono::milliseconds> timeout,
          std::optional<bool> high_priority_stream,
          std::optional<c10::intrusive_ptr<c10d::Store>> store,
+         bool enable_reconfigure,
          std::optional<std::unordered_map<std::string, std::string>> hints) {
         py::module_ torchcomms = py::module_::import("torchcomms");
         torchcomms.attr("_load_backend")(backend);
@@ -658,6 +1090,7 @@ Args:
           if (hints) {
             opts.hints = *hints;
           }
+          opts.enable_reconfigure = enable_reconfigure;
 
           return new_comm(backend, device, name, opts);
         }
@@ -686,6 +1119,9 @@ Args:
   timeout (timedelta): Timeout for initialization.
   high_priority_stream (bool): Whether to use high priority stream.
   store (torch.distributed.Store): Store used to initialize the communicator between processes.
+  enable_reconfigure (bool): If True, enables reconfigure() for fault tolerance.
+      With reconfigure enabled, the communicator is not initialized until
+      reconfigure() is called. Default is False.
   hints (dict): Dictionary of string hints for backend-specific options.
       )",
       py::arg("backend"),
@@ -695,6 +1131,7 @@ Args:
       py::arg("timeout") = std::nullopt,
       py::arg("high_priority_stream") = std::nullopt,
       py::arg("store") = nullptr,
+      py::arg("enable_reconfigure") = false,
       py::arg("hints") = std::nullopt);
 
   py::class_<TorchCommBackend, std::shared_ptr<TorchCommBackend>>(
@@ -712,7 +1149,7 @@ Args:
           [](const std::shared_ptr<TorchComm>& self) { return self; })
       .def(
           "__deepcopy__",
-          [](const std::shared_ptr<TorchComm>& self, py::dict memo) {
+          [](const std::shared_ptr<TorchComm>& self, const py::dict& memo) {
             auto self_obj = py::cast(self);
             auto self_id =
                 py::cast(reinterpret_cast<uintptr_t>(self_obj.ptr()));
@@ -758,16 +1195,132 @@ Args:
           "Get communicator backend name",
           py::call_guard<py::gil_scoped_release>())
       .def(
-          "unsafe_get_backend",
-          &TorchComm::unsafeGetBackend,
+          "get_backend_version",
+          &TorchComm::getBackendVersion,
+          "Get communicator backend version",
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_backend_impl",
+          &TorchComm::getBackendImpl,
           R"(
 Get communicator backend implementation.
 
 WARNING: This is intended as an escape hatch for experimentation and
 development. Direct backend access provides no backwards compatibility
-guarantees. Users depending on unsafe_get_backend should expect their code to
+guarantees. Users depending on get_backend_impl should expect their code to
 break as interfaces change.
           )",
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "unsafe_get_backend",
+          [](TorchComm& self) {
+            PyErr_WarnEx(
+                PyExc_DeprecationWarning,
+                "unsafe_get_backend() is deprecated, "
+                "use get_backend_impl() instead.",
+                1);
+            return self.getBackendImpl();
+          },
+          R"(
+Deprecated: Use get_backend_impl() instead.
+          )")
+      .def(
+          "get_init_handle",
+          &TorchComm::getInitHandle,
+          R"(
+Get the initialization handle for this communicator.
+
+In dynamic regime, this handle encodes information required by the backend
+to complete the initialization process via reconfigure().
+
+Returns:
+    An InitHandle string.
+
+Raises:
+    RuntimeError: If not implemented by the backend.
+          )",
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "reconfigure",
+          [](TorchComm& self,
+             int64_t uuid,
+             std::variant<
+                 std::unordered_set<InitHandle>,
+                 std::vector<InitHandle>> handles,
+             std::optional<std::chrono::milliseconds> timeout,
+             std::optional<std::unordered_map<std::string, std::string>>
+                 hints) {
+            ReconfigureOptions opts;
+            opts.uuid = uuid;
+            opts.handles = std::move(handles);
+            opts.timeout = timeout;
+            if (hints) {
+              opts.hints = *hints;
+            }
+            return self.reconfigure(opts);
+          },
+          R"(
+Reconfigure the communicator with a new set of peers.
+
+In dynamic regime, this method initializes the communicator with the
+provided set of peers. After a successful reconfigure call, the
+communicator is fully initialized and collective operations are permitted.
+
+Args:
+    uuid: Uniquely identifies this instance of the communicator. The uuid
+        must not have been used previously on this communicator.
+    init_handles: The init handles of all ranks that will participate in this
+        communicator. Can be either a ``list[str]`` (guarantees that assigned
+        ranks correspond to position of handle in the list) or a ``set[str]``
+        (the backend will determine the rank assignment).
+    timeout: How long to allow reconfiguration to take before failing.
+        If None, uses the backend's default timeout.
+    hints: Additional configuration key-value pairs, implementation-specific.
+
+Returns:
+    A TorchWork handle that can be used to wait for completion.
+
+Raises:
+    RuntimeError: If not implemented by the backend.
+
+Example:
+    >>> comm = torchcomms.new_comm("mccl", device, "my_comm", init_dynamic_regime=True)
+    >>> my_handle = comm.get_init_handle()
+    >>> # Exchange handles with all ranks via store/coordinator
+    >>> all_handles = collect_handles_from_all_ranks(my_handle)
+    >>> work = comm.reconfigure(
+    ...     uuid=0,
+    ...     init_handles=all_handles,
+    ...     timeout=timedelta(milliseconds=5000)
+    ... )
+    >>> work.wait_blocking()
+    >>> # Now collective operations are permitted
+    >>> comm.all_reduce(tensor, op=torchcomms.ReduceOp.SUM, async_op=False)
+          )",
+          py::arg("uuid"),
+          py::arg("init_handles"),
+          py::arg("timeout") = std::nullopt,
+          py::arg("hints") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_device_transport",
+          &TorchComm::get_device_transport,
+          R"(
+Get a device-allocated transport handle for pipes transport operations.
+
+Returns a device pointer (as int64) to a MultiPeerDeviceHandle that can be
+passed to Triton transport extern functions (transport.send, transport.recv,
+transport.signal, etc.).
+
+The handle is lazily created on first call and cached. The returned pointer
+is valid until the communicator is destroyed.
+
+Returns:
+    int: Device transport pointer as int64, suitable for passing to Triton kernels.
+
+Raises:
+    RuntimeError: If the backend does not support device transport.
+)",
           py::call_guard<py::gil_scoped_release>())
 
       // Point-to-Point Operations
@@ -1386,11 +1939,47 @@ Args:
           py::arg("hints") = std::nullopt,
           py::arg("timeout") = std::nullopt,
           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "gather_single",
+          [](TorchComm& self,
+             at::Tensor& output,
+             const at::Tensor& input,
+             int root,
+             bool async_op,
+             std::optional<std::unordered_map<std::string, std::string>> hints,
+             std::optional<std::chrono::milliseconds> timeout) {
+            GatherSingleOptions opts;
+            if (hints) {
+              opts.hints = *hints;
+            }
+            if (timeout) {
+              opts.timeout = *timeout;
+            }
+            return self.gather_single(output, input, root, async_op, opts);
+          },
+          R"(
+Gather the input tensor from all ranks to the root using a single output tensor.
+
+Args:
+    output: Output tensor on the root rank. Ignored on non-root ranks.
+    input: Input tensor to gather.
+    root: The root rank.
+    async_op: Whether to perform the operation asynchronously.
+    hints: Dictionary of string hints for backend-specific options.
+    timeout: Timeout for the operation.
+          )",
+          py::arg("output"),
+          py::arg("input"),
+          py::arg("root"),
+          py::arg("async_op"),
+          py::arg("hints") = std::nullopt,
+          py::arg("timeout") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>())
 
       // window operations
       .def(
           "new_window",
-          [](TorchComm& self, std::optional<at::Tensor> tensor) {
+          [](TorchComm& self, const std::optional<at::Tensor>& tensor) {
             return self.new_window(tensor);
           },
           R"(
@@ -1449,6 +2038,111 @@ Example:
           py::arg("tensor") = std::nullopt,
           py::call_guard<py::gil_scoped_release>())
 
+      // Persistent AllGather operations
+      .def(
+          "all_gather_p_init",
+          [](TorchComm& self,
+             at::Tensor& output,
+             std::optional<std::unordered_map<std::string, std::string>> hints,
+             std::optional<std::chrono::milliseconds> timeout) {
+            AllGatherPInitOptions opts;
+            if (hints) {
+              opts.hints = *hints;
+            }
+            if (timeout) {
+              opts.timeout = *timeout;
+            }
+            return self.all_gather_p_init(output, opts);
+          },
+          R"(
+Initialize a persistent AllGather operation.
+
+This is a SM free collective operation where the memory is pre-registered and uses 
+Copy Engine or DMA to move data from one rank to the other.
+
+Args:
+    output: Pre-allocated output tensor of size (world_size * input_size).
+    hints: Dictionary of string hints for backend-specific options.
+    timeout: Timeout for the operation.
+
+Returns:
+    An opaque handle to use with all_gather_p_exec and all_gather_p_free.
+
+Note:
+    Requires ``rcclx`` backend.
+
+Example:
+
+.. code-block:: python
+
+    # Initialize once
+    handle = comm.all_gather_p_init(output_tensor)
+
+    # Execute many times
+    for input_tensor in inputs:
+        work = comm.all_gather_p_exec(handle, input_tensor, async_op=True)
+        work.wait()
+
+    # Free when done
+    comm.all_gather_p_free(handle)
+
+          )",
+          py::arg("output"),
+          py::arg("hints") = std::nullopt,
+          py::arg("timeout") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "all_gather_p_exec",
+          [](TorchComm& self,
+             TorchCommBackend::AllGatherPHandle handle,
+             const at::Tensor& input,
+             bool async_op,
+             std::optional<std::unordered_map<std::string, std::string>> hints,
+             std::optional<std::chrono::milliseconds> timeout) {
+            AllGatherPExecOptions opts;
+            if (hints) {
+              opts.hints = *hints;
+            }
+            if (timeout) {
+              opts.timeout = *timeout;
+            }
+            return self.all_gather_p_exec(handle, input, async_op, opts);
+          },
+          R"(
+Execute a persistent AllGather operation.
+
+Args:
+    handle: Handle returned by all_gather_p_init.
+    input: Input tensor to gather from all ranks.
+    async_op: Whether to perform the operation asynchronously.
+    hints: Dictionary of string hints for backend-specific options.
+    timeout: Timeout for the operation.
+
+Returns:
+    TorchWork: Work object for synchronization.
+
+          )",
+          py::arg("handle"),
+          py::arg("input"),
+          py::arg("async_op"),
+          py::arg("hints") = std::nullopt,
+          py::arg("timeout") = std::nullopt,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "all_gather_p_free",
+          [](TorchComm& self, TorchCommBackend::AllGatherPHandle handle) {
+            self.all_gather_p_free(handle);
+          },
+          R"(
+Free a persistent AllGather handle.
+
+Args:
+    handle: Handle returned by all_gather_p_init.
+
+          )",
+          py::arg("handle"),
+          py::call_guard<py::gil_scoped_release>())
+
       // Communicator Management
       .def(
           "split",
@@ -1500,7 +2194,267 @@ Raises: RuntimeError if the ranks list is non-empty and the current rank is not 
       .def_property_readonly(
           "mem_allocator",
           [](TorchComm& self) { return get_mem_allocator(self.getBackend()); },
-          "Get the communication-specific memory allocator");
+          "Get the communication-specific memory allocator")
+
+      // Hook registration methods
+      .def(
+          "register_pre_hook",
+          [](TorchComm& self, const py::function& callback) {
+            auto hook = [callback](
+                            OpName name,
+                            size_t op_id,
+                            const PreHookArgs& args) {
+              py::gil_scoped_acquire acquire;
+              py::object py_args = std::visit(
+                  [](const auto& a) -> py::object {
+                    using T = std::decay_t<decltype(a)>;
+                    if constexpr (std::is_same_v<T, SendPreHookArgs>) {
+                      return py::cast(
+                          PySendPreHookArgs{a.tensor, a.peer, a.async_op});
+                    } else if constexpr (std::is_same_v<T, RecvPreHookArgs>) {
+                      return py::cast(
+                          PyRecvPreHookArgs{a.tensor, a.peer, a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             BroadcastPreHookArgs>) {
+                      return py::cast(
+                          PyBroadcastPreHookArgs{a.tensor, a.root, a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllReducePreHookArgs>) {
+                      return py::cast(
+                          PyAllReducePreHookArgs{a.tensor, a.async_op});
+                    } else if constexpr (std::is_same_v<T, ReducePreHookArgs>) {
+                      return py::cast(
+                          PyReducePreHookArgs{a.tensor, a.root, a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllGatherPreHookArgs>) {
+                      return py::cast(
+                          PyAllGatherPreHookArgs{
+                              a.input,
+                              {a.output.begin(), a.output.end()},
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllGatherVPreHookArgs>) {
+                      return py::cast(
+                          PyAllGatherVPreHookArgs{
+                              a.input,
+                              {a.output.begin(), a.output.end()},
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllGatherSinglePreHookArgs>) {
+                      return py::cast(
+                          PyAllGatherSinglePreHookArgs{
+                              a.input, a.output, a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             ReduceScatterPreHookArgs>) {
+                      return py::cast(
+                          PyReduceScatterPreHookArgs{
+                              {a.input.begin(), a.input.end()},
+                              a.output,
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             ReduceScatterVPreHookArgs>) {
+                      return py::cast(
+                          PyReduceScatterVPreHookArgs{
+                              {a.input.begin(), a.input.end()},
+                              a.output,
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             ReduceScatterSinglePreHookArgs>) {
+                      return py::cast(
+                          PyReduceScatterSinglePreHookArgs{
+                              a.input, a.output, a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllToAllSinglePreHookArgs>) {
+                      return py::cast(
+                          PyAllToAllSinglePreHookArgs{
+                              a.input, a.output, a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllToAllVSinglePreHookArgs>) {
+                      return py::cast(
+                          PyAllToAllVSinglePreHookArgs{
+                              a.input,
+                              a.output,
+                              {a.input_split_sizes.begin(),
+                               a.input_split_sizes.end()},
+                              {a.output_split_sizes.begin(),
+                               a.output_split_sizes.end()},
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             AllToAllPreHookArgs>) {
+                      return py::cast(
+                          PyAllToAllPreHookArgs{
+                              {a.input.begin(), a.input.end()},
+                              {a.output.begin(), a.output.end()},
+                              a.async_op});
+                    } else if constexpr (std::
+                                             is_same_v<T, BarrierPreHookArgs>) {
+                      return py::cast(PyBarrierPreHookArgs{a.async_op});
+                    } else if constexpr (std::
+                                             is_same_v<T, ScatterPreHookArgs>) {
+                      return py::cast(
+                          PyScatterPreHookArgs{
+                              a.output,
+                              {a.input.begin(), a.input.end()},
+                              a.root,
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<T, GatherPreHookArgs>) {
+                      return py::cast(
+                          PyGatherPreHookArgs{
+                              a.input,
+                              {a.output.begin(), a.output.end()},
+                              a.root,
+                              a.async_op});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             GatherSinglePreHookArgs>) {
+                      return py::cast(
+                          PyGatherSinglePreHookArgs{
+                              a.input, a.output, a.root, a.async_op});
+                    } else if constexpr (std::is_same_v<T, SplitPreHookArgs>) {
+                      return py::cast(
+                          PySplitPreHookArgs{
+                              {a.ranks.begin(), a.ranks.end()},
+                              std::string(a.name)});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             NewWindowPreHookArgs>) {
+                      return py::cast(PyNewWindowPreHookArgs{});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             BatchOpIssuePreHookArgs>) {
+                      return py::cast(
+                          PyBatchOpIssuePreHookArgs{a.num_ops, a.async_op});
+                    } else {
+                      return py::none();
+                    }
+                  },
+                  args);
+              callback(name, op_id, py_args);
+            };
+            return self.registerPreHook(std::move(hook));
+          },
+          R"doc(
+Register a pre-hook callback that is called before each collective operation.
+
+The callback receives (name, op_id, args) where args is the typed
+per-collective pre-hook args object (e.g., AllReducePreHookArgs).
+
+Args:
+    callback: A callable that takes (name, op_id, args).
+
+Returns:
+    RemovableHandle: A handle that can be used to unregister the hook.
+
+Example::
+
+    def my_pre_hook(args):
+        print(f"Starting {args.name}")
+    handle = comm.register_pre_hook(my_pre_hook)
+    # ... run operations ...
+    handle.remove()  # Unregister when done
+
+Note:
+    Hooks are not thread-safe and must not be modified while a collective
+    operation is in progress.
+          )doc",
+          py::arg("callback"))
+      .def(
+          "register_post_hook",
+          [](TorchComm& self, const py::function& callback) {
+            auto hook = [callback](size_t op_id, const PostHookArgs& args) {
+              py::gil_scoped_acquire acquire;
+              py::object py_args = std::visit(
+                  [](const auto& a) -> py::object {
+                    using T = std::decay_t<decltype(a)>;
+                    if constexpr (std::is_same_v<T, SplitPostHookArgs>) {
+                      return py::cast(PySplitPostHookArgs{});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             NewWindowPostHookArgs>) {
+                      return py::cast(PyNewWindowPostHookArgs{});
+                    } else if constexpr (std::is_same_v<
+                                             T,
+                                             BatchOpIssuePostHookArgs>) {
+                      return py::cast(PyBatchOpIssuePostHookArgs{});
+                    } else {
+                      return py::cast(PyCollectivePostHookArgs{});
+                    }
+                  },
+                  args);
+              callback(op_id, py_args);
+            };
+            return self.registerPostHook(std::move(hook));
+          },
+          R"doc(
+Register a post-hook callback that is called after each collective operation.
+
+The callback receives (op_id, args) where args is the typed
+per-collective post-hook args object (e.g., CollectivePostHookArgs).
+The op_id can be used to correlate with the corresponding pre-hook call.
+
+Args:
+    callback: A callable that takes (op_id, args).
+
+Returns:
+    RemovableHandle: A handle that can be used to unregister the hook.
+
+Example::
+
+    def my_post_hook(args):
+        print(f"Completed {args.name}")
+    handle = comm.register_post_hook(my_post_hook)
+    # ... run operations ...
+    handle.remove()  # Unregister when done
+
+Note:
+    Hooks are not thread-safe and must not be modified while a collective
+    operation is in progress.
+          )doc",
+          py::arg("callback"))
+      .def(
+          "register_abort_hook",
+          [](TorchComm& self, const py::function& callback) {
+            auto hook = [callback]() {
+              py::gil_scoped_acquire acquire;
+              callback();
+            };
+            return self.registerAbortHook(std::move(hook));
+          },
+          R"doc(
+Register an abort hook callback that is called before process abort.
+
+This hook is called when a collective operation times out or fails and the
+process is about to abort. Use this to capture debug information.
+
+Args:
+    callback: A callable with no arguments.
+
+Returns:
+    RemovableHandle: A handle that can be used to unregister the hook.
+
+Example::
+
+    def my_abort_hook():
+        print("About to abort, saving debug info...")
+        save_debug_state()
+    handle = comm.register_abort_hook(my_abort_hook)
+
+Note:
+    Hooks are not thread-safe and must not be modified while a collective
+    operation is in progress.
+          )doc",
+          py::arg("callback"));
 
   intrusive_ptr_class_<BackendWrapper, c10d::Backend>(m, "_BackendWrapper")
       .def(
@@ -1516,9 +2470,10 @@ Raises: RuntimeError if the ranks list is non-empty and the current rank is not 
       .def("name", &BackendWrapper::getBackendName)
       .def_property_readonly(
           "options",
-          &BackendWrapper::getOptions,
-          R"(Return the options used to create the torchComm under the hood.)",
-          py::call_guard<py::gil_scoped_release>())
+          py::cpp_function(
+              &BackendWrapper::getOptions,
+              py::call_guard<py::gil_scoped_release>()),
+          R"(Return the options used to create the torchComm under the hood.)")
       .def(
           "_verify_work_timeout",
           &BackendWrapper::verifyWorkTimeoutForTest,
@@ -1553,22 +2508,6 @@ Args:
       m, "_BackendWrapperOptions");
 
   m.def(
-      "_get_store",
-      [](const std::string& backend_name,
-         const std::string& name,
-         std::chrono::milliseconds timeout) {
-        return StoreManager::get().getStore(backend_name, name, timeout);
-      },
-      R"(
-      Return a new store object that's unique to the given backend and
-      communicator name.
-      )",
-      py::arg("backend_name"),
-      py::arg("name"),
-      py::arg("timeout") = std::chrono::milliseconds(60000),
-      py::call_guard<py::gil_scoped_release>());
-
-  m.def(
       "get_mem_allocator",
       [](const std::string& backend) { return get_mem_allocator(backend); },
       R"(
@@ -1586,4 +2525,9 @@ Args:
       )",
       py::arg("backend"),
       py::call_guard<py::gil_scoped_release>());
+
+  // Flight Recorder submodule: torchcomms._comms.hooks.fr
+  auto hooks_mod = m.def_submodule("hooks");
+  auto fr_mod = hooks_mod.def_submodule("fr");
+  init_flight_recorder_bindings(fr_mod);
 }

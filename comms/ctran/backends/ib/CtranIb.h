@@ -42,17 +42,13 @@ class CtranIb {
   // to the local rank.
   // Input arguments:
   //   - comm: the Ctran communicator
-  //   - ctrlMgr: the ctranCtrlManager that manages control message callback
-  //              functions registered by other modules. Passed to VC for
-  //              calling callback when receiving control message.
   //   - enableLocalFlush: whether to support local flush. If not specified, use
   //              default config based on cuda arch.
   CtranIb(
       CtranComm* comm,
-      CtranCtrlManager* ctrlMgr,
       std::optional<bool> enableLocalFlush = std::nullopt,
-      std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory =
-          nullptr);
+      std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory = nullptr,
+      std::optional<int> maxNumCqe = std::nullopt);
 
   // Creates local IB resources without pre-existing communicator. It is used
   // for use cases directly control the local transport (see CtranEx). In
@@ -64,7 +60,6 @@ class CtranIb {
   //              mapping NIC
   //   - commHash: for logging only.
   //   - commDesc: for logging only.
-  //   - ctrlMgr: same as in comm-based CtranIb constructor.
   //   - enableLocalFlush: whether to support local flush.
   //   - bootstrapMode: defines the needed bootstrap mode. If kDefaultServer,
   //                    it launches internal listen thread which binds and
@@ -80,14 +75,13 @@ class CtranIb {
       int cudaDev,
       uint64_t commHash,
       const std::string& commDesc,
-      CtranCtrlManager* ctrlMgr,
       bool enableLocalFlush,
       const BootstrapMode bootstrapMode = BootstrapMode::kDefaultServer,
       std::optional<const SocketServerAddr*> qpServerAddr = std::nullopt,
       std::shared_ptr<Abort> abortCtrl =
           ::ctran::utils::createAbort(/*enabled=*/false),
-      std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory =
-          nullptr);
+      std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory = nullptr,
+      std::optional<int> maxNumCqe = std::nullopt);
 
   ~CtranIb();
 
@@ -113,11 +107,6 @@ class CtranIb {
 
   // Unlock the entire CtranIb instance.
   commResult_t epochUnlock();
-
-  // Register control message callback function if have any.
-  // Input arguments:
-  //   - ctrlMgr: the ctranCtrlManager to manage the control message
-  void regCtrlCb(std::unique_ptr<CtranCtrlManager>& ctrlMgr);
 
   // Register memory to be used for IB operations.
   // Input arguments:
@@ -496,6 +485,10 @@ class CtranIb {
     return commDesc;
   }
 
+  int getMaxCqe() const {
+    return maxCqe;
+  }
+
  private:
   friend class CtranIbRequest;
   void init(
@@ -504,14 +497,13 @@ class CtranIb {
       int cudaDev,
       uint64_t commHash,
       const std::string& commDesc,
-      CtranCtrlManager* ctrlMgr,
       bool enableLocalFlush,
       const BootstrapMode bootstrapMode = BootstrapMode::kDefaultServer,
       std::optional<const SocketServerAddr*> qpServerAddr = std::nullopt,
       std::shared_ptr<Abort> abortCtrl =
           ::ctran::utils::createAbort(/*enabled=*/false),
-      std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory =
-          nullptr);
+      std::shared_ptr<ctran::bootstrap::ISocketFactory> socketFactory = nullptr,
+      std::optional<int> maxNumCqe = std::nullopt);
 
   void bootstrapStart(std::optional<const SocketServerAddr*> qpServerAddr);
   static void bootstrapAccept(CtranIb* ib);
@@ -734,9 +726,9 @@ class CtranIb {
   static inline commResult_t
   exportMemImpl(const void* buf, void* ibRegElem, ControlMsg& msg) {
     msg.setType(ControlMsgType::IB_EXPORT_MEM);
-    msg.ibExp.remoteAddr = reinterpret_cast<uint64_t>(buf);
-    msg.ibExp.nKeys = NCCL_CTRAN_IB_DEVICES_PER_RANK;
-    ctran::ib::getRemoteKeysImpl(ibRegElem, msg.ibExp.rkeys);
+    msg.ibDesc.remoteAddr = reinterpret_cast<uint64_t>(buf);
+    msg.ibDesc.nKeys = NCCL_CTRAN_IB_DEVICES_PER_RANK;
+    ctran::ib::getRemoteKeysImpl(ibRegElem, msg.ibDesc.rkeys);
 
     return commSuccess;
   }
@@ -745,11 +737,11 @@ class CtranIb {
       void** buf,
       CtranIbRemoteAccessKey* key,
       const ControlMsg& msg) {
-    (*buf) = reinterpret_cast<void*>(msg.ibExp.remoteAddr);
+    (*buf) = reinterpret_cast<void*>(msg.ibDesc.remoteAddr);
     for (int device = 0; device < NCCL_CTRAN_IB_DEVICES_PER_RANK; device++) {
-      key->rkeys[device] = msg.ibExp.rkeys[device];
+      key->rkeys[device] = msg.ibDesc.rkeys[device];
     }
-    key->nKeys = msg.ibExp.nKeys;
+    key->nKeys = msg.ibDesc.nKeys;
     return commSuccess;
   }
 
@@ -1136,8 +1128,6 @@ class CtranIb {
 
   folly::F14FastMap<int, PendingOpQueue> rankToPendingOpsMap;
   std::mutex pendingOpsMutex;
-
-  CtranCtrlManager* ctrlMgr{nullptr};
 
   std::unordered_map<std::string, uint32_t> pgToTrafficClassMap_;
 

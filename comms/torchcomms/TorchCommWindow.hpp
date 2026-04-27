@@ -3,6 +3,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/core/Device.h>
+#include <comms/torchcomms/RegisteredBuffer.hpp>
 #include <comms/torchcomms/TorchCommOptions.hpp>
 #include <comms/torchcomms/TorchCommTypes.hpp>
 namespace torch::comms {
@@ -10,7 +11,7 @@ namespace torch::comms {
 // Forward declaration
 class TorchWork;
 
-using TorchCommWinAccessType = enum {
+enum class TorchCommWinAccessType {
   WIN_ACCESS_TYPE_UNIFIED = 0,
   WIN_ACCESS_TYPE_SEPARATE = 1,
 };
@@ -22,6 +23,9 @@ class TorchCommWindowAttr {
 
 class TorchCommWindow {
  public:
+  // Backward-compat alias — prefer RegisteredBuffer directly.
+  using DeviceBuffer = RegisteredBuffer;
+
   TorchCommWindow() = default;
   virtual ~TorchCommWindow() = default;
 
@@ -33,7 +37,15 @@ class TorchCommWindow {
 
   // tensor_register and tensor_deregister are collective operations - all
   // ranks must call them together.
-  virtual void tensor_register(const at::Tensor& tensor) = 0;
+  //
+  // When owning=true (default), the window holds a reference to the tensor,
+  // keeping its storage alive. When owning=false, the window does NOT hold a
+  // reference — the caller must ensure the tensor remains alive for the
+  // window's lifetime. Use owning=false in CUDA graph capture mode to allow
+  // tensor memory reuse within the graph.
+  virtual void tensor_register(
+      const at::Tensor& tensor,
+      bool owning = true) = 0;
   virtual void tensor_deregister() = 0;
 
   // Creates a new window with the same backend/comm configuration.
@@ -57,6 +69,46 @@ class TorchCommWindow {
 
   virtual std::shared_ptr<TorchCommWindowAttr> get_attr(int peerRank) = 0;
 
+  // ==========================================================================
+  // Device API — virtual methods for GPU-initiated communication.
+  //
+  // Default implementations throw so that existing backends (NCCL, Gloo, RCCL)
+  // continue to build and fail loudly at runtime until they add support.
+  // When all backends implement these, the defaults can be made pure virtual.
+  // ==========================================================================
+
+  virtual void* get_device_window(
+      int /*signal_count*/ = -1,
+      int /*counter_count*/ = -1,
+      int /*barrier_count*/ = 1) {
+    throw std::runtime_error(
+        "get_device_window is not yet supported by this backend");
+  }
+
+  virtual RegisteredBuffer register_local_buffer(const at::Tensor&) {
+    throw std::runtime_error(
+        "register_local_buffer is not yet supported by this backend");
+  }
+
+  virtual void deregister_local_buffer(RegisteredBuffer&) {
+    throw std::runtime_error(
+        "deregister_local_buffer is not yet supported by this backend");
+  }
+
+  // Device-handle variants of register/deregister_local_buffer.
+  // Returns an opaque int64_t handle (device pointer to RegisteredBuffer)
+  // for use in Triton put_block() calls. The backend owns the device memory.
+  // NOT thread-safe — concurrent calls require external synchronization.
+  virtual int64_t register_local_buffer_handle(const at::Tensor&) {
+    throw std::runtime_error(
+        "register_local_buffer_handle is not yet supported by this backend");
+  }
+
+  virtual void deregister_local_buffer_handle(int64_t /*handle*/) {
+    throw std::runtime_error(
+        "deregister_local_buffer_handle is not yet supported by this backend");
+  }
+
   // Get the registered buffer's dtype (for torch.compile meta kernel)
   at::ScalarType getDtype() const {
     return buf_dtype_;
@@ -76,7 +128,7 @@ class TorchCommWindow {
     return win_size_;
   }
 
-  // Returns the registered tensor buffer, if any.
+  // Returns the registered tensor buffer, or nullopt if owning=false was used.
   std::optional<at::Tensor> get_tensor() const {
     return buf_tensor_;
   }
@@ -88,9 +140,8 @@ class TorchCommWindow {
   //  while the communicator operates on the GPU. However, if both are using the
   //  GPU, they should reside on the same device.
   size_t win_size_{0};
-  // Store a copy of the user-provided tensor buffer to ensure its storage
-  // remains valid for the lifetime of the window. This prevents use-after-free
-  // issues by holding a reference count on the tensor's storage.
+  // Holds a reference to the registered tensor to keep its storage alive.
+  // Nullopt when owning=false was passed to tensor_register().
   std::optional<at::Tensor> buf_tensor_;
   at::ScalarType buf_dtype_{at::kFloat};
   c10::Device buf_device_{c10::kCUDA};

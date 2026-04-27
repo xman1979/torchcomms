@@ -8,13 +8,18 @@ from datetime import timedelta
 
 import torch
 from torchcomms import objcol
-from torchcomms.tests.integration.py.TorchCommTestHelpers import TorchCommTestWrapper
+from torchcomms.tests.integration.py.TorchCommTestHelpers import (
+    is_full_sweep,
+    TorchCommTestWrapper,
+)
 
 
 @contextmanager
 def report_error():
     try:
         yield
+    except unittest.SkipTest:
+        raise
     except Exception as e:
         import traceback
 
@@ -27,8 +32,8 @@ class ObjColTest(unittest.TestCase):
     """Test class for broadcast operations in TorchComm."""
 
     # Class variables for test parameters
-    counts = [0, 4, 1024, 1024 * 1024]
-    dtypes = [torch.float, torch.int, torch.int8]
+    counts = [0, 4, 1024, 1024 * 1024] if is_full_sweep() else [4, 1024 * 1024]
+    dtypes = [torch.float, torch.int, torch.int8] if is_full_sweep() else [torch.float]
     num_replays = 4
 
     def get_wrapper(self):
@@ -88,6 +93,9 @@ class ObjColTest(unittest.TestCase):
     @report_error()
     def test_send_recv_object_list(self) -> None:
         """Test point-to-point object list communication."""
+        if self.num_ranks < 2:
+            self.skipTest("This test requires at least 2 ranks.")
+
         sender_rank = 0
         receiver_rank = 1
 

@@ -7,12 +7,13 @@
 #ifndef _GIN_HOST_GDAKI_H_
 #define _GIN_HOST_GDAKI_H_
 
+#ifndef DOCA_VERBS_USE_META_THIRD_PARTY
 #ifndef DOCA_VERBS_USE_CUDA_WRAPPER
 #define DOCA_VERBS_USE_CUDA_WRAPPER
 #endif
-
 #ifndef DOCA_VERBS_USE_NET_WRAPPER
 #define DOCA_VERBS_USE_NET_WRAPPER
+#endif
 #endif
 
 #include <stdbool.h>
@@ -30,6 +31,10 @@ ncclResult_t ncclGinGdakiDestroyContext(void *ginCtx);
 ncclResult_t ncclGinGdakiRegMrSym(void *collComm, void *data, size_t size, int type, void **mhandle,
                                   void **ginHandle);
 ncclResult_t ncclGinGdakiDeregMrSym(void *collComm, void *mhandle);
+// Local-only registration (non-collective, for source buffers only)
+ncclResult_t ncclGinGdakiRegMrLocal(void *collComm, void *data, size_t size, int type, void **mhandle,
+                                    void **ginHandle);
+ncclResult_t ncclGinGdakiDeregMrLocal(void *collComm, void *mhandle);
 ncclResult_t ncclGinGdakiProgress(void *ginCtx);
 ncclResult_t ncclGinGdakiQueryLastError(void *ginCtx, bool *hasError);
 

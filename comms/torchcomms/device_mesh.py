@@ -24,7 +24,7 @@ from typing import Any, cast, Optional
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import _mesh_resources
-from torchcomms._comms import _BackendWrapper, _get_store, new_comm, TorchComm
+from torchcomms._comms import _BackendWrapper, new_comm, TorchComm
 
 try:
     from torch.distributed.distributed_c10d import GroupName
@@ -39,7 +39,6 @@ def _create_torchcomm_process_group(
     comm: TorchComm,
     group_name: str,
     backend_str: str = "torchcomm",
-    prefix_store: Optional[object] = None,
     global_ranks_mapping: Optional[dict[int, int]] = None,
 ) -> dist.ProcessGroup:
     """
@@ -50,7 +49,6 @@ def _create_torchcomm_process_group(
         comm: TorchComm instance to wrap
         group_name: Name for the process group
         backend_str: Backend string identifier
-        prefix_store: Store for the process group (can be None)
         global_ranks_mapping: Mapping from global rank to group rank
 
     Returns:
@@ -64,9 +62,12 @@ def _create_torchcomm_process_group(
     backend_type = dist.ProcessGroup.BackendType.CUSTOM
     backend_config = dist.BackendConfig(dist.Backend(backend_str))
 
-    # Create process group
-    # pyre-fixme[6]: support store=None
-    pg = dist.ProcessGroup(prefix_store, comm.get_rank(), comm.get_size())
+    # Create process group. TorchComm backends handle all communication
+    # directly, so no real store is needed. We use a dummy HashStore to
+    # satisfy the ProcessGroup interface (e.g., splitGroup calls
+    # store_->clone()).
+    dummy_store = dist.HashStore()
+    pg = dist.ProcessGroup(dummy_store, comm.get_rank(), comm.get_size())
 
     # Register backend
     # pyre-fixme[6]: BackendWrapper implements dist.Backend but types isn't aware
@@ -74,8 +75,7 @@ def _create_torchcomm_process_group(
     pg._set_group_name(group_name)
 
     # Update global state
-    # pyre-fixme[6]: support store=None
-    dist.distributed_c10d._world.pg_map[pg] = (backend_str, prefix_store)
+    dist.distributed_c10d._world.pg_map[pg] = (backend_str, dummy_store)
     dist.distributed_c10d._world.pg_names[pg] = group_name
     dist.distributed_c10d._world.pg_backend_config[pg] = str(backend_config)
     dist.distributed_c10d._register_process_group(group_name, pg)
@@ -97,14 +97,6 @@ def _create_torchcomm_process_group(
     return pg
 
 
-def _get_store_for_pg() -> dist.Store:
-    if not hasattr(_get_store_for_pg, "_store"):
-        _get_store_for_pg._store = _get_store(  # pyre-ignore[16]
-            "torchcomm", "store_dist"
-        )
-    return _get_store_for_pg._store
-
-
 def init_device_mesh(
     mesh_dim_comms: tuple[TorchComm, ...],  # noqa: F405
     mesh_dim_names: tuple[str, ...],
@@ -124,7 +116,6 @@ def init_device_mesh(
 
     local_ranks = [comm.get_rank() for comm in mesh_dim_comms]
     global_rank = cast(int, mesh[tuple(local_ranks)].item())
-    prefix_store = _get_store_for_pg()
     backend_str = "torchcomm"
     # Register the backend
     dist.Backend.register_backend(backend_str, new_comm)
@@ -134,7 +125,6 @@ def init_device_mesh(
         global_pg = _create_torchcomm_process_group(
             comm=_global_comm,
             group_name=_global_comm.get_name(),
-            prefix_store=dist.PrefixStore("default", prefix_store),
             global_ranks_mapping=None,  # Will use default mapping
         )
     elif len(mesh_dim_comms) != 1:
@@ -160,7 +150,6 @@ def init_device_mesh(
             comm=comm,
             group_name=group_name,
             backend_str=backend_str,
-            prefix_store=dist.PrefixStore(name, prefix_store),
             global_ranks_mapping=global_ranks_mapping,
         )
         if _global_comm is None and idx == 0:
@@ -192,17 +181,24 @@ def _flatten_with_comm(
     layout: Any,  # noqa: F405
 ) -> dist.DeviceMesh:
     backend_str = "torchcomm"
-    prefix_store = _get_store_for_pg()
-    prefix_store = dist.PrefixStore(mesh_dim_name, prefix_store)
     global_ranks_mapping = {global_ranks[i]: i for i in range(comm.get_size())}
     # We still need to register the process group for the flattened mesh
     _create_torchcomm_process_group(
         comm=comm,
         group_name=mesh_dim_name,
         backend_str=backend_str,
-        prefix_store=prefix_store,
         global_ranks_mapping=global_ranks_mapping,
     )
+
+    # Coalesce the layout for the flattened mesh dimension.
+    # New PyTorch API (2.13+): _MeshLayout has collapse() instead of coalesce(),
+    # and auto-coalesces _FlatLayouts in the constructor.
+    if hasattr(layout, "coalesce"):
+        coalesced_layout = layout.coalesce()
+    else:
+        from torch.distributed._mesh_layout import _MeshLayout
+
+        coalesced_layout = _MeshLayout([layout.collapse()])  # pyre-ignore[19]
 
     # Compatibility layer for DeviceMesh API changes. The new API uses _rank_map
     # while the older API requires passing mesh tensor directly. This conditional
@@ -213,7 +209,7 @@ def _flatten_with_comm(
             mesh_dim_names=(mesh_dim_name,),
             _init_backend=False,
             _rank=comm.get_rank(),
-            _layout=layout.coalesce(),
+            _layout=coalesced_layout,
             _rank_map=mesh._rank_map,
             _root_mesh=mesh,
         )
@@ -224,7 +220,7 @@ def _flatten_with_comm(
             mesh_dim_names=(mesh_dim_name,),
             _init_backend=False,
             _rank=comm.get_rank(),
-            _layout=layout.coalesce(),
+            _layout=coalesced_layout,
         )
     flattened_device_mesh._dim_group_names = [mesh_dim_name]
 

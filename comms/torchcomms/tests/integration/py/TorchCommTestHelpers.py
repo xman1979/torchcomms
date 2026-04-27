@@ -3,11 +3,23 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import os
-from typing import Tuple, Union
+import unittest
+from functools import wraps
+from typing import List, Tuple, Union
 
 import torch
-from torchcomms import new_comm, RedOpType
-from torchcomms._comms import _get_store
+from torch.distributed import PrefixStore, TCPStore
+from torchcomms import new_comm, RedOpType, ReduceOp
+
+
+def is_full_sweep():
+    """Check if the test should run the full parameter sweep.
+
+    When TEST_FULL_SWEEP=0, tests use a reduced set of parameters
+    (fewer counts, dtypes, ops) for a faster smoke test. The full
+    sweep runs all parameter combinations.
+    """
+    return os.environ.get("TEST_FULL_SWEEP", "1") == "1"
 
 
 def get_dtype_name(dtype):
@@ -46,6 +58,8 @@ def get_op_name(op):
         return "BXor"
     elif op.type == RedOpType.PREMUL_SUM:
         return "PremulSum"
+    elif op.type == RedOpType.AVG:
+        return "Avg"
     else:
         return "Unknown: " + str(op.type)
 
@@ -90,9 +104,52 @@ def get_rank_and_size() -> Tuple[int, int]:
     if torchrun_rank is not None and torchrun_size is not None:
         return int(torchrun_rank), int(torchrun_size)
 
+    # Try PALS environment variables
+    pals_rank = os.environ.get("PALS_RANKID")
+    # Note: PALS does not provide an env variable for size, like `PALS_SIZE`.
+    # We just check it if supplied in the future. We try to query size from other
+    # env vars that may be set in a PALS environment, such as PMI_SIZE, WORLD_SIZE,
+    # etc.
+    # TODO: replace with the correct PALS env var for size once it is available.
+    pals_size = (
+        os.environ.get("PALS_SIZE")
+        or os.environ.get("WORLD_SIZE")
+        or os.environ.get("PMI_SIZE")
+        or os.environ.get("OMPI_COMM_WORLD_SIZE")
+    )
+
+    if pals_rank is not None and pals_size is not None:
+        return int(pals_rank), int(pals_size)
+
     raise RuntimeError(
         "Could not determine rank or world size from environment variables."
     )
+
+
+def filter_int8_overflow_cases(
+    test_cases: List[Tuple[int, torch.dtype, ReduceOp]], num_ranks: int, max_ranks: int
+) -> List[Tuple[int, torch.dtype, ReduceOp]]:
+    """
+    Filter out test cases that would cause int8 overflow.
+
+    When the current number of ranks is greater than the specified maximum,
+    this function removes any test case that uses an ``int8`` tensor with ``ReduceOp.SUM`` or ``ReduceOp.AVG``,
+    since the accumulated result may overflow the int8 range.
+    """
+    if num_ranks > max_ranks:
+        print(
+            f"Filtering ReduceOp.SUM or ReduceOp.AVG test cases for int8 overflow (num_ranks > {max_ranks})..."
+        )
+        return [
+            test_case
+            for test_case in test_cases
+            if not (
+                test_case[1] == torch.int8
+                and (test_case[2] == ReduceOp.SUM or test_case[2] == ReduceOp.AVG)
+            )
+        ]
+    else:
+        return test_cases
 
 
 def maybe_set_rank_envs():
@@ -105,16 +162,44 @@ def maybe_set_rank_envs():
         del os.environ["TORCHCOMM_BOOTSTRAP_RANKSIZE_QUERY_METHOD"]
 
 
+_root_store = None
 NEXT_STORE_ID = 0
 
 
 def create_store():
-    """Create a TCPStore object for coordination."""
+    """Create a PrefixStore for test coordination."""
     maybe_set_rank_envs()
 
-    global NEXT_STORE_ID
+    global _root_store, NEXT_STORE_ID
+    if _root_store is None:
+        rank, _ = get_rank_and_size()
+        host = os.environ["MASTER_ADDR"]
+        port = int(os.environ["MASTER_PORT"])
+        _root_store = TCPStore(
+            host_name=host,
+            port=port,
+            is_master=(rank == 0),
+            wait_for_workers=False,
+        )
+
     NEXT_STORE_ID += 1
-    return _get_store("my_backend", f"test_comm_{NEXT_STORE_ID}")
+    return PrefixStore(f"test_comm_{NEXT_STORE_ID}", _root_store)
+
+
+def wrap_prefix_store(name, store):
+    """Wrap a store with a PrefixStore using the given name."""
+    return PrefixStore(name, store)
+
+
+def destroy_root_store():
+    """Destroy the global _root_store so the MASTER_PORT can be reused.
+
+    Call this in tearDown() of test classes that mix store-based and no-store
+    tests. Without this, the persistent _root_store holds MASTER_PORT and
+    prevents the no-store bootstrap path from creating its own TCPStore.
+    """
+    global _root_store
+    _root_store = None
 
 
 def verify_tensor_equality(
@@ -198,25 +283,29 @@ def verify_tensor_equality(
                 )
 
 
+def get_device(backend, rank) -> torch.device:
+    if device_str := os.environ.get("TEST_DEVICE"):
+        return torch.device(device_str)
+
+    if torch.accelerator.is_available():
+        device_count = torch.accelerator.device_count()
+        if device_count > 0:
+            device_id = rank % device_count
+            accelerator = torch.accelerator.current_accelerator()
+            assert accelerator is not None
+            device_type = accelerator.type
+            return torch.device(f"{device_type}:{device_id}")
+    # Fallback to CPU if an accelerator is not found or device_count is 0
+    return torch.device("cpu")
+
+
 class TorchCommTestWrapper:
     """Wrapper class for TorchComm tests, similar to the C++ TorchCommTestWrapper."""
 
     NEXT_COMM_ID = 0
 
     def get_device(self, backend, rank) -> torch.device:
-        if device_str := os.environ.get("TEST_DEVICE"):
-            return torch.device(device_str)
-
-        if torch.accelerator.is_available():
-            device_count = torch.accelerator.device_count()
-            if device_count > 0:
-                device_id = rank % device_count
-                accelerator = torch.accelerator.current_accelerator()
-                assert accelerator is not None
-                device_type = accelerator.type
-                return torch.device(f"{device_type}:{device_id}")
-        # Fallback to CPU if an accelerator is not found or device_count is 0
-        return torch.device("cpu")
+        return get_device(backend, rank)
 
     def get_hints_from_env(self):
         hints = {}
@@ -224,7 +313,7 @@ class TorchCommTestWrapper:
             hints.update({"fastInitMode": fast_init_mode})
         return hints
 
-    def __init__(self, store=None, hints=None):
+    def __init__(self, store=None, hints=None, abort_process_on_timeout_or_error=None):
         maybe_set_rank_envs()
 
         # Get backend from TEST_BACKEND environment variable, throw if not set
@@ -248,6 +337,7 @@ class TorchCommTestWrapper:
             store=store,
             name=f"comms_test_{TorchCommTestWrapper.NEXT_COMM_ID}",
             hints=hints,
+            abort_process_on_timeout_or_error=abort_process_on_timeout_or_error,
         )
 
         print(
@@ -263,3 +353,19 @@ class TorchCommTestWrapper:
     def get_torchcomm(self):
         """Get the TorchComm instance."""
         return self.torchcomm
+
+
+def skipBackend(backend, msg="Skipping test for backend: "):
+    def dec_fn(fn):
+        reason = f"{msg}{backend}"
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if os.environ["TEST_BACKEND"] == backend:
+                raise unittest.SkipTest(reason)
+
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return dec_fn

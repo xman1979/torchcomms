@@ -5,7 +5,7 @@
 
 #include <stdexcept>
 #include <string>
-#include "comms/torchcomms/TorchCommLogging.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp"
+#include "comms/torchcomms/utils/Logging.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp"
 #include "rccl.h" // @manual
 
 namespace torch::comms {
@@ -133,11 +133,11 @@ TorchCommRCCL::RedOpRAII TorchCommRCCL::getNcclReduceOp(
     case ReduceOp::RedOpType::MAX:
       return ncclMax;
     case ReduceOp::RedOpType::BAND:
-      return ncclSum; // RCCL doesn't have bitwise AND, using SUM as fallback
+      throw std::runtime_error("Cannot use ReduceOp.BAND with RCCL");
     case ReduceOp::RedOpType::BOR:
-      return ncclSum; // RCCL doesn't have bitwise OR, using SUM as fallback
+      throw std::runtime_error("Cannot use ReduceOp.BOR with RCCL");
     case ReduceOp::RedOpType::BXOR:
-      return ncclSum; // RCCL doesn't have bitwise XOR, using SUM as fallback
+      throw std::runtime_error("Cannot use ReduceOp.BXOR with RCCL");
     case ReduceOp::RedOpType::PREMUL_SUM:
       return RedOpRAII(op, comm, dataType, rccl_api_);
     case ReduceOp::RedOpType::AVG:
@@ -226,9 +226,18 @@ void TorchCommRCCL::timeoutWatchdog() noexcept {
     }
 
     // Check work objects for completion or timeout
+    //
+    // NOTE: garbageCollectWorkQueues may pop a completed work item whose
+    // destruction releases the last shared_ptr to this comm, triggering our
+    // destructor. In that case, the destructor sets shutdown_=true and
+    // detaches this thread. We must check shutdown_ immediately after to
+    // avoid accessing potentially destroyed member state.
 
     std::lock_guard<std::mutex> lock(work_queues_mutex_);
     garbageCollectWorkQueues();
+    if (shutdown_) {
+      break;
+    }
     if (comm_state_ != CommState::NORMAL &&
         options_.abort_process_on_timeout_or_error) {
       // Log the error and abort the process.  We cannot abort the NCCL
@@ -331,7 +340,7 @@ hipStream_t TorchCommRCCL::getOperationStream(bool async_op) {
   if (async_op) {
     // Get current PyTorch CUDA stream for this device
     hipStream_t current_stream =
-        hip_api_->getCurrentHIPStreamMasqueradingAsCUDA(device_.index());
+        hip_api_->getCurrentCUDAStream(device_.index());
 
     // Record event on current stream and wait for it on internal stream
     HIP_CHECK(
@@ -347,7 +356,7 @@ hipStream_t TorchCommRCCL::getOperationStream(bool async_op) {
     return internal_stream_;
   } else {
     // Use the current PyTorch CUDA stream for synchronous operations
-    return hip_api_->getCurrentHIPStreamMasqueradingAsCUDA(device_.index());
+    return hip_api_->getCurrentCUDAStream(device_.index());
   }
 }
 

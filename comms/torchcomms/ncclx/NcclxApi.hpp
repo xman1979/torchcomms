@@ -5,6 +5,7 @@
 #include <exception>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include <glog/logging.h>
 #include <nccl.h> // @manual=//comms/ncclx:nccl
@@ -56,9 +57,20 @@ class NCCLXException : public std::exception {
     }                                                                      \
   } while (0)
 
+// Window/RMA types are only available in NCCLX builds that define
+// NCCL_RMA_SUPPORTED
+#ifdef NCCL_RMA_SUPPORTED
 using NcclxWindow = ncclWindow_t;
 using NcclxWindowAccessType = ncclWinAccessType;
 using NcclxWindowAttr = ncclWinAttr_t;
+#else
+using NcclxWindow = void*;
+using NcclxWindowAccessType = int;
+using NcclxWindowAttr = void*;
+#ifndef NCCL_WIN_DEFAULT
+#define NCCL_WIN_DEFAULT 0x00
+#endif
+#endif
 
 /**
  * Abstract interface for NCCL API operations.
@@ -88,6 +100,8 @@ class NcclxApi {
 
   [[nodiscard]] virtual ncclResult_t commAbort(ncclComm_t comm) = 0;
 
+  [[nodiscard]] virtual ncclResult_t commRevoke(ncclComm_t comm) = 0;
+
   [[nodiscard]] virtual ncclResult_t commGetAsyncError(
       ncclComm_t comm,
       ncclResult_t* asyncError) = 0;
@@ -99,6 +113,26 @@ class NcclxApi {
       ncclComm_t* newcomm,
       ncclConfig_t* config) = 0;
 
+  [[nodiscard]] virtual ncclResult_t commShrink(
+      ncclComm_t comm,
+      int* excludeRanksList,
+      int excludeRanksCount,
+      ncclComm_t* newcomm,
+      ncclConfig_t* config,
+      int shrinkFlags) = 0;
+
+  [[nodiscard]] virtual ncclResult_t commGetUniqueId(
+      ncclComm_t comm,
+      ncclUniqueId* uniqueId) = 0;
+
+  [[nodiscard]] virtual ncclResult_t commGrow(
+      ncclComm_t comm,
+      int nRanks,
+      const ncclUniqueId* uniqueId,
+      int rank,
+      ncclComm_t* newcomm,
+      ncclConfig_t* config) = 0;
+
   // Memory registration
   [[nodiscard]] virtual ncclResult_t
   commRegister(ncclComm_t comm, void* buffer, size_t size, void** handle) = 0;
@@ -106,6 +140,12 @@ class NcclxApi {
   [[nodiscard]] virtual ncclResult_t commDeregister(
       ncclComm_t comm,
       void* handle) = 0;
+
+  // Pointer-based memory registration (global - does not require comm)
+  // cudaDev is auto-detected from the buffer pointer.
+  virtual ncclResult_t globalRegisterWithPtr(void* buffer, size_t size) = 0;
+
+  virtual ncclResult_t globalDeregisterWithPtr(void* buffer, size_t size) = 0;
 
   // Point-to-point operations
   [[nodiscard]] virtual ncclResult_t send(
@@ -186,6 +226,19 @@ class NcclxApi {
       ncclComm_t comm,
       cudaStream_t stream) = 0;
 
+#ifdef NCCL_REDUCE_SCATTER_QUANTIZE_SUPPORTED
+  [[nodiscard]] virtual ncclResult_t reduceScatterQuantize(
+      const void* sendbuff,
+      void* recvbuff,
+      size_t recvcount,
+      ncclDataType_t inputType,
+      ncclDataType_t transportType,
+      ncclRedOp_t op,
+      uint64_t* seedPtr,
+      ncclComm_t comm,
+      cudaStream_t stream) = 0;
+#endif
+
   [[nodiscard]] virtual ncclResult_t allToAllv(
       const void* sendbuff,
       const size_t sendcounts[],
@@ -196,6 +249,20 @@ class NcclxApi {
       ncclDataType_t datatype,
       ncclComm_t comm,
       cudaStream_t stream) = 0;
+
+  [[nodiscard]] virtual ncclResult_t deviceAllToAllv(
+      const void* sendbuff,
+      void* recvbuff,
+      const int64_t* sendcounts_d,
+      const int64_t* recvcounts_d,
+      ncclDataType_t datatype,
+      ncclComm_t comm,
+      cudaStream_t stream,
+      int64_t sendcountsMultiplier = 1,
+      int64_t recvcountsMultiplier = 1,
+      const std::unordered_map<std::string, std::string>& hints = {}) {
+    return ncclInvalidUsage;
+  }
 
   [[nodiscard]] virtual ncclResult_t alltoallvDynamicDispatch(
       const void* sendbuff,
@@ -253,6 +320,22 @@ class NcclxApi {
       void* recvBuff,
       void* request) = 0;
 
+  // Persistent AllGather operations
+  [[nodiscard]] virtual ncclResult_t allGatherInit(
+      void* recvbuff,
+      size_t maxRecvCount,
+      const std::unordered_map<std::string, std::string>& hints,
+      ncclDataType_t datatype,
+      ncclComm_t comm,
+      cudaStream_t stream,
+      void** request) = 0;
+
+  [[nodiscard]] virtual ncclResult_t allGatherExec(
+      const void* sendbuff,
+      size_t count,
+      ncclDataType_t datatype,
+      void* request) = 0;
+
   [[nodiscard]] virtual ncclResult_t pFree(void* request) = 0;
 
   [[nodiscard]] virtual ncclResult_t commWindowRegister(
@@ -294,6 +377,75 @@ class NcclxApi {
   virtual ncclResult_t devCommDestroy(
       ncclComm_t comm,
       const ncclDevComm_t* devComm) = 0;
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  // Get NVLink-mapped pointer for a peer's window memory.
+  // Returns nullptr in outPtr if peer is not NVLink-accessible.
+  // Requires NCCLX 2.29+.
+  [[nodiscard]] virtual ncclResult_t winGetPeerDevicePointer(
+      NcclxWindow win,
+      size_t offset,
+      int peer,
+      void** outPtr) = 0;
+
+  // Get the LSA multimem (multicast) device pointer for a window.
+  // Returns the NVLS multicast address that can be used with
+  // multimem.ld_reduce / multimem.st PTX instructions for hardware-fused
+  // all-reduce across all LSA-connected peers.
+  // Requires NCCLX 2.29+ and lsaMultimem enabled in ncclDevCommRequirements.
+  [[nodiscard]] virtual ncclResult_t winGetLsaMultimemDevicePointer(
+      NcclxWindow win,
+      size_t offset,
+      void** outPtr) = 0;
+#endif
+
+  // Get the LSA team info (rank count, local rank) for a communicator.
+  [[nodiscard]] virtual ncclTeam_t teamLsa(ncclComm_t comm) = 0;
+#endif
+
+#if defined(ENABLE_PIPES)
+  // Create a DeviceWindow in device memory from a ctran-registered NcclxWindow.
+  // COLLECTIVE on first call — all ranks must call together.
+  // Returns opaque device pointer via outDevicePtr; free with
+  // winDestroyDeviceWin.
+  virtual ncclResult_t winCreateDeviceWin(
+      NcclxWindow win,
+      int signal_count,
+      int counter_count,
+      int barrier_count,
+      void** outDevicePtr) = 0;
+
+  // Free device memory allocated by winCreateDeviceWin.
+  virtual ncclResult_t winDestroyDeviceWin(void* devicePtr) = 0;
+
+  // Get pipes transport device handle components from the communicator.
+  // NON-COLLECTIVE — reads already-exchanged state.
+  // Returns ncclInternalError if pipes transport is not initialized.
+  virtual ncclResult_t getMultiPeerDeviceHandle(
+      ncclComm_t comm,
+      void** outTransportsPtr,
+      int* outMyRank,
+      int* outNRanks,
+      int* outNumNvlPeers,
+      int* outNumIbPeers) = 0;
+
+  // Register a local buffer for device-side RDMA put operations.
+  // NON-COLLECTIVE — purely local memory registration (per-NIC lkeys only).
+  // Fills *outLkeys with per-NIC lkeys + populated NIC count. Multi-NIC:
+  // device put selects outLkeys->values[nic] based on slot dispatch —
+  // populating only values[0] would corrupt WQEs for slots landing on
+  // NIC[1..size-1] on GB200/GB300.
+  [[nodiscard]] virtual ncclResult_t winLocalRegisterBuffer(
+      ncclComm_t comm,
+      void* ptr,
+      size_t size,
+      ncclLkeyPerDevice* outLkeys) = 0;
+
+  // Deregister a buffer previously registered with winLocalRegisterBuffer.
+  // NON-COLLECTIVE.
+  [[nodiscard]] virtual ncclResult_t winLocalDeregisterBuffer(
+      ncclComm_t comm,
+      void* ptr) = 0;
 #endif
 
   // Group operations
@@ -306,6 +458,10 @@ class NcclxApi {
   [[nodiscard]] virtual ncclResult_t commCount(
       const ncclComm_t comm,
       int* count) = 0;
+
+  [[nodiscard]] virtual ncclResult_t commDump(
+      ncclComm_t comm,
+      std::unordered_map<std::string, std::string>& map) = 0;
 
   [[nodiscard]] virtual ncclResult_t redOpCreatePreMulSum(
       ncclRedOp_t* op,
@@ -344,6 +500,8 @@ class DefaultNcclxApi : public NcclxApi {
 
   [[nodiscard]] ncclResult_t commAbort(ncclComm_t comm) override;
 
+  [[nodiscard]] ncclResult_t commRevoke(ncclComm_t comm) override;
+
   [[nodiscard]] ncclResult_t commGetAsyncError(
       ncclComm_t comm,
       ncclResult_t* asyncError) override;
@@ -355,6 +513,26 @@ class DefaultNcclxApi : public NcclxApi {
       ncclComm_t* newcomm,
       ncclConfig_t* config) override;
 
+  [[nodiscard]] ncclResult_t commShrink(
+      ncclComm_t comm,
+      int* excludeRanksList,
+      int excludeRanksCount,
+      ncclComm_t* newcomm,
+      ncclConfig_t* config,
+      int shrinkFlags) override;
+
+  [[nodiscard]] ncclResult_t commGetUniqueId(
+      ncclComm_t comm,
+      ncclUniqueId* uniqueId) override;
+
+  [[nodiscard]] ncclResult_t commGrow(
+      ncclComm_t comm,
+      int nRanks,
+      const ncclUniqueId* uniqueId,
+      int rank,
+      ncclComm_t* newcomm,
+      ncclConfig_t* config) override;
+
   [[nodiscard]] ncclResult_t commRegister(
       ncclComm_t comm,
       void* buffer,
@@ -363,6 +541,10 @@ class DefaultNcclxApi : public NcclxApi {
 
   [[nodiscard]] ncclResult_t commDeregister(ncclComm_t comm, void* handle)
       override;
+
+  ncclResult_t globalRegisterWithPtr(void* buffer, size_t size) override;
+
+  ncclResult_t globalDeregisterWithPtr(void* buffer, size_t size) override;
 
   // Point-to-point operations
   [[nodiscard]] ncclResult_t send(
@@ -443,6 +625,19 @@ class DefaultNcclxApi : public NcclxApi {
       ncclComm_t comm,
       cudaStream_t stream) override;
 
+#ifdef NCCL_REDUCE_SCATTER_QUANTIZE_SUPPORTED
+  [[nodiscard]] ncclResult_t reduceScatterQuantize(
+      const void* sendbuff,
+      void* recvbuff,
+      size_t recvcount,
+      ncclDataType_t inputType,
+      ncclDataType_t transportType,
+      ncclRedOp_t op,
+      uint64_t* seedPtr,
+      ncclComm_t comm,
+      cudaStream_t stream) override;
+#endif
+
   [[nodiscard]] ncclResult_t allToAllv(
       const void* sendbuff,
       const size_t sendcounts[],
@@ -453,6 +648,18 @@ class DefaultNcclxApi : public NcclxApi {
       ncclDataType_t datatype,
       ncclComm_t comm,
       cudaStream_t stream) override;
+
+  [[nodiscard]] ncclResult_t deviceAllToAllv(
+      const void* sendbuff,
+      void* recvbuff,
+      const int64_t* sendcounts_d,
+      const int64_t* recvcounts_d,
+      ncclDataType_t datatype,
+      ncclComm_t comm,
+      cudaStream_t stream,
+      int64_t sendcountsMultiplier = 1,
+      int64_t recvcountsMultiplier = 1,
+      const std::unordered_map<std::string, std::string>& hints = {}) override;
 
   [[nodiscard]] ncclResult_t alltoallvDynamicDispatch(
       const void* sendbuff,
@@ -508,6 +715,22 @@ class DefaultNcclxApi : public NcclxApi {
       void* recvBuff,
       void* request) override;
 
+  // Persistent AllGather operations
+  [[nodiscard]] ncclResult_t allGatherInit(
+      void* recvbuff,
+      size_t maxRecvCount,
+      const std::unordered_map<std::string, std::string>& hints,
+      ncclDataType_t datatype,
+      ncclComm_t comm,
+      cudaStream_t stream,
+      void** request) override;
+
+  [[nodiscard]] ncclResult_t allGatherExec(
+      const void* sendbuff,
+      size_t count,
+      ncclDataType_t datatype,
+      void* request) override;
+
   [[nodiscard]] ncclResult_t pFree(void* request) override;
 
   // Window RMA operations
@@ -554,6 +777,46 @@ class DefaultNcclxApi : public NcclxApi {
       ncclDevComm_t* outDevComm) override;
   ncclResult_t devCommDestroy(ncclComm_t comm, const ncclDevComm_t* devComm)
       override;
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  [[nodiscard]] ncclResult_t winGetPeerDevicePointer(
+      NcclxWindow win,
+      size_t offset,
+      int peer,
+      void** outPtr) override;
+
+  [[nodiscard]] ncclResult_t winGetLsaMultimemDevicePointer(
+      NcclxWindow win,
+      size_t offset,
+      void** outPtr) override;
+#endif
+
+  [[nodiscard]] ncclTeam_t teamLsa(ncclComm_t comm) override;
+#endif
+
+#if defined(ENABLE_PIPES)
+  ncclResult_t winCreateDeviceWin(
+      NcclxWindow win,
+      int signal_count,
+      int counter_count,
+      int barrier_count,
+      void** outDevicePtr) override;
+  ncclResult_t winDestroyDeviceWin(void* devicePtr) override;
+  ncclResult_t getMultiPeerDeviceHandle(
+      ncclComm_t comm,
+      void** outTransportsPtr,
+      int* outMyRank,
+      int* outNRanks,
+      int* outNumNvlPeers,
+      int* outNumIbPeers) override;
+  [[nodiscard]] ncclResult_t winLocalRegisterBuffer(
+      ncclComm_t comm,
+      void* ptr,
+      size_t size,
+      ncclLkeyPerDevice* outLkeys) override;
+  [[nodiscard]] ncclResult_t winLocalDeregisterBuffer(
+      ncclComm_t comm,
+      void* ptr) override;
 #endif
 
   // Group operations
@@ -564,6 +827,10 @@ class DefaultNcclxApi : public NcclxApi {
       override;
   [[nodiscard]] ncclResult_t commCount(const ncclComm_t comm, int* count)
       override;
+
+  [[nodiscard]] ncclResult_t commDump(
+      ncclComm_t comm,
+      std::unordered_map<std::string, std::string>& map) override;
 
   [[nodiscard]] ncclResult_t redOpCreatePreMulSum(
       ncclRedOp_t* op,

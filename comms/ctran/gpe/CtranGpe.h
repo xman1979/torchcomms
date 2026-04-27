@@ -46,6 +46,7 @@ struct OpElem {
     ALLTOALL,
     ALLTOALLP,
     ALLTOALLV,
+    DEVICE_ALLTOALLV,
     ALLTOALLV_DYNAMIC,
     ALLTOALLV_DYNAMIC_SPLIT,
     ALLTOALLV_DYNAMIC_SPLIT_NON_CONTIG,
@@ -90,6 +91,9 @@ struct OpElem {
     struct {
       // reference to pre-initialized persistent arguments and resource
       void* pArgs;
+      // non-null for window-based init; used by GPE callback to populate
+      // pArgs from window remote info
+      ctran::CtranWin* win;
     } allgatherp_init;
     struct {
       // reference to pre-initialized persistent arguments and resource
@@ -113,8 +117,12 @@ struct OpElem {
       std::vector<void*> remoteRecvBuffs;
       std::vector<struct CtranMapperRemoteAccessKey> remoteAccessKeys;
 
-      void* args;
-      void* resource;
+#if !defined(__CUDACC__)
+      // Ring algorithm host state. Owned by OpElem — constructed in
+      // OpElem(), destroyed in ~OpElem(). Unused by ctdirect.
+      ctran::allreduce::ring::HostArgs hostArgs;
+      ctran::allreduce::ring::HostResource hostResource;
+#endif
     } allreduce;
     struct {
       const void* sendbuff;
@@ -156,6 +164,13 @@ struct OpElem {
       std::vector<size_t> rdispls;
       commDataType_t datatype;
     } alltoallv;
+    struct {
+      const void* sendbuff;
+      void* recvbuff;
+      const int64_t* sendcounts_d; // device pointer
+      const int64_t* recvcounts_d; // device pointer
+      commDataType_t datatype;
+    } device_alltoallv;
     struct {
       const void* const* sendbuffs;
       void* const* recvbuffs;
@@ -285,14 +300,11 @@ struct KernelConfig {
     SEND,
     RECV,
     SENDRECV,
-    SEND_NOTIFY,
-    RECV_NOTIFY,
-    SENDRECV_NOTIFY,
     RECV_UNPACK,
     SENDRECV_UNPACK,
-    SENDRECV_STAGED,
     SENDRECV_P2P,
     ALLTOALL,
+    DEVICE_ALLTOALLV,
     ALLTOALLV,
     ALLTOALLV_DYNAMIC,
     ALLTOALLV_DYNAMIC_SPLIT,
@@ -318,12 +330,26 @@ struct KernelConfig {
   void* algoArgs{nullptr};
   void* unpackPool{nullptr};
 
+  // Post-kernel cleanup callback. Populated by algorithm setup (e.g.,
+  // SendRecv P2P useList path); transferred to CtranGpeCmd on submit,
+  // invoked by GPE thread after the kernel signals completion via
+  // kernelFlag.
+  std::function<void()> postKernelCleanup{nullptr};
+
+  // KernelElems marked persistent during graph capture by allocKernelElems().
+  // submit() retains cleanup on the graph for the no-cmd (empty opGroup) path.
+  // For the cmd path, ~OpElem handles free() and this vector is ignored.
+  std::vector<KernelElem*> persistentKernelElems;
+
   const std::string algoName;
   // Copied after collective called ctran->updateOpCount()
   // Upon collective submission, we should always use the copied opCount since
   // original opCount in comm may be updated by other threads.
   const uint64_t opCount;
   bool isDevice{true};
+
+  // Dynamic shared memory size override. 0 = use sizeof(CtranAlgoDeviceState).
+  size_t dynamicSharedMemBytes{0};
 
   // Experimental: allows one-sided communications, waitSignal and
   // multiWaitSignal, to run in parallel with other kernels when
@@ -389,14 +415,6 @@ class CtranGpe {
       std::shared_ptr<std::atomic_flag> cpuFlag);
 
   // Allocate numElems number of p2pElem objects from internal pool.
-  // When free objects are not enough, it will be in blocking wait and reclaim
-  // inuse p2pElems till enough objects are available. Return commSuccess if all
-  // elements are allocated, otherwise return commInternalError. Input
-  // arguments:
-  //   - numElems: number of p2pElem objects to be allocated
-  //   - ngroups: number of thread block groups to use each p2pElem object
-  // Output arguments:
-  //   - elemsList: a C-style list of p2pElem objects being accessed in kernel
   commResult_t
   allocKernelElems(size_t numElems, int ngroups, KernelElem** elemsList);
 
@@ -408,6 +426,14 @@ class CtranGpe {
   // Return number of inuse kernel flags.
   // Used to check potential flag leak in UT due to inproper usage in ctran
   size_t numInUseKernelFlags();
+
+  // Return number of inuse checksums.
+  size_t numInUseChecksums();
+
+  // Return number of inuse GpeKernelSync elements.
+  // Used to verify that CUDA graph cmdDestroy callbacks have released all pool
+  // elements before pool destruction (async cmdDestroy race).
+  size_t numInUseGpeKernelSyncs();
 
   commResult_t allocGpeKernelSyncs(
       size_t count,
@@ -474,26 +500,6 @@ extern __global__ void ncclKernelSendRecv(
     int* flag,
     CtranAlgoDeviceState* devState,
     ctran::sendrecv::KernelSendRecvArgs args);
-
-extern __global__ void ncclKernelSendNotifyOnly(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernelSendArgs args);
-
-extern __global__ void ncclKernelRecvNotifyOnly(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernelRecvArgs args);
-
-extern __global__ void ncclKernelSendRecvNotifyOnly(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernelSendRecvArgs args);
-
-extern __global__ void ncclKernelSendRecvStaged(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::sendrecv::KernArgs args);
 
 extern __global__ void ncclKernelSendRecvP2p(
     int* flag,

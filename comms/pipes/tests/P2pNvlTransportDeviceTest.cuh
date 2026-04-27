@@ -25,7 +25,7 @@ enum class GroupType {
 
 // Signal operation on a single transport (signals to its remote state)
 void testDeviceSignal(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     SignalOp op,
     uint64_t value,
@@ -35,7 +35,7 @@ void testDeviceSignal(
 
 // Wait operation on a single transport (waits on its local state)
 void testDeviceWaitSignal(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     CmpOp op,
     uint64_t value,
@@ -45,7 +45,7 @@ void testDeviceWaitSignal(
 
 // Signal then wait within a single kernel
 void testDeviceSignalThenWait(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     SignalOp signalOp,
     uint64_t signalValue,
@@ -80,5 +80,53 @@ void testRawWaitSignal(
 
 // Read the signal value (for verification)
 void testReadSignal(SignalState* signal_d, uint64_t* result_d);
+
+// Per-group put copy (each block copies its own tile at blockIdx.x offset)
+void testDevicePut(
+    P2pNvlTransportDevice* p2p,
+    char* dst_d,
+    const char* src_d,
+    std::size_t tileSize,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType = GroupType::BLOCK);
+
+// Reset signal on a transport (resets local signal state)
+void testDeviceResetSignal(
+    P2pNvlTransportDevice* p2p,
+    uint64_t signalId,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType = GroupType::WARP);
+
+// =============================================================================
+// LL128 transport send/recv test helpers
+// These test the ll128_send_group()/ll128_recv_group() methods on
+// P2pNvlTransportDevice
+// =============================================================================
+
+/**
+ * Test LL128 send/recv via P2pNvlTransportDevice transport wrappers.
+ *
+ * Uses two transports in a loopback configuration where transport0 sends
+ * to transport1. The sender calls p2p.ll128_send_group() and the receiver
+ * calls p2p.ll128_recv_group().
+ *
+ * @param sender Sender transport (writes to receiver's LL128 buffer)
+ * @param receiver Receiver transport (reads from its local LL128 buffer)
+ * @param src_d Source buffer on sender GPU
+ * @param dst_d Destination buffer on receiver GPU
+ * @param nbytes Number of bytes to transfer (must be multiple of 16)
+ * @param numBlocks Number of blocks to launch
+ * @param blockSize Threads per block
+ */
+void testLl128SendRecv(
+    P2pNvlTransportDevice sender,
+    P2pNvlTransportDevice receiver,
+    const char* src_d,
+    char* dst_d,
+    size_t nbytes,
+    int numBlocks,
+    int blockSize);
 
 } // namespace comms::pipes::test

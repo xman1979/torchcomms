@@ -19,6 +19,10 @@
 // Forward declaration
 class CtranIb;
 
+namespace ctran {
+class RegCache;
+} // namespace ctran
+
 namespace torch::comms {
 
 /*
@@ -128,7 +132,19 @@ class RdmaMemory : folly::MoveOnly {
     }
   };
 
-  RdmaMemory(const void* buf, size_t len, int cudaDev);
+  /**
+   * Construct an RdmaMemory object and register the buffer with the IB device.
+   *
+   * @param buf Pointer to the memory buffer to register
+   * @param len Length of the memory buffer in bytes
+   * @param cudaDev CUDA device ID associated with this memory buffer
+   * @param cacheReg Whether the buffer is already registered in regCache.
+   *        When true, the constructor expects the buffer to be pre-registered
+   *        and will throw if the handle is not found. When false, the
+   *        constructor will register the buffer itself and deregister it on
+   *        destruction
+   */
+  RdmaMemory(const void* buf, size_t len, int cudaDev, bool cacheReg = false);
   RdmaMemory(RdmaMemory&& other) noexcept;
   RdmaMemory& operator=(RdmaMemory&& other) = delete;
   ~RdmaMemory() noexcept;
@@ -226,6 +242,8 @@ class RdmaMemory : folly::MoveOnly {
 
   void* regHdl_{nullptr};
   std::string remoteKey_;
+  bool cacheReg_{false};
+  std::shared_ptr<ctran::RegCache> regCache_;
 };
 
 /**
@@ -300,8 +318,13 @@ class __attribute__((visibility("default"))) RdmaTransport {
    * cudaDev - Transport needs to use NIC for I/O. It does so by identifying
    *           the NIC associated with specified cudaDevice.
    * evb - EventLoop to drive the RDMA operations.
+   * maxNumCqe - Optional per-transport CQ size cap. When set, overrides
+   *             the global NCCL_CTRAN_IB_MAX_NUM_CQE env var.
    */
-  explicit RdmaTransport(int cudaDev, folly::EventBase* evb = nullptr);
+  explicit RdmaTransport(
+      int cudaDev,
+      folly::EventBase* evb = nullptr,
+      std::optional<int> maxNumCqe = std::nullopt);
 
   ~RdmaTransport();
 
@@ -334,6 +357,11 @@ class __attribute__((visibility("default"))) RdmaTransport {
    * operations.
    */
   bool connected() const;
+
+  /*
+   * Return the effective max CQ entries configured for this transport.
+   */
+  int getMaxCqe() const;
 
   /*
    * [Remote Op] Transfer data from local buffer to remote buffer on the peer

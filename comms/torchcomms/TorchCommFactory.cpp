@@ -4,16 +4,18 @@
 
 #include <dlfcn.h>
 
-#include "comms/torchcomms/TorchComm.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
 
 namespace torch::comms {
 
 namespace {
 
 // BackendLib manages the lifecycle of dynamically loaded backend libraries.
-// The library is loaded in the constructor via dlopen() and unloaded in the
-// destructor via dlclose(). Move semantics transfer ownership of the library
+// The library is loaded in the constructor via dlopen() and kept loaded for
+// the lifetime of the process. We intentionally do not call dlclose() --
+// doing so during static destruction causes segfaults due to unload-order
+// dependencies between the backend library and libtorch. The OS reclaims all
+// resources on process exit. Move semantics transfer ownership of the library
 // handle, while copy operations are explicitly deleted to prevent dangling
 // references. After loading, setLoader() must be called to initialize the
 // DynamicLoaderInterface which provides the new_comm/destroy_comm functions
@@ -36,11 +38,8 @@ class BackendLib {
     other.handle_ = nullptr;
   }
 
-  ~BackendLib() {
-    if (handle_ != nullptr) {
-      dlclose(handle_);
-    }
-  }
+  // Intentionally default: we do not call dlclose() here. See class comment.
+  ~BackendLib() = default; // NOLINT(clang-diagnostic-unneeded-member-function)
 
   // Non-copyable to avoid dangling references to the handle
   BackendLib(const BackendLib&) = delete;
@@ -171,6 +170,18 @@ std::shared_ptr<TorchCommBackend> TorchCommFactory::create_backend(
   }
 
   if (impl) {
+    // Check if enable_reconfigure is requested but backend doesn't support it
+    // We do this check AFTER creating the backend instance but BEFORE calling
+    // init(). This is safe because the backend destructor won't complain about
+    // lack of finalization since init() was never called.
+    if (options.enable_reconfigure && !impl->supportsReconfigure()) {
+      throw std::runtime_error(
+          "[TorchComm]: enable_reconfigure=true is not supported by backend: " +
+          backend +
+          ". Only backends that implement supportsReconfigure() can use "
+          "reconfigure for fault tolerance.");
+    }
+
     impl->init(device, name, options);
   }
 

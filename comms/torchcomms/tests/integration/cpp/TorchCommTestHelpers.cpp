@@ -1,10 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "comms/torchcomms/tests/integration/cpp/TorchCommTestHelpers.h"
+#include "torch/csrc/distributed/c10d/PrefixStore.hpp" // @manual=//caffe2:torch-cpp-cpu
 #include "torch/csrc/distributed/c10d/TCPStore.hpp" // @manual=//caffe2:torch-cpp-cpu
 
-#include "comms/torchcomms/StoreManager.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/Utils.hpp"
 
 using namespace torch::comms;
 
@@ -127,13 +128,26 @@ std::tuple<int, int> getRankAndSize() {
 c10::intrusive_ptr<c10d::Store> createStore() {
   configureManualRankSize();
 
-  static int next_store_id = 0;
-  next_store_id += 1;
+  auto [rank, comm_size] = query_ranksize();
+  (void)comm_size;
+  const char* host = std::getenv("MASTER_ADDR");
+  TORCH_INTERNAL_ASSERT(host, "MASTER_ADDR env is not set");
+  const char* port_str = std::getenv("MASTER_PORT");
+  TORCH_INTERNAL_ASSERT(port_str, "MASTER_PORT env is not set");
+  int port = std::stoi(port_str);
+  c10d::TCPStoreOptions opts;
+  // Use default 300s timeout
+  opts.port = port;
+  opts.isServer = (rank == 0);
+  opts.waitWorkers = false;
+  opts.useLibUV = true;
+  return c10::make_intrusive<c10d::TCPStore>(std::string{host}, opts);
+}
 
-  return StoreManager::get().getStore(
-      "comms_test",
-      fmt::format("store_{}", next_store_id),
-      std::chrono::milliseconds(60000));
+c10::intrusive_ptr<c10d::Store> wrapPrefixStore(
+    const std::string& name,
+    c10::intrusive_ptr<c10d::Store> store) {
+  return c10::make_intrusive<c10d::PrefixStore>(name, store);
 }
 
 void destroyStore(

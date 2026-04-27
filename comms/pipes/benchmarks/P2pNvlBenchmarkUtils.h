@@ -20,6 +20,9 @@ struct BenchmarkConfig {
   std::size_t chunkSize = 512 * 1024; // 512KB default
   SyncScope groupScope = SyncScope::WARP; // Thread group scope for parallelism
   bool spreadClusterLaunch = false; // Use spread cluster kernel launch
+  bool useDualStateBuffer = false; // Use dual chunk state buffers
+  bool useTiled = false; // Use tiled protocol (Triton-style head/tail)
+  int chunksPerSlot = 1; // Sub-chunks per pipeline slot for finer signaling
   std::string name;
 };
 

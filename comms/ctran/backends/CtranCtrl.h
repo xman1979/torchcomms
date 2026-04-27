@@ -6,33 +6,18 @@
 #include <comms/utils/cvars/nccl_cvars.h>
 #include <fmt/format.h>
 #include <cstddef>
-#include <functional>
-#include <optional>
 #include <sstream>
-#include <unordered_map>
 
 #include "comms/ctran/backends/CtranAux.h"
 #include "comms/ctran/regcache/IpcRegCacheBase.h"
 #include "comms/ctran/utils/CtranIpc.h"
 
-constexpr int CTRAN_MAX_IB_DEVICES_PER_RANK{2};
-
 /**
- * Define all control message types used in CTran backends.
+ * Define all control message types and packet format used in CTran backends.
  *
- * Support two protocols to transfer control message:
- * 1. Explicitly exchanged bewteen two sides via a control message channel's
- *    send/recv API. This can be used when need explicit synchronization (e.g.,
- *    handshake in zero-copy algorithms)
- * 2. Sent from one side via the send API, and the remote side handles it
- *    implicitly via pre-registered callback. The callback will be called by the
- *    control message channel whenever progressed. It is useful for asynchronous
- *    request where the sender doesn't need blockingly wait for
- *    the ack from receiver. The callback must be pre-registered to
- *    CtranCtrlManager.
- *
- * All control message types and packet format must be defined in this header
- * file for centralized management.
+ * Control messages are explicitly exchanged between two sides via a control
+ * message channel's send/recv API, used for synchronization (e.g., handshake
+ * in zero-copy algorithms).
  */
 enum ControlMsgType {
   NVL_EXPORT_MEM = 1,
@@ -76,24 +61,6 @@ struct CtranIbConfig {
   int64_t trafficClass{NCCL_IB_TC};
 };
 
-struct CmsgIbExportMem {
-  uint64_t remoteAddr{0};
-  std::array<uint32_t, CTRAN_MAX_IB_DEVICES_PER_RANK> rkeys{};
-  int nKeys{0};
-
-  static const std::string name;
-
-  CmsgIbExportMem() {};
-  std::string toString() const {
-    std::stringstream ss;
-    ss << "[" << name << "] remoteAddr: 0x" << std::hex << remoteAddr;
-    for (int i = 0; i < nKeys; i++) {
-      ss << ", rkeys[" << i << "]: " << std::dec << rkeys[i];
-    }
-    return ss.str();
-  }
-};
-
 /**
  * Packet structure of control message transferred by underlying backend.
  */
@@ -102,7 +69,7 @@ struct ControlMsg {
   union {
     struct ctran::regcache::IpcDesc ipcDesc;
     struct ctran::regcache::IpcRelease ipcRls;
-    struct CmsgIbExportMem ibExp;
+    struct ctran::regcache::IBDesc ibDesc;
   };
 
   AuxData_t<DefaultAuxType> aux; // Used to store the remote aux data
@@ -124,7 +91,7 @@ struct ControlMsg {
         ipcRls = ctran::regcache::IpcRelease{};
         break;
       case ControlMsgType::IB_EXPORT_MEM:
-        ibExp = CmsgIbExportMem{};
+        ibDesc = ctran::regcache::IBDesc{};
         break;
       default:
         break;
@@ -141,7 +108,7 @@ struct ControlMsg {
         ss << ipcRls.toString();
         break;
       case ControlMsgType::IB_EXPORT_MEM:
-        ss << ibExp.toString();
+        ss << ibDesc.toString();
         break;
       case ControlMsgType::SYNC:
         ss << "SYNC";
@@ -152,25 +119,6 @@ struct ControlMsg {
     }
     return ss.str();
   }
-};
-
-using ContrlMsgCbFn =
-    std::function<commResult_t(int rank, void* msg, void* ctx)>;
-
-struct ControlMsgCb {
-  ContrlMsgCbFn fn;
-  // contains comm specific pointer to find the corresponding instance
-  void* ctx;
-};
-
-class CtranCtrlManager {
- public:
-  commResult_t regCb(int type, ContrlMsgCbFn fn, void* ctx);
-  commResult_t runCb(int rank, int type, void* msg) const;
-  bool hasCb(int type) const;
-
- private:
-  std::unordered_map<int, ControlMsgCb> ctrlMsgCbMap_;
 };
 
 #endif

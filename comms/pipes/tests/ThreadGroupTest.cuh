@@ -23,6 +23,38 @@ void testContiguousLocality(
     int blockSize,
     SyncScope scope);
 
+// Tests make_thread_solo() - where each thread forms its own group of size 1
+// Verifies:
+// - group_size == 1 for every thread
+// - thread_id_in_group == 0 for every thread (always the leader)
+// - is_leader() == true for every thread
+// - group_id == global_thread_index (unique per thread)
+// - total_groups == total thread count (numBlocks * blockSize)
+// - scope == SyncScope::THREAD
+// - sync() completes without deadlock (compiler barrier only, no hardware sync)
+void testThreadSoloGroup(
+    uint32_t* groupIds_d,
+    uint32_t* groupSizes_d,
+    uint32_t* threadIdsInGroup_d,
+    uint32_t* isLeader_d,
+    uint32_t* syncResults_d,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize);
+
+// Kernel: testStridedLocalityKernel
+// Tests that for_each_item_strided assigns work items in a strided
+// fashion. Each group writes its group_id to all work items it processes.
+// The CPU then verifies that item K is assigned to group (K % total_groups),
+// confirming strided assignment.
+void testStridedLocality(
+    uint32_t* groupIds_d,
+    uint32_t numItems,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize,
+    SyncScope scope);
+
 // Tests make_block_group() - where all threads in a block form one group
 // Verifies:
 // - group_id == blockIdx.x
@@ -78,7 +110,7 @@ void testWeightedPartition(
     int blockSize,
     SyncScope scope);
 
-// Tests partition_interleaved(num_partitions) - round-robin partition
+// Tests partition_interleaved(num_partitions) - interleaved partition
 // Verifies:
 // - Each group gets partition_id = group_id % num_partitions
 // - subgroup.group_id is renumbered as group_id / num_partitions
@@ -143,5 +175,28 @@ __global__ void testBlockClusterGroupKernel(
 __global__ void testBlockClusterSyncKernel(
     uint32_t* syncResults,
     uint32_t* errorCount);
+
+// to_warp_group() basic conversion test.
+// Verifies group_id and total_groups renumbering, plus device-side checks
+// for thread_id_in_group, group_size, and scope.
+void testToWarpGroup(
+    uint32_t* groupIds_d,
+    uint32_t* totalGroupsOut_d,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize,
+    SyncScope scope);
+
+// partition() followed by to_warp_group() test.
+// Verifies that to_warp_group() preserves partition context
+// (unlike make_warp_group() which ignores partitions).
+void testPartitionThenToWarpGroup(
+    uint32_t* warpGroupIds_d,
+    uint32_t* warpTotalGroups_d,
+    uint32_t* partitionIds_d,
+    uint32_t numPartitions,
+    uint32_t* errorCount_d,
+    int numBlocks,
+    int blockSize);
 
 } // namespace comms::pipes::test

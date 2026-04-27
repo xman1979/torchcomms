@@ -10,14 +10,14 @@ namespace comms::pipes::benchmark {
 /**
  * barrierBenchKernel - Benchmark kernel for P2P barrier synchronization
  *
- * Uses P2pNvlTransportDevice::barrier_sync_threadgroup() for cross-GPU
+ * Uses P2pNvlTransportDevice::barrier_sync() for cross-GPU
  * synchronization over NVLink.
  */
 __global__ void
 barrierBenchKernel(P2pNvlTransportDevice p2p, int nSteps, bool useBlockGroups) {
   auto group = useBlockGroups ? make_block_group() : make_warp_group();
   for (int step = 0; step < nSteps; ++step) {
-    p2p.barrier_sync_threadgroup(group, group.group_id);
+    p2p.barrier_sync(group, group.group_id);
   }
 }
 
@@ -42,13 +42,15 @@ void launchBarrierBenchKernel(
   // Create local and remote state with barrier buffers
   LocalState localState{
       .dataBuffer = nullptr,
-      .stateBuffer = DeviceSpan<ChunkState>(nullptr, 0),
+      .receiverStateBuffer = DeviceSpan<ChunkState>(nullptr, 0),
+      .senderStateBuffer = DeviceSpan<ChunkState>(nullptr, 0),
       .signalBuffer = DeviceSpan<SignalState>(nullptr, 0),
       .barrierBuffer = DeviceSpan<BarrierState>(localBarrier, numBarriers),
   };
   RemoteState remoteState{
       .dataBuffer = nullptr,
-      .stateBuffer = DeviceSpan<ChunkState>(nullptr, 0),
+      .senderStateBuffer = DeviceSpan<ChunkState>(nullptr, 0),
+      .receiverStateBuffer = DeviceSpan<ChunkState>(nullptr, 0),
       .signalBuffer = DeviceSpan<SignalState>(nullptr, 0),
       .barrierBuffer = DeviceSpan<BarrierState>(remoteBarrier, numBarriers),
   };

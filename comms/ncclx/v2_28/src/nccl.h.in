@@ -28,6 +28,7 @@
 #define NCCL_VERSION(X,Y,Z) (((X) <= 2 && (Y) <= 8) ? (X) * 1000 + (Y) * 100 + (Z) : (X) * 10000 + (Y) * 100 + (Z))
 
 #ifdef __cplusplus
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -47,6 +48,7 @@ extern "C" {
 #define NCCL_COMM_DUMP
 #define NCCL_COMM_GET_UNIQUE_HASH
 #define NCCL_COLLTRACE_CUDA_GRAPH_COMPATIBLE
+#define NCCLX_CONFIG_SUPPORTED
 
 /* Opaque handle to communicator */
 typedef struct ncclComm* ncclComm_t;
@@ -94,6 +96,9 @@ typedef enum { ncclSuccess                 =  0,
 // TODO: Revisit NCCL_WIN_DEVICE_API - this is a temporary fix to bypass CTRAN
 // and force the original NCCL path for device API (GIN support).
 #define NCCL_WIN_DEVICE_API 0x02
+// Local-only registration for source buffers. Skips rkey allGather.
+// The resulting window can only be used as a source for put operations.
+#define NCCL_WIN_LOCAL_ONLY 0x04
 
 #define NCCL_WIN_REQUIRED_ALIGNMENT 4096
 
@@ -156,6 +161,16 @@ typedef struct ncclConfig_v22800 {
 
   // control the fast init features
   int fastInitMode{NCCL_CONFIG_UNDEF_INT};
+
+  // Opaque pointer to an ncclx::Hints object.  When non-null, NCCLX
+  // will read key-value pairs from this object and apply them to
+  // config fields that are still at their undefined defaults.
+  void* hints{NCCL_CONFIG_UNDEF_PTR};
+
+  // Internal field -- do not access directly.  This would be private
+  // if ncclConfig_t were a C++ class.  Populated by NCCLX during
+  // communicator creation; users must not read or write this field.
+  void* ncclxConfig{NCCL_CONFIG_UNDEF_PTR};
 } ncclConfig_t;
 
 /* Config initializer must be assigned to initialize config structure when it is created.
@@ -185,6 +200,8 @@ typedef struct ncclConfig_v22800 {
   NCCL_CONFIG_UNDEF_INT,                    /* lazyConnect */           \
   NCCL_CONFIG_UNDEF_INT,                    /* lazySetupChannels */     \
   NCCL_CONFIG_UNDEF_INT,                    /* fastInitMode */          \
+  NCCL_CONFIG_UNDEF_PTR,                    /* hints */                  \
+  NCCL_CONFIG_UNDEF_PTR,                    /* ncclxConfig */            \
 }
 
 /* This struct will be used by ncclGroupSimulateEnd() API to query information about simulation. */
@@ -330,13 +347,33 @@ ncclResult_t pncclCommCuDevice(const ncclComm_t comm, int* device);
 ncclResult_t  ncclCommUserRank(const ncclComm_t comm, int* rank);
 ncclResult_t pncclCommUserRank(const ncclComm_t comm, int* rank);
 
-/* Register CUDA buffer for zero-copy operation */
+/* [DEPRECATED] Handle-based registration for zero-copy operation.
+ * Prefer ncclGlobalRegisterWithPtr for new code - it supports both single and
+ * multi-segment buffers without requiring handle management. */
 ncclResult_t  ncclCommRegister(const ncclComm_t comm, void* buff, size_t size, void** handle);
 ncclResult_t pncclCommRegister(const ncclComm_t comm, void* buff, size_t size, void** handle);
 
-/* Deregister CUDA buffer */
+/* [DEPRECATED] Handle-based deregistration.
+ * Prefer ncclGlobalDeregisterWithPtr for new code. */
 ncclResult_t  ncclCommDeregister(const ncclComm_t comm, void* handle);
 ncclResult_t pncclCommDeregister(const ncclComm_t comm, void* handle);
+
+/* Pointer-based registration for all buffer types - no handle returned.
+ * Supports both single-segment and multi-segment (expandable) buffers.
+ * Use ncclGlobalDeregisterWithPtr(buf, len) to deregister.
+ * "Global" because registration is stored in a global RegCache, not per-comm.
+ * Does not require a communicator - uses global backends set by first comm.
+ * cudaDev is auto-detected from the buffer pointer. */
+ncclResult_t  ncclGlobalRegisterWithPtr(void* buff, size_t size);
+ncclResult_t pncclGlobalRegisterWithPtr(void* buff, size_t size);
+
+/* Pointer-based deregistration for all buffer types.
+ * Uses pinRange to discover all physical segments and frees each.
+ * "Global" because registration is stored in a global RegCache, not per-comm.
+ * Does not require a communicator - uses global backends set by first comm.
+ * cudaDev is auto-detected from the buffer pointer. */
+ncclResult_t  ncclGlobalDeregisterWithPtr(void* buff, size_t size);
+ncclResult_t pncclGlobalDeregisterWithPtr(void* buff, size_t size);
 
 /* Register memory window  */
 ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
@@ -738,6 +775,7 @@ typedef std::unordered_map<std::string, std::string> kvType;
 class Hints {
     public:
         Hints();
+        explicit Hints(std::initializer_list<std::pair<std::string, std::string>> init);
         ncclResult_t set(const std::string& key, const std::string& val);
         ncclResult_t get(const std::string& key, std::string& val) const;
 
@@ -781,6 +819,100 @@ ncclResult_t pncclWinSharedQuery(int rank, ncclComm_t comm, ncclWindow_t win, vo
  * Query the window attributes
  */
 ncclResult_t ncclWinGetAttributes(int rank, ncclWindow_t win, ncclWinAttr_t* attr);
+
+#if defined(ENABLE_PIPES)
+/*
+ * Create a DeviceWindow in device memory from a ctran-registered ncclWindow_t.
+ * COLLECTIVE on first call — all ranks must call together.
+ * Subsequent calls return cached results (config parameters ignored).
+ *
+ * The returned device pointer must be freed via ncclWinDestroyDeviceWin().
+ */
+ncclResult_t ncclWinCreateDeviceWin(
+    ncclWindow_t win,
+    int signal_count,
+    int counter_count,
+    int barrier_count,
+    void** outDevicePtr);
+
+/*
+ * Free device memory allocated by ncclWinCreateDeviceWin.
+ */
+ncclResult_t ncclWinDestroyDeviceWin(void* devicePtr);
+
+/*
+ * Get the MultiPeerDeviceHandle components from the communicator's
+ * pipes transport. NON-COLLECTIVE — reads already-exchanged state.
+ *
+ * Returns the device pointer to the Transport[] array and metadata.
+ * The caller assembles a MultiPeerDeviceHandle from these fields.
+ *
+ * Requires NCCL_CTRAN_USE_PIPES=1 during communicator init.
+ * Returns ncclInternalError if pipes transport is not initialized.
+ */
+ncclResult_t ncclGetMultiPeerDeviceHandle(
+    ncclComm_t comm,
+    void** outTransportsPtr,
+    int* outMyRank,
+    int* outNRanks,
+    int* outNumNvlPeers,
+    int* outNumIbPeers);
+
+/*
+ * NCCLX_MAX_NICS_PER_GPU — maximum number of IBGDA NICs per GPU exposed to
+ * ncclWinLocalRegisterBuffer. Must match comms::pipes::kMaxNicsPerGpu and
+ * torch::comms::kMaxNicsPerGpu (verified by static_assert in
+ * PipesDeviceBackend.cpp). Increase only if a future platform supports
+ * > 2 NICs per GPU; update all three constants in lockstep.
+ */
+#define NCCLX_MAX_NICS_PER_GPU 2
+
+/*
+ * Per-NIC lkey result for ncclWinLocalRegisterBuffer.
+ *
+ *   values[0..size) — per-NIC RDMA local keys in network byte order.
+ *   size            — actual NIC count populated [0, NCCLX_MAX_NICS_PER_GPU].
+ *                     0 indicates no IBGDA peers (NVL-only topology); the
+ *                     caller must NOT index into values[] in that case.
+ *
+ * The device-side put selects values[nic] based on the slot it dispatches
+ * on, so consumers MUST forward all `size` per-NIC keys to
+ * LocalBufferRegistration. Populating only values[0] would corrupt WQEs
+ * for any slot landing on NIC[1..size-1] on multi-NIC hardware
+ * (GB200/GB300).
+ */
+typedef struct {
+  uint32_t values[NCCLX_MAX_NICS_PER_GPU];
+  int size;
+} ncclLkeyPerDevice;
+
+/*
+ * Register a local buffer for use as source in device-side RDMA put operations.
+ * NON-COLLECTIVE — purely local memory registration (per-NIC lkeys only, no
+ * rkey exchange).
+ *
+ * Fills *outLkeys with per-NIC lkeys + populated NIC count. See
+ * ncclLkeyPerDevice for layout.
+ *
+ * Deregister with ncclWinLocalDeregisterBuffer() when no longer needed.
+ *
+ * Requires NCCL_CTRAN_USE_PIPES=1 during communicator init.
+ * Returns ncclInternalError if pipes transport is not initialized.
+ */
+ncclResult_t ncclWinLocalRegisterBuffer(
+    ncclComm_t comm,
+    void* ptr,
+    size_t size,
+    ncclLkeyPerDevice* outLkeys);
+
+/*
+ * Deregister a buffer previously registered with ncclWinLocalRegisterBuffer().
+ * NON-COLLECTIVE.
+ */
+ncclResult_t ncclWinLocalDeregisterBuffer(
+    ncclComm_t comm,
+    void* ptr);
+#endif // ENABLE_PIPES
 
 /*
  * Free the window object and free the allocated memory
@@ -840,18 +972,16 @@ ncclResult_t pncclPutSignal(
     cudaStream_t stream);
 
 /*
- * Wait for a signal from remote peer to complete the put operation.
+ * Wait for a signal from remote peer by checking the local signal region
  */
 ncclResult_t ncclWaitSignal(int peer, ncclWindow_t win, cudaStream_t stream);
 ncclResult_t pncclWaitSignal(int peer, ncclWindow_t win, cudaStream_t stream);
 
 /*
- * Wait for a signal given the local signal displacement, the signal value, and the comparison op.
+ * One-sided signal operation to a remote peer's signal region at an offset
+ * corresponding to the local rank ID.
  */
-
 ncclResult_t ncclSignal(
-    size_t signalDisp,
-    uint64_t signalVal,
     int peer,
     ncclWindow_t win,
     cudaStream_t stream
@@ -886,7 +1016,14 @@ ncclResult_t ncclCommDumpAll(std::unordered_map<std::string, std::unordered_map<
 #define NCCL_HAS_COMMS_TRACING_SERVICE_PORT
 ncclResult_t ncclCommsTracingServicePort(int& port);
 
+// NCCL_HAS_DUMP_ALGO_STAT controls whether dumpAlgoStat() is available.
+// By default, it is defined. To disable it (e.g., for adapters which may have
+// different ncclComm layout), compile with -DNCCL_HAS_DUMP_ALGO_STAT=0.
+#if !defined(NCCL_HAS_DUMP_ALGO_STAT)
 #define NCCL_HAS_DUMP_ALGO_STAT
+#elif NCCL_HAS_DUMP_ALGO_STAT == 0
+#undef NCCL_HAS_DUMP_ALGO_STAT
+#endif
 namespace ncclx::colltrace {
 
 // Dump collective algorithm statistics for a communicator.
@@ -957,6 +1094,13 @@ ncclResult_t alltoallvDynamicCombine( const void* sendbuff, const size_t* sendSp
     size_t numSendSplitLengths, const size_t* sendIndices, const size_t* sendIndicesBlockLengths, void* recvbuff,
     size_t maxSendcount, size_t maxRecvcount, const ncclx::Hints& hints, ncclDataType_t datatype,
     ncclComm_t comm, cudaStream_t stream);
+
+// Per-collective hint keys: numBlocks, numThreads, blockScheduling
+ncclResult_t deviceAllToAllv(const void* sendbuff, void* recvbuff,
+    const int64_t* sendcounts_d, const int64_t* recvcounts_d,
+    ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream,
+    int64_t sendcountsMultiplier = 1, int64_t recvcountsMultiplier = 1,
+    const std::unordered_map<std::string, std::string>& hints = {});
 
 /*
  * Persistent All-Gather similar to ncclAllgather, the key difference is that

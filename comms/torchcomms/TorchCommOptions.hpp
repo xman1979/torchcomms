@@ -9,6 +9,7 @@
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace torch::comms {
@@ -142,18 +143,37 @@ class GatherOptions {
   GatherOptions() : timeout(kNoTimeout) {}
 };
 
+class GatherSingleOptions {
+ public:
+  std::unordered_map<std::string, std::string> hints;
+  std::chrono::milliseconds timeout;
+
+  GatherSingleOptions() : timeout(kNoTimeout) {}
+};
+
 class CommOptions {
  public:
   bool abort_process_on_timeout_or_error{true};
   std::chrono::milliseconds timeout{kDefaultTimeout};
   bool high_priority_stream{false};
   c10::intrusive_ptr<c10d::Store> store{nullptr};
+  /**
+   * If true, enables reconfigure() for fault tolerance.
+   * With reconfigure enabled, the communicator is not initialized until
+   * reconfigure() is called. Default is false.
+   */
+  bool enable_reconfigure{false};
   std::unordered_map<std::string, std::string> hints;
 
  public:
   CommOptions();
 
   bool operator==(const CommOptions& other) const;
+
+  // Look up a hint by key and convert to the requested type.
+  // Returns default_value if the key is not present.
+  template <typename T>
+  T getHint(std::string_view key, const T& default_value) const;
 };
 
 class PutOptions {
@@ -178,6 +198,22 @@ class WaitSignalOptions {
   std::chrono::milliseconds timeout;
 
   WaitSignalOptions() : timeout(kNoTimeout) {}
+};
+
+class AllGatherPInitOptions {
+ public:
+  std::unordered_map<std::string, std::string> hints;
+  std::chrono::milliseconds timeout;
+
+  AllGatherPInitOptions() : timeout(kNoTimeout) {}
+};
+
+class AllGatherPExecOptions {
+ public:
+  std::unordered_map<std::string, std::string> hints;
+  std::chrono::milliseconds timeout;
+
+  AllGatherPExecOptions() : timeout(kNoTimeout) {}
 };
 
 } // namespace torch::comms

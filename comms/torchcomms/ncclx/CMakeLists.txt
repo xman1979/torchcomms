@@ -3,8 +3,12 @@
 file(GLOB TORCHCOMMS_NCCLX_SOURCES
     "comms/torchcomms/ncclx/*.cpp"
 )
-file(GLOB TORCHCOMMS_CUDA_API_SOURCE "comms/torchcomms/device/cuda/CudaApi.cpp")
+file(GLOB TORCHCOMMS_CUDA_DEVICE_SOURCES
+    "comms/torchcomms/device/cuda/*.cpp"
+    "comms/torchcomms/device/cuda/*.cu"
+)
 
+enable_language(CUDA)
 find_package(CUDA)
 
 # NCCLX handling
@@ -20,19 +24,8 @@ else()
     set(NCCLX_INCLUDE "${NCCLX_BUILD_DIR}/include")
     set(NCCLX_STATIC_LIB "${NCCLX_BUILD_DIR}/lib/libnccl_static.a")
     set(NCCLX_SHARED_LIB "${NCCLX_BUILD_DIR}/lib/libnccl.so")
-    set(FMT_INCLUDE "${ROOT}/third-party/fmt/include")
-
-    if (NOT EXISTS "${NCCLX_BUILD_DIR}")
-        execute_process(
-            COMMAND ${ROOT}/build_ncclx.sh
-            WORKING_DIRECTORY ${ROOT}
-            RESULT_VARIABLE result
-            OUTPUT_VARIABLE output
-        )
-        if(result)
-            message(FATAL_ERROR "NCCLX build failed: ${result}")
-        endif()
-    endif()
+    # build_ncclx.sh is invoked by build_ncclx.cmake (included before other
+    # third-party deps) so NCCLX_BUILD_DIR should already exist at this point.
 endif()
 
 # Get folly LDFLAGS using pkg-config
@@ -48,8 +41,13 @@ if(NOT PKG_RESULT EQUAL 0)
 endif()
 separate_arguments(FOLLY_LDFLAGS NATIVE_COMMAND "${FOLLY_LDFLAGS_RAW}")
 
-# Remove any -l:libglog.a from FOLLY_LDFLAGS
-list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX ".*libglog.*")
+# Remove glog/gflags/fmt from FOLLY_LDFLAGS — they're already linked
+# statically via libtorchcomms.so from the third-party cmake modules.
+# pkg-config may output -lglog, -l:libglog.a, or full paths like
+# /path/to/libglog.a — the simple substring match handles all forms.
+list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX "glog")
+list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX "gflags")
+list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX "libfmt")
 
 # Check NCCLX include exists
 if(NOT EXISTS "${NCCLX_INCLUDE}")
@@ -59,19 +57,46 @@ endif()
 # Check if NCCL Device API headers are available (requires NCCLX 2.28+)
 # This enables the device API for GPU-initiated networking (GIN) support
 if(EXISTS "${NCCLX_INCLUDE}/nccl_device/core.h")
-    message(STATUS "NCCL Device API headers found, building with device API support")
+    message(STATUS
+        "NCCL Device API headers found,"
+        " building with device API support")
     set(TORCHCOMMS_HAS_NCCL_DEVICE_API ON)
-    file(GLOB TORCHCOMMS_DEVICE_NCCLX_SOURCE "comms/torchcomms/device/ncclx/*.cpp")
+    file(GLOB TORCHCOMMS_DEVICE_NCCLX_SOURCE
+        "comms/torchcomms/device/ncclx/*.cpp")
 else()
-    message(STATUS "NCCL Device API headers NOT found (requires NCCLX 2.28+), building without device API support")
+    message(STATUS
+        "NCCL Device API headers NOT found"
+        " (requires NCCLX 2.28+),"
+        " building without device API support")
     set(TORCHCOMMS_HAS_NCCL_DEVICE_API OFF)
     set(TORCHCOMMS_DEVICE_NCCLX_SOURCE "")
 endif()
 
+# Check if ENABLE_PIPES is requested via environment variable.
+# When enabled, compiles pipes device backend support into _comms_ncclx.
+# Requires NCCL built with ENABLE_PIPES=1 (pipes transport in libnccl.so).
+if("$ENV{ENABLE_PIPES}" STREQUAL "1")
+    set(TORCHCOMMS_ENABLE_PIPES ON)
+    message(STATUS "ENABLE_PIPES=1 set, building with pipes support")
+    if(TORCHCOMMS_HAS_NCCL_DEVICE_API)
+        file(GLOB TORCHCOMMS_DEVICE_PIPES_SOURCE
+            "comms/torchcomms/device/pipes/*.cpp")
+    else()
+        set(TORCHCOMMS_DEVICE_PIPES_SOURCE "")
+    endif()
+else()
+    set(TORCHCOMMS_ENABLE_PIPES OFF)
+    set(TORCHCOMMS_DEVICE_PIPES_SOURCE "")
+    message(STATUS "ENABLE_PIPES not set, building without pipes support")
+endif()
+
 add_library(torchcomms_comms_ncclx MODULE
     ${TORCHCOMMS_NCCLX_SOURCES}
-    ${TORCHCOMMS_CUDA_API_SOURCE}
+    ${TORCHCOMMS_CUDA_DEVICE_SOURCES}
     ${TORCHCOMMS_DEVICE_NCCLX_SOURCE}
+    ${TORCHCOMMS_DEVICE_PIPES_SOURCE}
+    comms/utils/CudaRAII.cc
+    comms/utils/GraphCaptureSideStream.cc
 )
 set_target_properties(torchcomms_comms_ncclx PROPERTIES
     PREFIX ""
@@ -82,7 +107,6 @@ set_target_properties(torchcomms_comms_ncclx PROPERTIES
 target_include_directories(torchcomms_comms_ncclx PRIVATE
     ${ROOT}
     ${NCCLX_INCLUDE}
-    ${FMT_INCLUDE}
     ${CONDA_INCLUDE}
     ${Python3_INCLUDE_DIRS}
 )
@@ -90,19 +114,29 @@ target_compile_features(torchcomms_comms_ncclx PRIVATE cxx_std_20)
 
 # Add device API compile definition if headers are available
 if(TORCHCOMMS_HAS_NCCL_DEVICE_API)
-    target_compile_definitions(torchcomms_comms_ncclx PRIVATE TORCHCOMMS_HAS_NCCL_DEVICE_API=1)
+    target_compile_definitions(torchcomms_comms_ncclx
+        PRIVATE TORCHCOMMS_HAS_NCCL_DEVICE_API=1)
+endif()
+
+# Add ENABLE_PIPES compile definition for pipes device backend
+if(TORCHCOMMS_ENABLE_PIPES)
+    target_compile_definitions(torchcomms_comms_ncclx
+        PRIVATE ENABLE_PIPES=1)
 endif()
 
 target_link_directories(torchcomms_comms_ncclx PRIVATE ${CONDA_LIB})
 target_link_libraries(torchcomms_comms_ncclx PRIVATE
+    fmt::fmt
+    torchcomms
     ${TORCH_LIBRARIES}
     ${TORCH_PYTHON_LIB}
-    torchcomms
 )
 if(USE_SYSTEM_LIBS)
     target_link_libraries(torchcomms_comms_ncclx PRIVATE
         ${NCCLX_SHARED_LIB}
-        "-lfmt"
+        ${FOLLY_LDFLAGS}
+        "-lboost_program_options"
+        "-lboost_filesystem"
     )
 else()
     target_link_libraries(torchcomms_comms_ncclx PRIVATE
@@ -132,7 +166,6 @@ else()
         "-l:libxxhash.a"
         "-l:libboost_filesystem.a"
         "-l:libboost_context.a"
-        "-l:libfmt.a"
         ${FOLLY_LDFLAGS}
     )
     # Rename NCCL symbols to avoid conflicting with OSS nccl* that is bundled

@@ -732,7 +732,76 @@ set(RCCLX_FILES
   meta/ctran/Hints.cc
   meta/ctran/MetaFactory.cc
   meta/ctran/MetaFactory.h
+  meta/ctran/PersistentCollectives.cc
 )
+
+# Automatically collect all ctran and pipes source files.
+# Glob paths must be absolute because these dirs live outside CMAKE_SOURCE_DIR
+# (at fbcode/comms/ctran/ and fbcode/comms/pipes/, not under comms/rcclx/develop/).
+set(FBCODE_DIR_FOR_CTRAN "${CMAKE_SOURCE_DIR}/../../..")
+file(GLOB_RECURSE CTRAN_SOURCES_ABS
+    "${FBCODE_DIR_FOR_CTRAN}/comms/ctran/*.cc"
+    "${FBCODE_DIR_FOR_CTRAN}/comms/ctran/*.cu"
+    "${FBCODE_DIR_FOR_CTRAN}/comms/ctran/*.h"
+    "${FBCODE_DIR_FOR_CTRAN}/comms/ctran/*.cuh"
+)
+
+# Convert absolute paths to fbcode-relative paths (e.g. "comms/ctran/Ctran.cc")
+# so they work with the hipify pipeline which resolves via ${FBCODE_DIR}/${SRC_FILE}.
+set(CTRAN_SOURCES "")
+foreach(ABS_PATH ${CTRAN_SOURCES_ABS})
+    file(RELATIVE_PATH REL_PATH "${FBCODE_DIR_FOR_CTRAN}" "${ABS_PATH}")
+    list(APPEND CTRAN_SOURCES "${REL_PATH}")
+endforeach()
+
+list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/tests/.*")
+list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/benchmarks/.*")
+list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/examples/.*")
+# Also exclude nested tests/benchmarks/examples dirs (e.g. comms/ctran/algos/tests/, comms/ctran/gpe/tests/)
+list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/.*/tests/.*")
+list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/.*/benchmarks/.*")
+list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/.*/examples/.*")
+if (NOT DEFINED ENABLE_TCPDM OR NOT ENABLE_TCPDM)
+    add_compile_definitions(CTRAN_DISABLE_TCPDM)
+    list(FILTER CTRAN_SOURCES EXCLUDE REGEX "comms/ctran/backends/tcpdevmem/.*")
+endif()
+
+# Automatically collect all pipes source files.
+file(GLOB_RECURSE PIPES_SOURCES_ABS
+    "${FBCODE_DIR_FOR_CTRAN}/comms/pipes/*.cc"
+    "${FBCODE_DIR_FOR_CTRAN}/comms/pipes/*.cu"
+    "${FBCODE_DIR_FOR_CTRAN}/comms/pipes/*.h"
+    "${FBCODE_DIR_FOR_CTRAN}/comms/pipes/*.cuh"
+)
+
+set(PIPES_SOURCES "")
+foreach(ABS_PATH ${PIPES_SOURCES_ABS})
+    file(RELATIVE_PATH REL_PATH "${FBCODE_DIR_FOR_CTRAN}" "${ABS_PATH}")
+    list(APPEND PIPES_SOURCES "${REL_PATH}")
+endforeach()
+
+# Exclude IBGDA/DOCA files — they depend on NVIDIA DOCA and infiniband/verbs.h,
+# not available for ROCm/RCCL builds.
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "[Ii]bgda")
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "[Dd]oca")
+# MultiPeerTransport unconditionally includes MultipeerIbgdaTransport.h, so exclude it too.
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/MultiPeerTransport\\.")
+# Exclude Dispatchv files (currently disabled)
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "Dispatchv\\.")
+# Exclude tests and benchmarks (they depend on gtest/mpi which are not available in this build)
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/tests/.*")
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/benchmarks/.*")
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/.*/tests/.*")
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/.*/benchmarks/.*")
+# Exclude rdma files — they depend on spdlog which is not available in this build.
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/rdma/.*")
+# Exclude window files — they depend on IbgdaBuffer.h which is excluded.
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/pipes/window/.*")
+# Exclude GpuMemHandler and CudaDriverLazy — they depend on cudaTypedefs.h which is not available.
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "GpuMemHandler\\.")
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "CudaDriverLazy\\.")
+# Exclude MultiPeerNvlTransport — it depends on GpuMemHandler.h which is excluded.
+list(FILTER PIPES_SOURCES EXCLUDE REGEX "MultiPeerNvlTransport\\.")
 
 # Run this command to get RCCLX_LIB_FILES:
 # find comms/rcclx/develop/meta -type f ! -path "*/tests/*" -path "*/lib/*" \( -name "*.cc" -o -name "*.h" -o -name "*.hpp" \) | sort
@@ -763,351 +832,20 @@ set(RCCLX_LIB_FILES
   comms/rcclx/develop/meta//lpcoll/low_precision_utility.h
   comms/rcclx/develop/meta//lpcoll/p2p_allgather.cc
   comms/rcclx/develop/meta//lpcoll/p2p_allgather.h
-  comms/rcclx/develop/meta/ctran/MetaFactory.cc
-  comms/rcclx/develop/meta/ctran/MetaFactory.h
-  comms/rcclx/develop/meta/ctran/AllToAllvDynamic.cc
-  comms/rcclx/develop/meta/ctran/PersistentCollectives.cc
-  comms/rcclx/develop/meta/ctran/Hints.cc
 )
 
 # find comms/ctran/ -type f ! -path "*/tests/*" ! -path "*/benchmarks/*" ! -path "*/examples/*" \( -name "*.cc" -o -name "*.h" -o -name "*.hpp" -o -name "*.cuh" -o -name "*.cu" \) | sort
 set(CTRAN_FILES
-  comms/ctran/algos/AllGather/AllGatherBrucksFF.cc
-  comms/ctran/algos/AllGather/AllGather.cc
-  comms/ctran/algos/AllGather/AllGatherDirect.cc
-  comms/ctran/algos/AllGather/AllGatherDirect.cuh
-  comms/ctran/algos/AllGather/AllGatherImpl.h
-  comms/ctran/algos/AllGather/AllGatherRecDbl.cc
-  comms/ctran/algos/AllGather/AllGatherRecDbl.cu
-  comms/ctran/algos/AllGather/AllGatherRing.cc
-  comms/ctran/algos/AllGather/AllGatherRing.cu
-  comms/ctran/algos/AllGatherP/AlgoImpl.h
-  comms/ctran/algos/AllGatherP/AllGatherP.cc
-  comms/ctran/algos/AllGatherP/AllGatherP.cu
-  comms/ctran/algos/AllGatherP/CommUtils.h
-  comms/ctran/algos/AllGatherP/DirectImpl.cc
-  comms/ctran/algos/AllGatherP/DirectImpl.cu
-  comms/ctran/algos/AllGatherP/PipelineImpl.cc
-  comms/ctran/algos/AllGatherP/PipelineImpl.cu
-  comms/ctran/algos/AllGatherP/Types.h
-  comms/ctran/algos/AllReduce/AllReduceARG.cc
-  comms/ctran/algos/AllReduce/AllReduceARGCommonDev.h
-  comms/ctran/algos/AllReduce/AllReduceARG.cuh
-  comms/ctran/algos/AllReduce/AllReduce.cc
-  comms/ctran/algos/AllReduce/AllReduceDevTypes.h
-  comms/ctran/algos/AllReduce/AllReduceDirect.cc
-  comms/ctran/algos/AllReduce/AllReduceDirect.cuh
-  comms/ctran/algos/AllReduce/AllReduceImpl.h
-  comms/ctran/algos/AllReduce/AllReduceNetTypes.h
-  comms/ctran/algos/AllReduce/AllReduceResourceImpl.cc
-  comms/ctran/algos/AllReduce/AllReduceResourceImpl.h
-  comms/ctran/algos/AllReduce/AllReduceRing.cc
-  comms/ctran/algos/AllReduce/AllReduceRingCommon.cuh
-  comms/ctran/algos/AllReduce/AllReduceRing.cuh
-  comms/ctran/algos/AllReduce/AllReduceShm.cu
-  comms/ctran/algos/AllReduce/AllReduceShm.cuh
-  comms/ctran/algos/AllToAll/AllToAll.cc
-  comms/ctran/algos/AllToAll/AllToAll.cuh
-  comms/ctran/algos/AllToAll/AllToAllDedup.cc
-  comms/ctran/algos/AllToAll/AllToAllDedup.cuh
-  comms/ctran/algos/AllToAll/AllToAllDedupImpl.cc
-  comms/ctran/algos/AllToAll/AllToAllDedupImpl.h
-  comms/ctran/algos/AllToAll/AllToAllImpl.cc
-  comms/ctran/algos/AllToAll/AllToAllImpl.h
-  comms/ctran/algos/AllToAll/AllToAllP.cc
-  comms/ctran/algos/AllToAll/AllToAllPHintUtils.cc
-  comms/ctran/algos/AllToAll/AllToAllPHintUtils.h
-  comms/ctran/algos/AllToAll/AllToAllPImpl.cc
-  comms/ctran/algos/AllToAll/AllToAllPImpl.cu
-  comms/ctran/algos/AllToAll/AllToAllPImpl.h
-  comms/ctran/algos/AllToAll/AllToAllv.cc
-  comms/ctran/algos/AllToAll/AllToAllv.cuh
-  comms/ctran/algos/AllToAll/AllToAllvDynamic.cc
-  comms/ctran/algos/AllToAll/AllToAllvDynamicCommon.cc
-  comms/ctran/algos/AllToAll/AllToAllvDynamicCommon.h
-  comms/ctran/algos/AllToAll/AllToAllvDynamic.cuh
-  comms/ctran/algos/AllToAll/AllToAllvDynamicHintUtils.cc
-  comms/ctran/algos/AllToAll/AllToAllvDynamicHintUtils.h
-  comms/ctran/algos/AllToAll/AllToAllvDynamicPImpl.cc
-  comms/ctran/algos/AllToAll/AllToAllvDynamicPImpl.h
-  comms/ctran/algos/AllToAll/AllToAllvDynamicSplit.cc
-  comms/ctran/algos/AllToAll/AllToallvDynamicSplitNonContig.cc
-  comms/ctran/algos/AllToAll/AllToAllvImpl.h
-  comms/ctran/algos/AllToAll/fb/compressed/CompressedAllToAllv.cc
-  comms/ctran/algos/AllToAll/fb/compressed/CompressedAllToAllv.h
-  comms/ctran/algos/AllToAll/fb/compressed/CompressedAllToAllvImpl.h
-  comms/ctran/algos/AllToAll/Types.h
-  comms/ctran/algos/AllToAllvDedup/AlgoImpl.cc
-  comms/ctran/algos/AllToAllvDedup/AlgoImpl.h
-  comms/ctran/algos/AllToAllvDedup/AllToAllvDedup.cc
-  comms/ctran/algos/AllToAllvDedup/CommonDev.h
-  comms/ctran/algos/AllToAllvDedup/ExecCommon.cc
-  comms/ctran/algos/AllToAllvDedup/ExecCommon.cuh
-  comms/ctran/algos/AllToAllvDedup/ExecCommon.h
-  comms/ctran/algos/AllToAllvDedup/ExecFwd.cuh
-  comms/ctran/algos/AllToAllvDedup/ExecImpl.cc
-  comms/ctran/algos/AllToAllvDedup/ExecImpl.cu
-  comms/ctran/algos/AllToAllvDedup/ExecRecvCopy.cuh
-  comms/ctran/algos/AllToAllvDedup/ExecSendCopy.cuh
-  comms/ctran/algos/AllToAllvDedup/FwdRecvSync.cuh
-  comms/ctran/algos/AllToAllvDedup/IndexMapDev.cuh
-  comms/ctran/algos/AllToAllvDedup/PrepareImpl.cu
-  comms/ctran/algos/AllToAllvDedup/ResourceBuf.cc
-  comms/ctran/algos/AllToAllvDedup/ResourceBuf.h
-  comms/ctran/algos/AllToAllvDedup/ResourceImpl.cc
-  comms/ctran/algos/AllToAllvDedup/ResourceImpl.h
-  comms/ctran/algos/AllToAllvDedup/Types.h
-  comms/ctran/algos/AllToAllvDedup/WorkerGroupDev.cuh
-  comms/ctran/algos/AllToAllvDedup/WorkerGroup.h
-  comms/ctran/algos/Barrier.cu
-  comms/ctran/algos/barrier.cuh
-  comms/ctran/algos/bcast.cuh
-  comms/ctran/algos/Broadcast/BroadcastBinomialTree.cc
-  comms/ctran/algos/Broadcast/Broadcast.cc
-  comms/ctran/algos/Broadcast/Broadcast.cu
-  comms/ctran/algos/Broadcast/BroadcastDirect.cc
-  comms/ctran/algos/Broadcast/BroadcastImpl.h
-  comms/ctran/algos/Checksum.cu
-  comms/ctran/algos/Checksum.cuh
-  comms/ctran/algos/CollUtils.h
-  comms/ctran/algos/common/BufManager.cc
-  comms/ctran/algos/common/BufManager.h
-  comms/ctran/algos/common/GpeKernelDev.cuh
-  comms/ctran/algos/common/GpeKernel.h
-  comms/ctran/algos/common/GpeKernelSyncDev.cuh
-  comms/ctran/algos/common/GpeKernelSync.h
-  comms/ctran/algos/common/MPSCTbSyncDev.cuh
-  comms/ctran/algos/common/MPSCTbSync.h
-  comms/ctran/algos/common/MultiTbSyncDev.cuh
-  comms/ctran/algos/common/SpscP2pSyncDev.cuh
-  comms/ctran/algos/common/SpscP2pSync.h
-  comms/ctran/algos/CtranAlgoArgDev.h
-  comms/ctran/algos/CtranAlgo.cc
-  comms/ctran/algos/CtranAlgoDev.h
-  comms/ctran/algos/CtranAlgo.h
-  comms/ctran/algos/CudaGraphUtilsImpl.cc
-  comms/ctran/algos/DevAlgoImpl.cuh
-  comms/ctran/algos/DevCommon.cuh
-  comms/ctran/algos/DevShmState.cu
-  comms/ctran/algos/DevShmState.cuh
-  comms/ctran/algos/localReduce.cuh
-  comms/ctran/algos/perftrace/Record.cc
-  comms/ctran/algos/perftrace/Record.h
-  comms/ctran/algos/perftrace/TimeInterval.cc
-  comms/ctran/algos/perftrace/TimeInterval.h
-  comms/ctran/algos/perftrace/TimestampPoint.cc
-  comms/ctran/algos/perftrace/TimestampPoint.h
-  comms/ctran/algos/perftrace/Tracer.cc
-  comms/ctran/algos/perftrace/Tracer.h
-  comms/ctran/algos/ReduceScatter/ReduceScatter.cc
-  comms/ctran/algos/ReduceScatter/ReduceScatterDirect.cc
-  comms/ctran/algos/ReduceScatter/ReduceScatterDirect.cuh
-  comms/ctran/algos/ReduceScatter/ReduceScatterImpl.h
-  comms/ctran/algos/ReduceScatter/ReduceScatterRHD.cc
-  comms/ctran/algos/ReduceScatter/ReduceScatterRHD.cuh
-  comms/ctran/algos/ReduceScatter/ReduceScatterRing.cc
-  comms/ctran/algos/ReduceScatter/ReduceScatterRing.cuh
-  comms/ctran/algos/RMA/Get.cc
-  comms/ctran/algos/RMA/Get.cu
-  comms/ctran/algos/RMA/PutSignal.cc
-  comms/ctran/algos/RMA/PutSignal.cu
-  comms/ctran/algos/RMA/Types.h
-  comms/ctran/algos/RMA/WaitSignalImpl.h
-  comms/ctran/algos/SendRecv/SendRecv.cc
-  comms/ctran/algos/SendRecv/SendRecvCEImpl.cc
-  comms/ctran/algos/SendRecv/SendRecvCEImpl.h
-  comms/ctran/algos/SendRecv/SendRecv.cu
-  comms/ctran/algos/SendRecv/SendRecvImpl.cc
-  comms/ctran/algos/SendRecv/SendRecvImpl.h
-  comms/ctran/algos/SendRecv/SendRecvP2p.cu
-  comms/ctran/algos/SendRecv/SendRecvP2pImpl.cc
-  comms/ctran/algos/SendRecv/SendRecvP2pImpl.h
-  comms/ctran/algos/SendRecv/SendRecvStagedCopy.cu
-  comms/ctran/algos/SendRecv/SendRecvStagedCopyImpl.cc
-  comms/ctran/algos/SendRecv/SendRecvStagedCopyImpl.h
-  comms/ctran/algos/SendRecv/Types.h
-  comms/ctran/algos/topo/CtranRingBuilder.h
-  comms/ctran/backends/CtranAux.h
-  comms/ctran/backends/CtranCtrl.cc
-  comms/ctran/backends/CtranCtrl.h
-  comms/ctran/backends/ib/CtranIbBase.h
-  comms/ctran/backends/ib/CtranIb.cc
-  comms/ctran/backends/ib/CtranIb.h
-  comms/ctran/backends/ib/CtranIbImpl.h
-  comms/ctran/backends/ib/CtranIbLocalVc.cc
-  comms/ctran/backends/ib/CtranIbLocalVc.h
-  comms/ctran/ibverbx/IbvQpUtils.cc
-  comms/ctran/ibverbx/IbvQpUtils.h
-  comms/ctran/backends/ib/CtranIbRequest.cc
-  comms/ctran/backends/ib/CtranIbSingleton.h
-  comms/ctran/backends/ib/CtranIbVc.cc
-  comms/ctran/backends/ib/CtranIbVc.h
-  comms/ctran/backends/ib/ibutils.cc
-  comms/ctran/backends/ib/ibutils.h
-  comms/ctran/backends/ib/IbvWrap.cc
-  comms/ctran/backends/ib/IbvWrap.h
-  comms/ctran/backends/mock/CtranTcpDmBaseMock.h
-  comms/ctran/backends/mock/CtranTcpDmMock.h
-  comms/ctran/backends/nvl/CtranNvlBase.h
-  comms/ctran/backends/nvl/CtranNvl.cc
-  comms/ctran/backends/nvl/CtranNvl.h
-  comms/ctran/backends/nvl/CtranNvlImpl.cc
-  comms/ctran/backends/nvl/CtranNvlImpl.h
-  comms/ctran/backends/socket/CtranSocketBase.h
-  comms/ctran/backends/socket/CtranSocket.cc
-  comms/ctran/backends/socket/CtranSocket.h
-# comms/ctran/backends/tcpdevmem/CtranTcpDmBase.h
-# comms/ctran/backends/tcpdevmem/CtranTcpDm.cc
-# comms/ctran/backends/tcpdevmem/CtranTcpDm.h
-# comms/ctran/backends/tcpdevmem/CtranTcpDmSingleton.cc
-# comms/ctran/backends/tcpdevmem/CtranTcpDmSingleton.h
-  comms/ctran/bootstrap/AbortableSocket.cc
-  comms/ctran/bootstrap/AbortableSocket.h
-  comms/ctran/bootstrap/AsyncSocket.cc
-  comms/ctran/bootstrap/AsyncSocket.h
-  comms/ctran/bootstrap/ISocketFactory.h
-  comms/ctran/bootstrap/ISocket.h
-  comms/ctran/bootstrap/Socket.cc
-  comms/ctran/bootstrap/Socket.h
-  comms/ctran/colltrace/CollTraceWrapper.cc
-  comms/ctran/colltrace/CollTraceWrapper.h
-  comms/ctran/colltrace/MapperTrace.cc
-  comms/ctran/colltrace/MapperTrace.h
-  comms/ctran/commstate/CommStateX.cc
-  comms/ctran/commstate/CommStateXDev.h
-  comms/ctran/commstate/CommStateX.h
-  comms/ctran/commstate/Topology.cc
-  comms/ctran/commstate/Topology.h
-  comms/ctran/Ctran.cc
-  comms/ctran/CtranComm.h
-  comms/ctran/CtranEx.cc
-  comms/ctran/CtranEx.h
-  comms/ctran/CtranExImpl.h
-  comms/ctran/CtranExRequest.cc
-  comms/ctran/Ctran.h
-  comms/ctran/gpe/CtranChecksum.h
-  comms/ctran/gpe/CtranGpe.cc
-  comms/ctran/gpe/CtranGpeDev.h
-  comms/ctran/gpe/CtranGpe.h
-  comms/ctran/gpe/CtranGpeImpl.cc
-  comms/ctran/gpe/CtranGpeImpl.h
-  comms/ctran/hints/Hints.cc
-  comms/ctran/hints/Hints.h
-  comms/ctran/hints/HintUtils.cc
-  comms/ctran/hints/HintUtils.h
-  comms/ctran/ibverbx/Coordinator.cc
-  comms/ctran/ibverbx/Coordinator.h
-  comms/ctran/ibverbx/device/structs.h
-  comms/ctran/ibverbx/DqplbSeqTracker.h
-  comms/ctran/ibverbx/fb/ibgda/DeviceQueuePair.h
-  comms/ctran/ibverbx/fb/ibgda/SegmentBuilder.h
-  comms/ctran/ibverbx/fb/ibgda/Utils.h
-  comms/ctran/ibverbx/IbvCommon.cc
-  comms/ctran/ibverbx/IbvCommon.h
-  comms/ctran/ibverbx/Ibvcore.h
-  comms/ctran/ibverbx/IbvCq.cc
-  comms/ctran/ibverbx/IbvCq.h
-  comms/ctran/ibverbx/IbvDevice.cc
-  comms/ctran/ibverbx/IbvDevice.h
-  comms/ctran/ibverbx/Ibverbx.cc
-  comms/ctran/ibverbx/Ibverbx.h
-  comms/ctran/ibverbx/IbverbxSymbols.cc
-  comms/ctran/ibverbx/IbverbxSymbols.h
-  comms/ctran/ibverbx/IbvMr.cc
-  comms/ctran/ibverbx/IbvMr.h
-  comms/ctran/ibverbx/IbvPd.cc
-  comms/ctran/ibverbx/IbvPd.h
-  comms/ctran/ibverbx/IbvQp.cc
-  comms/ctran/ibverbx/IbvQp.h
-  comms/ctran/ibverbx/IbvVirtualCq.cc
-  comms/ctran/ibverbx/IbvVirtualCq.h
-  comms/ctran/ibverbx/IbvVirtualQp.cc
-  comms/ctran/ibverbx/IbvVirtualQp.h
-  comms/ctran/ibverbx/IbvVirtualWr.h
-  comms/ctran/ibverbx/Mlx5dv.cc
-  comms/ctran/ibverbx/Mlx5dv.h
-  comms/ctran/interfaces/IBootstrap.h
-  comms/ctran/interfaces/ICtran.h
-  comms/ctran/mapper/CtranMapper.cc
-  comms/ctran/mapper/CtranMapper.h
-  comms/ctran/mapper/CtranMapperImpl.cc
-  comms/ctran/mapper/CtranMapperImpl.h
-  comms/ctran/mapper/CtranMapperRequest.cc
-  comms/ctran/mapper/CtranMapperTypes.h
-  comms/ctran/mapper/fb/IcompressionManager.h
-  comms/ctran/memory/memCacheAllocator.cc
-  comms/ctran/memory/memCacheAllocator.h
-  comms/ctran/memory/SlabAllocator.cc
-  comms/ctran/memory/SlabAllocator.h
-  comms/ctran/memory/Utils.cc
-  comms/ctran/memory/Utils.h
-  comms/ctran/profiler/AlgoProfilerModule.cc
-  comms/ctran/profiler/AlgoProfilerModule.h
-  comms/ctran/profiler/CtranProfiler.cc
-  comms/ctran/profiler/CtranProfiler.h
-  comms/ctran/profiler/CtranProfilerSlowRankModule.cc
-  comms/ctran/profiler/CtranProfilerSlowRankModule.h
-  comms/ctran/profiler/Profiler.cc
-  comms/ctran/profiler/Profiler.h
-  comms/ctran/profiler/QueuePairProfilerModule.cc
-  comms/ctran/profiler/QueuePairProfilerModule.h
-  comms/ctran/regcache/RegCache.cc
-  comms/ctran/regcache/RegCache.h
-  comms/ctran/utils/Abort.cc
-  comms/ctran/utils/Abort.h
-  comms/ctran/utils/Alloc.cc
-  comms/ctran/utils/Alloc.h
-  comms/ctran/utils/ArgCheck.cc
-  comms/ctran/utils/ArgCheck.h
-  comms/ctran/utils/AsyncError.h
-  comms/ctran/utils/Checks.h
-  comms/ctran/utils/CommGroupUtils.cc
-  comms/ctran/utils/CommGroupUtils.h
-  comms/ctran/utils/CtranAvlTree.cc
-  comms/ctran/utils/CtranAvlTreeElem.cc
-  comms/ctran/utils/CtranAvlTreeElem.h
-  comms/ctran/utils/CtranAvlTree.h
-  comms/ctran/utils/CtranIpc.cc
-  comms/ctran/utils/CtranIpc.h
-  comms/ctran/utils/CtranPerf.h
-  comms/ctran/utils/CudaGraphUtils.h
-  comms/ctran/utils/CudaUtils.cc
-  comms/ctran/utils/CudaUtils.h
-  comms/ctran/utils/CudaWrap.cc
-  comms/ctran/utils/CudaWrap.h
-  comms/ctran/utils/Debug.h
-  comms/ctran/utils/DevAttribute.h
-  comms/ctran/utils/DevMemType.cc
-  comms/ctran/utils/DevMemType.h
-  comms/ctran/utils/DevUtils.cuh
-  comms/ctran/utils/ErrorStackTraceUtil.cc
-  comms/ctran/utils/ErrorStackTraceUtil.h
-  comms/ctran/utils/Exception.h
-  comms/ctran/utils/ExtUtils.h
-  comms/ctran/utils/HipGdrCheck.h
-  comms/ctran/utils/LogInit.cc
-  comms/ctran/utils/LogInit.h
-  comms/ctran/utils/MemFence.h
-  comms/ctran/utils/PinnedHostPool.h
-  comms/ctran/utils/SkipDestroyUtil.cc
-  comms/ctran/utils/SkipDestroyUtil.h
-  comms/ctran/utils/SPSCQueue.h
-  comms/ctran/utils/StopWatch.h
-  comms/ctran/utils/TmpBufSegManager.h
-  comms/ctran/utils/Utils.cc
-  comms/ctran/utils/Utils.h
-  comms/ctran/window/CtranWin.h
-  comms/ctran/window/Types.h
-  comms/ctran/window/window.cc
-  comms/ctran/window/WinHintUtils.cc
-  comms/ctran/window/WinHintUtils.h
+  ${CTRAN_SOURCES}
+  comms/common/bootstrap/IBootstrap.h
+  comms/ctran/bootstrap/ICtranBootstrap.h
   comms/tcp_devmem/transport.h # extra requirement
   comms/utils/MemUtils.h # extra requirement
 )
 
 # TODO: Add back comms/common/ files
 # Run this command to get COMMON_FILES:
-# find comms/utils/ comms/common -type f ! -path "*/tests/*" ! -path "*/benchmarks/*" \( -name "*.cc" -o -name "*.h" -o -name "*.hpp" -o -name "*.cuh" -o -name "*.cu" \) | sort
+# find comms/utils/ comms/common comms/pipes -type f ! -path "*/tests/*" ! -path "*/benchmarks/*" \( -name "*.cc" -o -name "*.h" -o -name "*.hpp" -o -name "*.cuh" -o -name "*.cu" \) | sort
 set(COMMON_FILES
   comms/common/algorithms/AlgoFactory.cu
   comms/common/algorithms/AlgoFactory.cuh
@@ -1136,31 +874,17 @@ set(COMMON_FILES
   comms/common/algorithms/reduce_scatter/reduce_scatter_dda.cuh
   comms/common/AtomicUtils.cuh
   comms/common/BitOps.cuh
+  comms/common/bootstrap/IBootstrap.h
   comms/common/CudaWrap.h
   comms/common/DeviceConstants.cuh
   comms/common/IpcGpuBarrier.cu
   comms/common/IpcGpuBarrier.cuh
   comms/common/IpcMemHandler.cc
   comms/common/IpcMemHandler.h
-  comms/pipes/AllToAllv.cuh
-  comms/pipes/BarrierState.cuh
-  comms/pipes/ChunkState.cuh
-  # comms/pipes/collectives/dispatch.cu
-  # comms/pipes/collectives/dispatch.cuh
-  # comms/pipes/collectives/dispatch.h
-  comms/pipes/CopyUtils.cuh
-  comms/pipes/DeviceSpan.cuh
-  comms/pipes/GpuMemHandler.cc
-  comms/pipes/GpuMemHandler.h
-  comms/pipes/MultiPeerNvlTransport.cc
-  comms/pipes/MultiPeerNvlTransport.h
-  comms/pipes/P2pNvlTransportDevice.cuh
-  comms/pipes/P2pSelfTransportDevice.cuh
-  comms/pipes/SignalState.cuh
-  comms/pipes/ThreadGroup.cuh
-  comms/pipes/Transport.cuh
-  comms/pipes/tests/Checks.h # manual
+  comms/common/bootstrap/IBootstrap.h
   comms/utils/checks.h
+  comms/utils/colltrace/AlgoStats.cc
+  comms/utils/colltrace/AlgoStats.h
   comms/utils/colltrace/CollMetadata.h
   comms/utils/colltrace/CollMetadataImpl.cc
   comms/utils/colltrace/CollMetadataImpl.h
@@ -1196,6 +920,7 @@ set(COMMON_FILES
   comms/utils/commSpecs.h
   comms/utils/Conversion.cc
   comms/utils/Conversion.h
+  comms/utils/CudaChecks.h
   comms/utils/CudaRAII.cc
   comms/utils/CudaRAII.h
   comms/utils/cvars/nccl_baseline_adapter.cc
@@ -1206,6 +931,8 @@ set(COMMON_FILES
   comms/utils/EnvUtils.h
   comms/utils/InitFolly.cc
   comms/utils/InitFolly.h
+  comms/utils/kernels/rng/philox_rng.cuh
+  comms/utils/kernels/stochastic_rounding/stochastic_rounding.cuh
   comms/utils/logger/alloc.cc
   comms/utils/logger/alloc.h
   comms/utils/logger/BackendTopologyUtil.cc
@@ -1319,7 +1046,7 @@ endforeach()
 # Different build rules for files that we want to import with their full path.
 # They will be stored in fbcode/comms/rcclx/develop/build/release/hipify/<path/from/fbcode>
 set(FBCODE_DIR "${CMAKE_SOURCE_DIR}/../../..")
-foreach(SRC_FILE ${RCCLX_LIB_FILES} ${COMMON_FILES} ${CTRAN_FILES})
+foreach(SRC_FILE ${RCCLX_LIB_FILES} ${COMMON_FILES} ${CTRAN_FILES} ${PIPES_SOURCES})
   # Check that file exists
   if (NOT EXISTS ${FBCODE_DIR}/${SRC_FILE})
     message(FATAL_ERROR "Unable to find file listed in CMakeLists.txt: ${FBCODE_DIR}/${SRC_FILE}")
@@ -1730,6 +1457,14 @@ target_compile_definitions(rccl PRIVATE __HIPCC__)
 target_compile_definitions(rccl PRIVATE MOCK_SCUBA_DATA) # removes some Scuba logging in comms/utils/logger.
 target_compile_definitions(rccl PRIVATE CTRAN_DISABLE_TCPDM) # TCPDM has strict topology requirements, which is why it isn't supported NCCLX/RCCLX Conda packages. See T239012482.
 target_compile_definitions(rccl PRIVATE NVTX_DISABLE) # NVTX is for annotating code for profilers like NSight systems. It's disabled by default for the NCCLX Conda package.
+
+# Undefine __HIPCC__ for host-only .cc files that need types guarded by
+# #if !defined(__CUDACC__) (hipified to __HIPCC__) in AllReduce/Types.h.
+set_source_files_properties(
+  ${CMAKE_CURRENT_BINARY_DIR}/hipify/comms/ctran/gpe/CtranGpe.cc
+  ${CMAKE_CURRENT_BINARY_DIR}/hipify/comms/ctran/algos/AllReduce/AllReduceRing.cc
+  PROPERTIES COMPILE_OPTIONS "-U__HIPCC__"
+)
 
 ## Set RCCL compile options
 if (HAVE_PARALLEL_JOBS)

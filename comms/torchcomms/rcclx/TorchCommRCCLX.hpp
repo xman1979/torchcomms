@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -20,14 +21,17 @@
 #include "comms/torchcomms/TorchComm.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
 #include "comms/torchcomms/TorchCommBackend.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
 #include "comms/torchcomms/TorchCommBatch.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/rcclx/HipApi.hpp" // @manual
 #include "comms/torchcomms/rcclx/RcclxApi.hpp" // @manual
 #include "comms/torchcomms/rcclx/TorchWorkRCCLX.hpp" // @manual
 
 namespace torch::comms {
 
-constexpr size_t kMaxEventPoolSize = 1000;
+// Hint key names for RCCLX backend configuration
+constexpr std::string_view kHintHighPriorityStream = "high_priority_stream";
+constexpr std::string_view kHintMaxEventPoolSize = "max_event_pool_size";
+
+constexpr size_t kDefaultMaxEventPoolSize = 1000;
 
 // Custom exception class for better error handling
 class RCCLXException : public std::exception {
@@ -188,6 +192,20 @@ class TorchCommRCCLX : public TorchCommBackend,
       int root,
       bool async_op,
       const GatherOptions& options = {}) override;
+
+  // Persistent AllGather operations
+  AllGatherPHandle all_gather_p_init(
+      at::Tensor& output,
+      const AllGatherPInitOptions& options = {}) override;
+
+  c10::intrusive_ptr<TorchWork> all_gather_p_exec(
+      AllGatherPHandle handle,
+      const at::Tensor& input,
+      bool async_op,
+      const AllGatherPExecOptions& options = {}) override;
+
+  void all_gather_p_free(AllGatherPHandle handle) override;
+
   std::string_view getBackendName() const override;
   std::string_view getCommName() const override;
   // Communicator Management
@@ -405,7 +423,6 @@ class TorchCommRCCLX : public TorchCommBackend,
   std::condition_variable timeout_cv_;
   std::mutex timeout_mutex_;
 
-  std::shared_ptr<TorchCommTracing> tracing_;
   bool high_priority_stream_{false};
   std::string name_;
 };

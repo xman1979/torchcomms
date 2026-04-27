@@ -28,6 +28,21 @@ torchcomms requires the following software and hardware:
 torchcomms is available on PyPI and can be installed using pip. Alternatively,
 you can build torchcomms from source.
 
+### Using pip (Stable)
+
+You can install torchcomms and PyTorch (2.11+) using pip:
+
+```bash
+# Cuda 12.6
+pip install torch torchcomms --index-url https://download.pytorch.org/whl/cu126
+
+# Cuda 12.8
+pip install torch torchcomms --index-url https://download.pytorch.org/whl/cu128
+
+# Cuda 13.0
+pip install torch torchcomms --index-url https://download.pytorch.org/whl/cu130
+```
+
 ### Using pip (Nightly Builds)
 
 You can install torchcomms and PyTorch nightly builds using pip:
@@ -38,9 +53,6 @@ pip install --pre torch torchcomms --index-url https://download.pytorch.org/whl/
 
 # Cuda 12.8
 pip install --pre torch torchcomms --index-url https://download.pytorch.org/whl/nightly/cu128
-
-# Cuda 12.9
-pip install --pre torch torchcomms --index-url https://download.pytorch.org/whl/nightly/cu129
 
 # Cuda 13.0
 pip install --pre torch torchcomms --index-url https://download.pytorch.org/whl/nightly/cu130
@@ -210,18 +222,18 @@ import torch
 from torchcomms import new_comm, ReduceOp
 
 def main():
-    # Initialize TorchComm with NCCLX backend
-    device = torch.device("cuda")
-    torchcomm = new_comm("nccl", device, name="main_comm")
+    # Initialize TorchComm with device-specific backend
+    device = torch.device("<device>") # cuda, xpu, etc
+    torchcomm = new_comm("<backend>", device, name="main_comm") # nccl, ncclx, rccl, xccl, etc
 
     # Get rank and world size
     rank = torchcomm.get_rank()
     world_size = torchcomm.get_size()
 
     # Calculate device ID
-    num_devices = torch.cuda.device_count()
+    num_devices = torch.<device>.device_count()
     device_id = rank % num_devices
-    target_device = torch.device(f"cuda:{device_id}")
+    target_device = torch.device(f"<device>:{device_id}")
 
     print(f"Rank {rank}/{world_size}: Running on device {device_id}")
 
@@ -238,8 +250,8 @@ def main():
     # Perform synchronous AllReduce (sum across all ranks)
     torchcomm.all_reduce(tensor, ReduceOp.SUM, async_op=False)
 
-    # Synchronize CUDA stream
-    torch.cuda.current_stream().synchronize()
+    # Synchronize device stream
+    torch.<device>.current_stream().synchronize()
 
     print(f"Rank {rank}: After AllReduce: {tensor[0].item()}")
 
@@ -290,12 +302,13 @@ Here is the same example as above, but with asynchronous `AllReduce`:
 import torch
 from torchcomms import new_comm, ReduceOp
 
-device = torch.device("cuda")
-torchcomm = new_comm("nccl", device, name="main_comm")
+# Use the correct device and backend for TorchComms initialization
+device = torch.device("<device>") # cuda, xpu, etc
+torchcomm = new_comm("<backend>", device, name="main_comm") # nccl, ncclx, rccl, xccl, etc
 
 rank = torchcomm.get_rank()
-device_id = rank % torch.cuda.device_count()
-target_device = torch.device(f"cuda:{device_id}")
+device_id = rank % torch.<device>.device_count()
+target_device = torch.device(f"<device>:{device_id}")
 
 # Create tensor
 tensor = torch.full((1024,), float(rank + 1), dtype=torch.float32, device=target_device)

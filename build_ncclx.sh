@@ -22,7 +22,7 @@ function do_cmake_build() {
     -DCMAKE_POLICY_VERSION_MINIMUM=3.22 \
     $extra_flags \
     -S "${source_dir}"
-  ninja
+  ninja -j$(nproc)
   ninja install
 }
 
@@ -85,7 +85,7 @@ function build_automake_library() {
 
   ./configure --prefix="$CMAKE_PREFIX_PATH" --disable-pie "CFLAGS=-fPIC" "CXXFLAGS=-fPIC"
 
-  make -j
+  make -j$(nproc)
   make install
   popd
 }
@@ -126,7 +126,7 @@ function build_openssl() {
   pushd "$library_name"
   ./config no-shared --prefix="$CMAKE_PREFIX_PATH" --openssldir="$CMAKE_PREFIX_PATH" --libdir=lib
 
-  make -j
+  make -j$(nproc)
   make install
   popd
 }
@@ -194,20 +194,19 @@ function build_third_party {
         zstd
         conda-forge::zlib
         conda-forge::libopenssl-static
-        conda-forge::folly
         fmt
       )
       conda install "${DEPS[@]}" --yes
+      build_fb_oss_library "https://github.com/facebook/folly.git" "$third_party_tag" folly
     fi
   fi
 
-  # TODO: migrate out all dependencies for feedstock
   if [[ -z "${NCCL_FEEDSTOCK_BUILD}" ]]; then
     build_fb_oss_library "https://github.com/facebookincubator/fizz.git" "$third_party_tag" fizz "-DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF"
     build_fb_oss_library "https://github.com/facebook/mvfst" "$third_party_tag" quic
     build_fb_oss_library "https://github.com/facebook/wangle.git" "$third_party_tag" wangle "-DBUILD_TESTS=OFF"
+    build_fb_oss_library "https://github.com/facebook/fbthrift.git" "$third_party_tag" thrift
   fi
-  build_fb_oss_library "https://github.com/facebook/fbthrift.git" "$third_party_tag" thrift
   popd
 }
 
@@ -223,8 +222,13 @@ function build_comms_tracing_service {
   cp -r "${base_dir}/${include_prefix}"/* "$include_prefix"
   mv "$include_prefix"/CMakeLists.txt .
 
-  # set up the build config
-  cp -r /tmp/third-party/thrift/build .
+  if [[ -z "${NCCL_FEEDSTOCK_BUILD}" ]]; then
+    # Reuse thrift cmake build tree (source build path)
+    cp -r /tmp/third-party/thrift/build .
+  else
+    # fbthrift installed via conda — cmake finds it via CMAKE_PREFIX_PATH
+    mkdir -p build
+  fi
 
   # build the thrift service library
   cd build
@@ -321,6 +325,18 @@ THRIFT_SERVICE_LDFLAGS=(
   "-l:libthrift-core.a"
   "-l:libthriftanyrep.a"
   "-l:libthriftcpp2.a"
+)
+
+# libthrift_dynamic_value.a and libthrift_path.a are only available in fbthrift main branch
+# (used by feedstock build), not in the pinned v2026.01.19.00 tag (used by OSS build)
+if [[ -n "${NCCL_FEEDSTOCK_BUILD}" ]]; then
+  THRIFT_SERVICE_LDFLAGS+=(
+    "-l:libthrift_dynamic_value.a"
+    "-l:libthrift_path.a"
+  )
+fi
+
+THRIFT_SERVICE_LDFLAGS+=(
   "-l:libthriftmetadata.a"
   "-l:libthriftprotocol.a"
   "-l:libthrifttype.a"
@@ -409,7 +425,10 @@ if [[ -z "${NVCC_GENCODE-}" ]]; then
             arch_gencode="$arch_gencode -gencode=arch=compute_90,code=sm_90"
         ;;
         "b200")
-            arch_gencode="$arch_gencode -gencode=arch=compute_100,code=sm_100"
+            arch_gencode="$arch_gencode -gencode=arch=compute_100a,code=sm_100a"
+        ;;
+        "b300")
+            arch_gencode="$arch_gencode -gencode=arch=compute_103a,code=sm_103a"
         ;;
         esac
     done
@@ -421,10 +440,33 @@ if [ "$CLEAN_BUILD" == 1 ]; then
 fi
 
 mkdir -p "$BUILDDIR"
+
+# Pre-generate nccl_git_version.h before the make build starts.
+# The Makefile has a rule for this, but it fails with re-cc/distcc because
+# the generated header is not available on the remote compilation machine.
+GIT_VERSION_DIR="$BUILDDIR/obj/include"
+mkdir -p "$GIT_VERSION_DIR"
+if [ -f "${NCCL_HOME}/src/misc/generate_git_version.py" ]; then
+  python3 "${NCCL_HOME}/src/misc/generate_git_version.py" "$GIT_VERSION_DIR/nccl_git_version.h"
+else
+  cat > "$GIT_VERSION_DIR/nccl_git_version.h" <<HEADER
+/* Auto-generated fallback. */
+#ifndef NCCL_GIT_VERSION_H
+#define NCCL_GIT_VERSION_H
+#ifndef NCCL_GIT_BRANCH
+#define NCCL_GIT_BRANCH "unknown"
+#endif
+#ifndef NCCL_GIT_COMMIT_HASH
+#define NCCL_GIT_COMMIT_HASH "${DEV_SIGNATURE:-unknown}"
+#endif
+#endif /* NCCL_GIT_VERSION_H */
+HEADER
+fi
+
 pushd "${NCCL_HOME}"
 
 function build_nccl {
-  make VERBOSE=1 -j \
+  make VERBOSE=1 -j$(nproc) \
     src.build \
     BUILDDIR="$BUILDDIR" \
     NVCC_GENCODE="$NVCC_GENCODE" \
@@ -436,11 +478,12 @@ function build_nccl {
     CONDA_INCLUDE_DIR="$CONDA_INCLUDE_DIR" \
     CONDA_LIB_DIR="$CONDA_LIB_DIR" \
     THIRD_PARTY_LDFLAGS="$THIRD_PARTY_LDFLAGS" \
-    CUDARTLIB="$CUDARTLIB"
+    CUDARTLIB="$CUDARTLIB" \
+    ENABLE_PIPES="${ENABLE_PIPES:-0}"
 }
 
 function build_and_install_nccl {
-make VERBOSE=1 -j \
+make VERBOSE=1 -j$(nproc) \
     src.install \
     BUILDDIR="$BUILDDIR" \
     NVCC_GENCODE="$NVCC_GENCODE" \
@@ -452,7 +495,8 @@ make VERBOSE=1 -j \
     CONDA_INCLUDE_DIR="$CONDA_INCLUDE_DIR" \
     CONDA_LIB_DIR="$CONDA_LIB_DIR" \
     THIRD_PARTY_LDFLAGS="$THIRD_PARTY_LDFLAGS" \
-    CUDARTLIB="$CUDARTLIB"
+    CUDARTLIB="$CUDARTLIB" \
+    ENABLE_PIPES="${ENABLE_PIPES:-0}"
 }
 
 if [[ -z "${NCCL_BUILD_AND_INSTALL}" ]]; then
@@ -463,23 +507,27 @@ fi
 
 # sanity check
 if [ -n "${NCCL_RUN_SANITY_CHECK}" ]; then
-    pushd examples
-    export NCCL_DEBUG=WARN
-    export LD_LIBRARY_PATH=$BUILDDIR/lib
+    if [ -f examples/Makefile ]; then
+        pushd examples
+        export NCCL_DEBUG=WARN
+        export LD_LIBRARY_PATH=$BUILDDIR/lib
 
-    make all \
-      NVCC_GENCODE="$NVCC_GENCODE" \
-      CUDA_HOME="$CUDA_HOME" \
-      NCCL_HOME="$CONDA_PREFIX"
+        make all \
+          NVCC_GENCODE="$NVCC_GENCODE" \
+          CUDA_HOME="$CUDA_HOME" \
+          NCCL_HOME="$CONDA_PREFIX"
 
-    set +e
+        set +e
 
-    TIMEOUT=10s
-    timeout $TIMEOUT "$BUILDDIR"/examples/HelloWorld
-    if [ "$?" == "124" ]; then
-        echo "Program TIMEOUT in ${TIMEOUT}. Terminate."
+        TIMEOUT=10s
+        timeout $TIMEOUT "$BUILDDIR"/examples/HelloWorld
+        if [ "$?" == "124" ]; then
+            echo "Program TIMEOUT in ${TIMEOUT}. Terminate."
+        fi
+        popd
+    else
+        echo "Skipping sanity check: examples/Makefile not found"
     fi
-    popd
 fi
 
 popd

@@ -19,6 +19,7 @@ class CudaMock : public CudaApi {
 
   // Device management
   MOCK_METHOD(cudaError_t, setDevice, (int device), (override));
+  MOCK_METHOD(cudaError_t, getDevice, (int* device), (override));
   MOCK_METHOD(
       cudaError_t,
       getDeviceProperties,
@@ -91,6 +92,16 @@ class CudaMock : public CudaApi {
       (override));
   MOCK_METHOD(
       cudaError_t,
+      userObjectRelease,
+      (cudaUserObject_t object, unsigned int count),
+      (override));
+  MOCK_METHOD(
+      cudaError_t,
+      launchHostFunc,
+      (cudaStream_t stream, cudaHostFn_t fn, void* userData),
+      (override));
+  MOCK_METHOD(
+      cudaError_t,
       streamGetCaptureInfo_v2,
       (cudaStream_t stream,
        cudaStreamCaptureStatus* captureStatus_out,
@@ -104,6 +115,13 @@ class CudaMock : public CudaApi {
       threadExchangeStreamCaptureMode,
       (enum cudaStreamCaptureMode * mode),
       (override));
+
+  MOCK_METHOD(
+      cudaError_t,
+      hostAlloc,
+      (void** pHost, size_t size, unsigned int flags),
+      (override));
+  MOCK_METHOD(cudaError_t, hostFree, (void* ptr), (override));
 
   // Memory management
   MOCK_METHOD(cudaError_t, malloc, (void** devPtr, size_t size), (override));
@@ -135,6 +153,11 @@ class CudaMock : public CudaApi {
       cudaError_t,
       eventRecord,
       (cudaEvent_t event, cudaStream_t stream),
+      (override));
+  MOCK_METHOD(
+      cudaError_t,
+      eventRecordWithFlags,
+      (cudaEvent_t event, cudaStream_t stream, unsigned int flags),
       (override));
   MOCK_METHOD(cudaError_t, eventQuery, (cudaEvent_t event), (override));
 

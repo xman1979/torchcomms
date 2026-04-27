@@ -24,8 +24,6 @@ namespace torch::comms::test {
 // ============================================================================
 
 TEST_F(TorchCommNCCLXTest, TestOptionsEnvironmentVariables) {
-  setupCCAExpectations(0, 0, 1);
-
   setOptionsEnvironmentVariables(false, 1); // false abort, 1 second
 
   CommOptions options1;
@@ -108,12 +106,6 @@ TEST_F(TorchCommNCCLXTest, InitializationRank0GetUniqueId) {
   // store
   setupRankAndSize(0, 2); // rank 0, size 2
 
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   cuda_mock_->setupDefaultBehaviors();
 
   auto comm = createMockedTorchComm();
@@ -153,12 +145,6 @@ TEST_F(TorchCommNCCLXTest, InitializationNonRank0ReadUniqueId) {
   // get it from store
   setupRankAndSize(1, 2); // rank 1, size 2
 
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   auto bootstrap = new TorchCommNCCLXBootstrap(
       store_, *device_, nccl_mock_, cuda_mock_, std::chrono::seconds(60));
   auto store_key = bootstrap->getNCCLXStoreKeyPrefix() +
@@ -196,9 +182,6 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
   // Test: TorchComm creation should fail when device ID is invalid
   setupRankAndSize(0, 2); // rank 0, size 2
 
-  // Setup CCA expectations - first init (device -1) should succeed
-  setupCCAExpectations(1, 2, 0);
-
   cuda_mock_->setupDefaultBehaviors();
 
   // Test with negative device ID
@@ -227,8 +210,10 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
 
     // Mock CUDA API to be called with device ID 0, since the boostrap
     // logic will assign a device ID in this case based on the rank.
+    // setDevice is called 3 times: once in the bootstrap constructor,
+    // once in init() post-bootstrap, and once in the watchdog thread.
     EXPECT_CALL(*cuda_mock_, setDevice(0))
-        .Times(2)
+        .Times(3)
         .WillRepeatedly(Return(cudaSuccess));
     EXPECT_CALL(*nccl_mock_, commInitRankConfig(_, 2, _, 0, _))
         .WillOnce(DoAll(
@@ -245,9 +230,6 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
   ::testing::Mock::VerifyAndClear(cuda_mock_.get());
   ::testing::Mock::VerifyAndClear(nccl_mock_.get());
   ::testing::Mock::VerifyAndClear(mock_hook_);
-
-  // Setup CCA expectations - no init should succeed, so only destructor calls
-  setupCCAExpectations(0, 1, 1);
 
   // Test with device ID larger than available devices
   {
@@ -267,7 +249,8 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
         comm->init(invalid_device, "test_name", default_options_),
         std::runtime_error);
 
-    comm->finalize();
+    // After a failed init, finalize should throw since we're not initialized
+    EXPECT_THROW(comm->finalize(), std::runtime_error);
   }
 }
 
@@ -276,12 +259,6 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
 // ============================================================================
 
 TEST_F(TorchCommNCCLXTest, FinalizeNoJobsScheduled) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   // Test: if no jobs are scheduled, finalize() returns immediately
   auto comm = createMockedTorchComm();
 
@@ -297,12 +274,6 @@ TEST_F(TorchCommNCCLXTest, FinalizeNoJobsScheduled) {
 }
 
 TEST_F(TorchCommNCCLXTest, FinalizeWorkNotFinishedWaitsForCompletion) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   // Test: if work is scheduled but not finished, finalize waits until work
   // completes
   auto comm = createMockedTorchComm();
@@ -360,12 +331,6 @@ TEST_F(TorchCommNCCLXTest, FinalizeWorkNotFinishedWaitsForCompletion) {
 }
 
 TEST_F(TorchCommNCCLXTest, FinalizeWorkErrorThrowsNCCLXException) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   // Test: if work errors because cudaEventQuery returns error, finalize throws
   // NCCLXException
   auto comm = createMockedTorchComm();
@@ -399,12 +364,6 @@ TEST_F(TorchCommNCCLXTest, FinalizeWorkErrorThrowsNCCLXException) {
 }
 
 TEST_F(TorchCommNCCLXTest, FinalizeWorkTimeoutThrowsRuntimeError) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   // Test: if work times out, finalize throws std::runtime_error
   auto comm = createMockedTorchComm();
 
@@ -442,12 +401,6 @@ TEST_F(TorchCommNCCLXTest, FinalizeWorkTimeoutThrowsRuntimeError) {
 // ============================================================================
 // TODO: add more tests for other collectives
 TEST_F(TorchCommNCCLXTest, WorkErrorCausesAbortDuringCollective) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 3 (abort, finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 3, 1);
-
   // Test: if work errors, calling TorchCommNCCLX method calls commAbort and
   // throws NCCLXException
   auto comm = createMockedTorchComm();
@@ -487,12 +440,6 @@ TEST_F(TorchCommNCCLXTest, WorkErrorCausesAbortDuringCollective) {
 }
 
 TEST_F(TorchCommNCCLXTest, WorkDefaultTimeoutCausesAbortDuringCollective) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 3 (abort, finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 3, 1);
-
   // Test: if work errors, calling TorchCommNCCLX method calls commAbort and
   // throws NCCLXException
   auto comm = createMockedTorchComm();
@@ -525,12 +472,6 @@ TEST_F(TorchCommNCCLXTest, WorkDefaultTimeoutCausesAbortDuringCollective) {
 }
 
 TEST_F(TorchCommNCCLXTest, WorkOperationTimeoutCausesAbortDuringCollective) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 3 (abort, finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 3, 1);
-
   // Test: if work errors, calling TorchCommNCCLX method calls commAbort and
   // throws NCCLXException
   auto comm = createMockedTorchComm();
@@ -568,11 +509,9 @@ TEST_F(TorchCommNCCLXTest, WorkOperationTimeoutCausesAbortDuringCollective) {
 }
 
 TEST_F(TorchCommNCCLXTest, AbortProcessOnTimeoutCausesProcessDeath) {
-  // Setup CCA expectations
   // constructor, init, destructor are in the EXPECT_DEATH macro, which don't
   // count towards the expectations.  We only count the clear call in the
   // teardown.
-  setupCCAExpectations(0, 0, 1);
 
   // Test: when abort_process_on_timeout_or_error is true, timeout should cause
   // process death
@@ -617,273 +556,7 @@ TEST_F(TorchCommNCCLXTest, AbortProcessOnTimeoutCausesProcessDeath) {
       ".*"); // Match any death message
 }
 
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookRegistersAndUnregistersOnCreateAndDestroy) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 1 (destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 1, 1);
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  auto comm = createMockedTorchComm();
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-  // fake registration of the comm.
-  mock_hook_->registerComm(comm.get());
-  // Destroy the comm
-  comm.reset();
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-}
-
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookRegistersAndUnregistersOnCreateAndFinalize) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  auto comm = createMockedTorchComm();
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-  comm->init(*device_, "test_name", default_options_);
-  // Check that the comm is registered
-  EXPECT_TRUE(mock_hook_->isCommRegistered(comm.get()));
-  // Finalize the comm
-  comm->finalize();
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-}
-
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookUnregistersOnTimeoutDuringFinalize) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  auto comm = createMockedTorchComm();
-
-  comm->init(*device_, "test_name", default_options_);
-  EXPECT_TRUE(mock_hook_->isCommRegistered(comm.get()));
-
-  setupEventsForWork(*comm, 1);
-  comm->barrier(true);
-
-  auto& work_event = work_events_[0];
-  setupWorkToTimeout(work_event);
-  comm->waitTillTimeout();
-
-  // Finalize should cause a timeout
-  EXPECT_THROW(comm->finalize(), std::runtime_error);
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-}
-
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookUnregistersOnErrorDuringFinalize) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  auto comm = createMockedTorchComm();
-
-  comm->init(*device_, "test_name", default_options_);
-
-  setupEventsForWork(*comm, 1);
-  comm->barrier(true);
-
-  auto& work_event = work_events_[0];
-  setupWorkToError(work_event);
-  comm->waitTillError();
-
-  // Finalize should cause an error
-  EXPECT_THROW(comm->finalize(), NCCLXException);
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-}
-
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookUnregistersOnErrorOrTimeoutDuringCollective) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 3 (abort, finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 3, 1);
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  auto comm = createMockedTorchComm();
-
-  comm->init(*device_, "test_name", default_options_);
-
-  setupEventsForWork(*comm, 1);
-
-  comm->barrier(true);
-
-  auto& work_event = work_events_[0];
-  setupWorkToTimeout(work_event);
-
-  comm->waitTillTimeout();
-  EXPECT_THROW(comm->barrier(true), std::runtime_error);
-  EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
-  EXPECT_THROW(comm->finalize(), std::runtime_error);
-}
-
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookMemoryRegistrationWithMultipleComms) {
-  CachingAllocatorHook::setInstance(
-      std::make_unique<CachingAllocatorHookImpl>());
-  auto& allocator = CachingAllocatorHook::getInstance();
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  // Create and initialize two communicators
-  auto comm1 = createMockedTorchComm();
-  auto comm2 = createMockedTorchComm();
-
-  comm1->init(*device_, "test_name", default_options_);
-  comm2->init(*device_, "test_name", default_options_);
-
-  // Create memory registration trace entry
-  auto alloc_entry = createAllocation(0x1000);
-
-  // Set up expectations for register_address on both comms
-  EXPECT_CALL(
-      *nccl_mock_, commRegister(_, reinterpret_cast<void*>(0x1000), 1024, _))
-      .Times(2)
-      .WillRepeatedly(DoAll(
-          SetArgPointee<3>(reinterpret_cast<void*>(0x2000)),
-          Return(ncclSuccess)));
-
-  // Simulate memory allocation
-  allocator.regDeregMem(alloc_entry);
-
-  // Create a third communicator after memory registration
-  auto comm3 = createMockedTorchComm();
-
-  // Set up expectations for register_address on the new comm for previously
-  // registered memory
-  EXPECT_CALL(
-      *nccl_mock_, commRegister(_, reinterpret_cast<void*>(0x1000), 1024, _))
-      .WillOnce(DoAll(
-          SetArgPointee<3>(reinterpret_cast<void*>(0x2000)),
-          Return(ncclSuccess)));
-
-  // Initialize the third comm - this should register all previously registered
-  // addresses
-  comm3->init(*device_, "test_name", default_options_);
-  EXPECT_TRUE(allocator.isCommRegistered(comm3.get()));
-
-  // Create memory deregistration trace entry
-  c10::cuda::CUDACachingAllocator::TraceEntry dealloc_entry =
-      createDeallocation(0x1000);
-  EXPECT_CALL(*nccl_mock_, commDeregister(_, reinterpret_cast<void*>(0x2000)))
-      .Times(1)
-      .WillRepeatedly(Return(ncclSuccess));
-
-  comm1->finalize();
-
-  // Set up expectations for deregister_address on all three comms
-  EXPECT_CALL(*nccl_mock_, commDeregister(_, reinterpret_cast<void*>(0x2000)))
-      .Times(2)
-      .WillRepeatedly(Return(ncclSuccess));
-
-  // Simulate memory deallocation
-  allocator.regDeregMem(dealloc_entry);
-
-  // Clean up
-  setupNormalDestruction(*comm2);
-  comm2->finalize();
-  setupNormalDestruction(*comm3);
-  comm3->finalize();
-}
-
-TEST_F(
-    TorchCommNCCLXTest,
-    CachingAllocatorHookMemoryRegistrationErrorHandling) {
-  // Test: Verify error handling during memory registration and deregistration
-  CachingAllocatorHook::setInstance(
-      std::make_unique<CachingAllocatorHookImpl>());
-  auto& allocator = CachingAllocatorHook::getInstance();
-
-  cuda_mock_->setupDefaultBehaviors();
-  nccl_mock_->setupDefaultBehaviors();
-
-  // Create and initialize a communicator
-  auto comm = createMockedTorchComm();
-  comm->init(*device_, "test_name", default_options_);
-
-  // Create memory registration trace entry
-  c10::cuda::CUDACachingAllocator::TraceEntry alloc_entry =
-      createAllocation(0x1000);
-  // Set up expectations for register_address to fail
-  EXPECT_CALL(
-      *nccl_mock_, commRegister(_, reinterpret_cast<void*>(0x1000), 1024, _))
-      .WillOnce(Return(ncclInvalidArgument));
-
-  EXPECT_CALL(*nccl_mock_, getErrorString(ncclInvalidArgument))
-      .WillRepeatedly(Return("Invalid argument"));
-
-  EXPECT_CALL(*nccl_mock_, getLastError(_))
-      .WillRepeatedly(Return("Invalid argument details"));
-
-  // Simulate memory allocation - should throw NCCLXException due to
-  // registration failure
-  EXPECT_THROW(allocator.regDeregMem(alloc_entry), NCCLXException);
-
-  // Try again with successful registration
-  EXPECT_CALL(
-      *nccl_mock_, commRegister(_, reinterpret_cast<void*>(0x2000), 1024, _))
-      .WillOnce(DoAll(
-          SetArgPointee<3>(reinterpret_cast<void*>(0x2000)),
-          Return(ncclSuccess)));
-
-  // Simulate successful memory allocation
-  auto alloc_entry2 = createAllocation(0x2000);
-  allocator.regDeregMem(alloc_entry2);
-
-  // Create memory deregistration trace entry
-  auto dealloc_entry = createDeallocation(0x2000);
-
-  // Set up expectations for deregister_address to fail
-  EXPECT_CALL(*nccl_mock_, commDeregister(_, reinterpret_cast<void*>(0x2000)))
-      .WillOnce(Return(ncclInvalidArgument));
-
-  // Simulate memory deallocation - should throw NCCLXException due to
-  // deregistration failure
-  EXPECT_THROW(allocator.regDeregMem(dealloc_entry), NCCLXException);
-
-  // Clean up
-  setupNormalDestruction(*comm);
-  comm->finalize();
-}
-
 TEST_F(TorchCommNCCLXTest, Getters) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -906,7 +579,6 @@ TEST_F(TorchCommNCCLXTest, HighPriorityStreamCreation) {
   {
     setupRankAndSize(0, 2); // rank 0, size 2
     // we don't call teardown in this test, so no clear
-    setupCCAExpectations(1, 2, 0);
 
     auto comm = createMockedTorchComm();
 
@@ -937,10 +609,9 @@ TEST_F(TorchCommNCCLXTest, HighPriorityStreamCreation) {
   // High priority for stream creation.
   {
     setupRankAndSize(0, 2); // rank 0, size 2
-    setupCCAExpectations(1, 2, 1);
 
     auto options = CommOptions();
-    options.hints["torchcomm::ncclx::high_priority_stream"] = "true";
+    options.hints[std::string(kHintHighPriorityStream)] = "true";
     options.store = store_;
     auto comm = createMockedTorchComm();
 
@@ -969,9 +640,6 @@ TEST_F(TorchCommNCCLXTest, HighPriorityStreamCreation) {
 // INITIALIZATION STATE TESTS
 // ============================================================================
 TEST_F(TorchCommNCCLXTest, InitialStateIsUninitialized) {
-  // Setup CCA expectations - no init/finalize calls
-  setupCCAExpectations(0, 1, 1);
-
   auto comm = createMockedTorchComm();
 
   // Access the initialization state through a test-specific method
@@ -992,12 +660,6 @@ TEST_F(TorchCommNCCLXTest, InitialStateIsUninitialized) {
 }
 
 TEST_F(TorchCommNCCLXTest, InitializationStateTransitionsCorrectly) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -1012,12 +674,6 @@ TEST_F(TorchCommNCCLXTest, InitializationStateTransitionsCorrectly) {
 }
 
 TEST_F(TorchCommNCCLXTest, DoubleInitializationThrowsException) {
-  // Setup CCA expectations
-  // Register - 1 (first init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -1045,12 +701,6 @@ TEST_F(TorchCommNCCLXTest, DoubleInitializationThrowsException) {
 }
 
 TEST_F(TorchCommNCCLXTest, DoubleFinalizeThrowsException) {
-  // Setup CCA expectations
-  // Register - 1 (init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -1078,12 +728,6 @@ TEST_F(TorchCommNCCLXTest, DoubleFinalizeThrowsException) {
 }
 
 TEST_F(TorchCommNCCLXTest, InitializeAfterFinalizeThrowsException) {
-  // Setup CCA expectations
-  // Register - 1 (first init)
-  // Deregister - 2 (finalize, destructor)
-  // Clear - 1 (destructor)
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -1109,9 +753,6 @@ TEST_F(TorchCommNCCLXTest, InitializeAfterFinalizeThrowsException) {
 }
 
 TEST_F(TorchCommNCCLXTest, FinalizeWithoutInitializeThrowsException) {
-  // Setup CCA expectations - no init/finalize calls
-  setupCCAExpectations(0, 1, 1);
-
   auto comm = createMockedTorchComm();
 
   // Attempting to finalize without initialization should throw
@@ -1131,9 +772,6 @@ TEST_F(TorchCommNCCLXTest, FinalizeWithoutInitializeThrowsException) {
 TEST_F(
     TorchCommNCCLXTest,
     CollectiveOperationsWithoutInitializationThrowException) {
-  // Setup CCA expectations - no init calls
-  setupCCAExpectations(0, 1, 1);
-
   auto comm = createMockedTorchComm();
 
   // Initialize and then finalize the communicator
@@ -1207,9 +845,6 @@ TEST_F(
 }
 
 TEST_F(TorchCommNCCLXTest, CollectiveOperationsAfterFinalizeThrowException) {
-  // Setup CCA expectations - init and finalize calls
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   // Initialize and then finalize the communicator
@@ -1300,9 +935,6 @@ class TorchCommNCCLXPreHookTest : public TorchCommNCCLXTest {
 };
 
 TEST_F(TorchCommNCCLXPreHookTest, MemAllocatedBeforeCommRegistered) {
-  // Setup CCA expectations - init and finalize calls
-  setupCCAExpectations(1, 2, 1);
-
   auto comm = createMockedTorchComm();
 
   // Initialize and then finalize the communicator
@@ -1310,13 +942,165 @@ TEST_F(TorchCommNCCLXPreHookTest, MemAllocatedBeforeCommRegistered) {
   nccl_mock_->setupDefaultBehaviors();
 
   comm->init(*device_, "test_name", default_options_);
-  EXPECT_TRUE(mock_hook_->isMemRegisteredCalled());
+  EXPECT_TRUE(mock_hook_->isMemPreHookRegistered());
   comm->finalize();
+}
+
+// ============================================================================
+// GLOBAL REGISTRATION TESTS
+// ============================================================================
+
+TEST_F(TorchCommNCCLXTest, GlobalRegisterAddressSuccess) {
+  // Test: Verify global_register_address succeeds when NCCL returns success
+
+  void* test_addr = reinterpret_cast<void*>(0x1000);
+  size_t test_len = 1024;
+
+  // Set up expectation for global registration to succeed
+  EXPECT_CALL(*nccl_mock_, globalRegisterWithPtr(test_addr, test_len))
+      .WillOnce(Return(ncclSuccess));
+
+  // Execute: call global_register_address with the mock API
+  EXPECT_NO_THROW(
+      TorchCommNCCLX::global_register_address(
+          TorchCommNCCLX::AddressWithLen{test_addr, test_len},
+          nccl_mock_.get()));
+}
+
+TEST_F(TorchCommNCCLXTest, GlobalDeregisterAddressSuccess) {
+  // Test: Verify global_deregister_address succeeds when NCCL returns success
+
+  void* test_addr = reinterpret_cast<void*>(0x2000);
+  size_t test_len = 2048;
+
+  // Set up expectation for global deregistration to succeed
+  EXPECT_CALL(*nccl_mock_, globalDeregisterWithPtr(test_addr, test_len))
+      .WillOnce(Return(ncclSuccess));
+
+  // Execute: call global_deregister_address with the mock API
+  EXPECT_NO_THROW(
+      TorchCommNCCLX::global_deregister_address(
+          TorchCommNCCLX::AddressWithLen{test_addr, test_len},
+          nccl_mock_.get()));
+}
+
+TEST_F(TorchCommNCCLXTest, GlobalRegisterAddressFailure) {
+  // Test: Verify global_register_address logs warning (does not throw) on NCCL
+  // failure. Registration is best-effort — when ctran is not enabled, it's
+  // expected to fail silently.
+
+  void* test_addr = reinterpret_cast<void*>(0x3000);
+  size_t test_len = 4096;
+
+  // Set up expectation for global registration to fail
+  EXPECT_CALL(*nccl_mock_, globalRegisterWithPtr(test_addr, test_len))
+      .WillOnce(Return(ncclInvalidArgument));
+
+  EXPECT_CALL(*nccl_mock_, getErrorString(ncclInvalidArgument))
+      .WillOnce(Return("invalid argument"));
+
+  // Execute: call global_register_address — should not throw
+  EXPECT_NO_THROW(
+      TorchCommNCCLX::global_register_address(
+          TorchCommNCCLX::AddressWithLen{test_addr, test_len},
+          nccl_mock_.get()));
+}
+
+TEST_F(TorchCommNCCLXTest, GlobalDeregisterAddressFailure) {
+  // Test: Verify global_deregister_address logs warning (does not throw) on
+  // NCCL failure. Deregistration is best-effort — when ctran is not enabled,
+  // it's expected to fail silently.
+
+  void* test_addr = reinterpret_cast<void*>(0x4000);
+  size_t test_len = 8192;
+
+  // Set up expectation for global deregistration to fail
+  EXPECT_CALL(*nccl_mock_, globalDeregisterWithPtr(test_addr, test_len))
+      .WillOnce(Return(ncclInvalidArgument));
+
+  EXPECT_CALL(*nccl_mock_, getErrorString(ncclInvalidArgument))
+      .WillOnce(Return("invalid argument"));
+
+  // Execute: call global_deregister_address — should not throw
+  EXPECT_NO_THROW(
+      TorchCommNCCLX::global_deregister_address(
+          TorchCommNCCLX::AddressWithLen{test_addr, test_len},
+          nccl_mock_.get()));
+}
+
+TEST_F(
+    TorchCommNCCLXTest,
+    CachingAllocatorHookCallsGlobalRegisterOnSegmentAlloc) {
+  // Test: Verify that CCA hook calls global_register_address on SEGMENT_ALLOC
+  // The mock_hook_ already has nccl_mock_ set via SetUp()
+  auto hook = std::make_unique<CachingAllocatorHookImpl>();
+  hook->setNcclApi(nccl_mock_);
+  CachingAllocatorHook::setInstance(std::move(hook));
+  auto& allocator = CachingAllocatorHook::getInstance();
+
+  // Create memory allocation trace entry
+  auto alloc_entry = createAllocation(0x5000);
+
+  // Set up expectation for global registration to be called
+  EXPECT_CALL(
+      *nccl_mock_, globalRegisterWithPtr(reinterpret_cast<void*>(0x5000), 1024))
+      .WillOnce(Return(ncclSuccess));
+
+  // Execute: simulate memory allocation event
+  allocator.regDeregMem(alloc_entry);
+}
+
+TEST_F(
+    TorchCommNCCLXTest,
+    CachingAllocatorHookCallsGlobalDeregisterOnSegmentFree) {
+  // Test: Verify that CCA hook calls global_deregister_address on SEGMENT_FREE
+  auto hook = std::make_unique<CachingAllocatorHookImpl>();
+  hook->setNcclApi(nccl_mock_);
+  CachingAllocatorHook::setInstance(std::move(hook));
+  auto& allocator = CachingAllocatorHook::getInstance();
+
+  // Create memory deallocation trace entry
+  auto dealloc_entry = createDeallocation(0x6000);
+
+  // Set up expectation for global deregistration to be called
+  EXPECT_CALL(
+      *nccl_mock_,
+      globalDeregisterWithPtr(reinterpret_cast<void*>(0x6000), 1024))
+      .WillOnce(Return(ncclSuccess));
+
+  // Execute: simulate memory deallocation event
+  allocator.regDeregMem(dealloc_entry);
+}
+
+TEST_F(
+    TorchCommNCCLXTest,
+    CachingAllocatorHookGlobalRegistrationErrorHandling) {
+  // Test: Verify error handling during global memory registration.
+  // Registration is best-effort — when ctran is not enabled, it's expected to
+  // fail silently with a warning log rather than throwing.
+  auto hook = std::make_unique<CachingAllocatorHookImpl>();
+  hook->setNcclApi(nccl_mock_);
+  CachingAllocatorHook::setInstance(std::move(hook));
+  auto& allocator = CachingAllocatorHook::getInstance();
+
+  // Create memory allocation trace entry
+  auto alloc_entry = createAllocation(0x7000);
+
+  // Set up expectation for global registration to fail
+  EXPECT_CALL(
+      *nccl_mock_, globalRegisterWithPtr(reinterpret_cast<void*>(0x7000), 1024))
+      .WillOnce(Return(ncclInvalidArgument));
+
+  EXPECT_CALL(*nccl_mock_, getErrorString(ncclInvalidArgument))
+      .WillOnce(Return("invalid argument"));
+
+  // Execute: simulate memory allocation — should not throw, registration
+  // failure is handled gracefully with a warning log
+  EXPECT_NO_THROW(allocator.regDeregMem(alloc_entry));
 }
 
 TEST_F(TorchCommNCCLXTest, AlltoallvDynamicDispatchCombine) {
   setupRankAndSize(0, 2);
-  setupCCAExpectations(1, 2, 1);
 
   auto comm = createMockedTorchComm();
 
@@ -1376,7 +1160,6 @@ TEST_F(TorchCommNCCLXTest, AlltoallvDynamicDispatchCombine) {
 
 TEST_F(TorchCommNCCLXTest, AlltoallvDedupExecCombine) {
   setupRankAndSize(0, 4);
-  setupCCAExpectations(1, 2, 1);
 
   auto comm = createMockedTorchComm();
 
@@ -1445,6 +1228,118 @@ TEST_F(TorchCommNCCLXTest, AlltoallvDedupExecCombine) {
   comm->finalize();
 }
 
+#ifdef NCCL_REDUCE_SCATTER_QUANTIZE_SUPPORTED
+TEST_F(TorchCommNCCLXTest, ReduceScatterQuantized) {
+  setupRankAndSize(0, 2);
+
+  auto comm = createMockedTorchComm();
+
+  cuda_mock_->setupDefaultBehaviors();
+  nccl_mock_->setupDefaultBehaviors();
+
+  comm->init(*device_, "test_name", default_options_);
+
+  // Create FP32 input/output tensors with correct sizes
+  // input size = output size * comm_size
+  auto output = createTestTensor({50}, at::kFloat);
+  auto input = createTestTensor({50 * comm->getSize()}, at::kFloat);
+
+  // Create seed tensor (single-element int64)
+  auto seed = createTestTensor({1}, at::kLong);
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  // v2_29 added a check that seed must be a CUDA tensor, which cannot
+  // be satisfied in the mocked CPU test environment.
+  EXPECT_THROW(
+      comm->reduce_scatter_quantized(
+          output, input, ReduceOp::SUM, seed, /*async_op=*/true),
+      c10::Error);
+#else
+  EXPECT_CALL(*nccl_mock_, reduceScatterQuantize(_, _, _, _, _, _, _, _, _))
+      .WillOnce(Return(ncclSuccess));
+
+  auto work = comm->reduce_scatter_quantized(
+      output, input, ReduceOp::SUM, seed, /*async_op=*/true);
+  EXPECT_NE(work, nullptr);
+#endif
+
+  setupNormalDestruction(*comm);
+  comm->finalize();
+}
+
+TEST_F(TorchCommNCCLXTest, ReduceScatterQuantizedInvalidInputType) {
+  setupRankAndSize(0, 2);
+
+  auto comm = createMockedTorchComm();
+
+  cuda_mock_->setupDefaultBehaviors();
+  nccl_mock_->setupDefaultBehaviors();
+
+  comm->init(*device_, "test_name", default_options_);
+
+  // Use BF16 input (should fail — must be FP32)
+  auto output = createTestTensor({50}, at::kFloat);
+  auto input = createTestTensor({100}, at::kBFloat16);
+  auto seed = createTestTensor({1}, at::kLong);
+
+  EXPECT_THROW(
+      comm->reduce_scatter_quantized(
+          output, input, ReduceOp::SUM, seed, /*async_op=*/true),
+      c10::Error);
+
+  setupNormalDestruction(*comm);
+  comm->finalize();
+}
+
+TEST_F(TorchCommNCCLXTest, ReduceScatterQuantizedInvalidOp) {
+  setupRankAndSize(0, 2);
+
+  auto comm = createMockedTorchComm();
+
+  cuda_mock_->setupDefaultBehaviors();
+  nccl_mock_->setupDefaultBehaviors();
+
+  comm->init(*device_, "test_name", default_options_);
+
+  auto output = createTestTensor({50}, at::kFloat);
+  auto input = createTestTensor({100}, at::kFloat);
+  auto seed = createTestTensor({1}, at::kLong);
+
+  // Use PRODUCT op (should fail — only SUM and AVG supported)
+  EXPECT_THROW(
+      comm->reduce_scatter_quantized(
+          output, input, ReduceOp::PRODUCT, seed, /*async_op=*/true),
+      c10::Error);
+
+  setupNormalDestruction(*comm);
+  comm->finalize();
+}
+
+TEST_F(TorchCommNCCLXTest, ReduceScatterQuantizedSizeMismatch) {
+  setupRankAndSize(0, 2);
+
+  auto comm = createMockedTorchComm();
+
+  cuda_mock_->setupDefaultBehaviors();
+  nccl_mock_->setupDefaultBehaviors();
+
+  comm->init(*device_, "test_name", default_options_);
+
+  // input size (80) != output size (50) * comm_size (2) = 100
+  auto output = createTestTensor({50}, at::kFloat);
+  auto input = createTestTensor({80}, at::kFloat);
+  auto seed = createTestTensor({1}, at::kLong);
+
+  EXPECT_THROW(
+      comm->reduce_scatter_quantized(
+          output, input, ReduceOp::SUM, seed, /*async_op=*/true),
+      c10::Error);
+
+  setupNormalDestruction(*comm);
+  comm->finalize();
+}
+#endif
+
 // ============================================================================
 // NCCLXException TESTS
 // ============================================================================
@@ -1483,11 +1378,32 @@ TEST_F(TorchCommNCCLXTest, NCCLXExceptionIncludesLastErrorString) {
   EXPECT_EQ(exception.getResult(), ncclInternalError);
 }
 
+TEST_F(TorchCommNCCLXTest, NCCLXExceptionIncludesBacktrace) {
+  // Test that NCCLXException message includes a backtrace
+
+  nccl_mock_->setupDefaultBehaviors();
+
+  EXPECT_CALL(*nccl_mock_, getErrorString(ncclInternalError))
+      .WillOnce(Return("internal error"));
+  EXPECT_CALL(*nccl_mock_, getLastError(_)).WillOnce(Return("some error"));
+
+  ncclComm_t mock_comm = reinterpret_cast<ncclComm_t>(0x3000);
+  NCCLXException exception(
+      *nccl_mock_, "Test operation failed", ncclInternalError, mock_comm);
+
+  std::string what_message = exception.what();
+  EXPECT_TRUE(what_message.find("Backtrace:") != std::string::npos)
+      << "Exception message should contain 'Backtrace:' label";
+  EXPECT_TRUE(
+      what_message.find("NCCLXException") != std::string::npos ||
+      what_message.find("getStackTraceStr") != std::string::npos)
+      << "Backtrace should contain a recognizable frame: " << what_message;
+}
+
 TEST_F(TorchCommNCCLXTest, NCCLXExceptionFromFailedSendIncludesLastError) {
   // Test that when send() fails, the thrown NCCLXException includes
   // the NCCL last error string
   setupRankAndSize(0, 2);
-  setupCCAExpectations(1, 2, 1);
 
   auto comm = createMockedTorchComm();
 
@@ -1533,7 +1449,6 @@ TEST_F(TorchCommNCCLXTest, NCCLXExceptionFromFailedAllReduceIncludesLastError) {
   // Test that when all_reduce() fails, the thrown NCCLXException includes
   // the NCCL last error string
   setupRankAndSize(0, 2);
-  setupCCAExpectations(1, 2, 1);
 
   auto comm = createMockedTorchComm();
 

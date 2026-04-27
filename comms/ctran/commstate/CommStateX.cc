@@ -6,6 +6,7 @@
 
 #include "CommStateX.h"
 #include "comms/ctran/commstate/Topology.h"
+#include "comms/ctran/utils/Alloc.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 
@@ -48,14 +49,20 @@ CommStateX::CommStateX(
     uint64_t commHash,
     std::vector<RankTopology> rankTopologies,
     std::vector<int> commRanksToWorldRanks,
-    const std::string& commDesc)
+    const std::string& commDesc,
+    bool noLocal,
+    int vCliqueSize)
     : rank_(rank),
       nRanks_(nRanks),
       cudaDev_(cudaDev),
       cudaArch_(cudaArch),
       busId_(busId),
       commHash_(commHash),
-      commDesc_(commDesc) {
+      commDesc_(commDesc),
+      noLocal_(
+          noLocal ||
+          NCCL_COMM_STATE_DEBUG_TOPO == NCCL_COMM_STATE_DEBUG_TOPO::nolocal),
+      vCliqueSize_(vCliqueSize) {
   setRankStatesTopologies(std::move(rankTopologies));
   setCommRankToWorldRanks(std::move(commRanksToWorldRanks));
 }
@@ -73,6 +80,7 @@ void CommStateX::initRankTopologyNolocal() {
     rankState.nLocalRanks = 1;
     rankState.localRankToRanks.assign(1, r);
     const std::string nolocalHost("nolocal_node_" + std::to_string(r));
+    rankState.host = nolocalHost;
     hostToRanks_[nolocalHost].emplace_back(r);
     nodeRanks_[rankState.nodeId].emplace_back(rankState.rank);
   }
@@ -94,13 +102,21 @@ void CommStateX::initRankTopologyVnode(const int nLocalRanks) {
     }
     const std::string vNodeHost(
         "vnode_node_" + std::to_string(rankState.nodeId));
+    rankState.host = vNodeHost;
     hostToRanks_[vNodeHost].emplace_back(r);
     nodeRanks_[rankState.nodeId].emplace_back(r);
   }
 }
 
-void CommStateX::initRankStatesTopology(
-    ctran::bootstrap::IBootstrap* bootstrap) {
+void CommStateX::initRankStatesTopology(meta::comms::IBootstrap* bootstrap) {
+  if (noLocal_) {
+    initRankTopologyNolocal();
+    return;
+  }
+  if (vCliqueSize_ > 0) {
+    initRankTopologyVnode(vCliqueSize_);
+    return;
+  }
   auto myTopo = ctran::commstate::loadTopology(rank_, NCCL_TOPO_FILE_PATH);
   if (!myTopo) {
     FB_CHECKTHROW_EX(
@@ -140,7 +156,10 @@ void CommStateX::initRankStatesTopology(
 }
 
 void CommStateX::setNvlFabricTopos(
-    std::vector<NvlFabricTopology> nvlFabricTopologies) {
+    std::vector<NvlFabricTopology> nvlFabricTopologies,
+    std::optional<bool> fabricHwSupportedForTest) {
+  bool fabricHwSupported =
+      fabricHwSupportedForTest.value_or(ctran::utils::isCuMemFabricEnabled());
   FB_CHECKABORT(
       nvlFabricTopologies.size() == nRanks_,
       "size of nvlFabricTopologies not equal to nRanks_: {}",
@@ -148,13 +167,16 @@ void CommStateX::setNvlFabricTopos(
   nvlFabricTopos_ = std::move(nvlFabricTopologies);
   nvlFabricRankStates_.clear();
   nvlDomainRanks_.clear();
-  nvlFabricEnabled_ = NCCL_CTRAN_NVL_FABRIC_ENABLE &&
-      nvlFabricTopos_.at(rank_).supportNvlFabric;
+  nvlFabricEnabled_ =
+      fabricHwSupported && nvlFabricTopos_.at(rank_).supportNvlFabric;
   if (!nvlFabricEnabled_) {
     return;
   }
+
+  // Step 1: Always parse the system NVL fabric topology first.
   nvlFabricCliqueEnabled_ = nvlFabricEnabled_ && NCCL_MNNVL_CLIQUE_SIZE > 0 &&
       NCCL_MNNVL_DETERMINISTIC_COLLECTIVE_ENABLE;
+
   std::unordered_map<std::string, int> clusterIdToNvlDomainIndex;
   // cliqueIds might not be contiguous, within the same communicator.
   // CliqueIndex is contiguous fron 0 to nCliqueIds - 1.
@@ -196,6 +218,7 @@ void CommStateX::setNvlFabricTopos(
       }
     }
   }
+
   // another loop to update the other stats of nvlFabricRankStates_
   for (int i = 0; i < nRanks_; i++) {
     if (nvlFabricTopos_.at(i).supportNvlFabric) {
@@ -226,6 +249,65 @@ void CommStateX::setNvlFabricTopos(
       "size of cliqueIdToCliqueIndex : {} not equal to size cliqueRanks_: {}",
       cliqueIdToCliqueIndex.size(),
       cliqueRanks_.size());
+
+  // Step 2: noLocal is equivalent to vCliqueSize=1. When either is set,
+  // override the parsed NVL fabric topology with virtual domains.
+  // We validate against system state parsed above.
+  const int effectiveVCliqueSize = noLocal_ ? 1 : vCliqueSize_;
+  if (effectiveVCliqueSize > 0) {
+    FB_CHECKABORT(
+        nRanks_ % effectiveVCliqueSize == 0,
+        "nRanks ({}) must be evenly divisible by effectiveVCliqueSize ({})",
+        nRanks_,
+        effectiveVCliqueSize);
+    // Validate against system clique size if cliques were parsed
+    if (nvlFabricCliqueEnabled_ && !cliqueRanks_.empty()) {
+      int systemCliqueRanks = cliqueRanks_.at(0).size();
+      FB_CHECKABORT(
+          systemCliqueRanks % effectiveVCliqueSize == 0,
+          "system nCliqueRanks ({}) must be evenly divisible by effectiveVCliqueSize ({})",
+          systemCliqueRanks,
+          effectiveVCliqueSize);
+    }
+
+    // Override with virtual domains of the given size
+    nvlFabricCliqueEnabled_ = true;
+    nvlFabricRankStates_.clear();
+    nvlFabricRankStates_.resize(nRanks_);
+    nvlDomainRanks_.clear();
+    cliqueRanks_.clear();
+    for (int i = 0; i < nRanks_; i++) {
+      auto& state = nvlFabricRankStates_.at(i);
+      state.rank = i;
+      int domainIdx = i / effectiveVCliqueSize;
+      int domainRank = i % effectiveVCliqueSize;
+      state.nvlDomainIndex = domainIdx;
+      state.nvlDomainRank = domainRank;
+      state.nNvlDomainRanks = effectiveVCliqueSize;
+      if (domainRank == 0) {
+        nvlDomainRanks_.emplace_back();
+      }
+      nvlDomainRanks_.at(domainIdx).emplace_back(i);
+      state.cliqueIndex = domainIdx;
+      state.cliqueRank = domainRank;
+      state.nCliqueRanks = effectiveVCliqueSize;
+      if (domainRank == 0) {
+        cliqueRanks_.emplace_back();
+      }
+      cliqueRanks_.at(domainIdx).emplace_back(i);
+    }
+    // Second pass to set rank-to-rank mappings
+    for (int i = 0; i < nRanks_; i++) {
+      auto& state = nvlFabricRankStates_.at(i);
+      state.nvlDomainRankToRank = nvlDomainRanks_.at(state.nvlDomainIndex);
+      state.cliqueRankToRank = cliqueRanks_.at(state.cliqueIndex);
+    }
+    myNvlFabricRankState_ = nvlFabricRankStates_.at(rank_);
+    XLOGF(
+        INFO,
+        "CommStateX: effectiveVCliqueSize={} override NVL fabric topology",
+        effectiveVCliqueSize);
+  }
 }
 
 void CommStateX::setRankStatesTopologies(
@@ -483,7 +565,7 @@ int CommStateX::gRank(int rank) const {
 std::string CommStateX::gPid(int rank) const {
   CHECK_TOPO_AND_SET_RANK(rank, rank_, rankStates_);
   return rankStates_.at(rank).host + ":" +
-      std::to_string(rankStates_.at(rank).pid) + ":" + std::to_string(rank);
+      std::to_string(rankStates_.at(rank).pid);
 }
 
 std::string CommStateX::dc(int rank) const {

@@ -4,7 +4,9 @@
 
 from datetime import timedelta
 from enum import auto, Enum
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Set
+
+InitHandle = str
 
 class RedOpType(Enum):
     SUM = auto()
@@ -31,11 +33,264 @@ class ReduceOp:
     @property
     def type(self) -> RedOpType: ...
 
+class OpName(Enum):
+    """Collective operation name for hooks."""
+
+    send = auto()
+    recv = auto()
+    broadcast = auto()
+    all_reduce = auto()
+    reduce = auto()
+    all_gather = auto()
+    all_gather_v = auto()
+    all_gather_single = auto()
+    reduce_scatter = auto()
+    reduce_scatter_v = auto()
+    reduce_scatter_single = auto()
+    all_to_all_single = auto()
+    all_to_all_v_single = auto()
+    all_to_all = auto()
+    barrier = auto()
+    scatter = auto()
+    gather = auto()
+    gather_single = auto()
+    split = auto()
+    new_window = auto()
+
+class RemovableHandle:
+    """Handle for removing a registered hook."""
+
+    def remove(self) -> None: ...
+
+# Per-collective pre-hook args (passed as typed 3rd argument to pre-hooks)
+class SendPreHookArgs:
+    @property
+    def tensor(self) -> Any: ...
+    @property
+    def peer(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class RecvPreHookArgs:
+    @property
+    def tensor(self) -> Any: ...
+    @property
+    def peer(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class BroadcastPreHookArgs:
+    @property
+    def tensor(self) -> Any: ...
+    @property
+    def root(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllReducePreHookArgs:
+    @property
+    def tensor(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class ReducePreHookArgs:
+    @property
+    def tensor(self) -> Any: ...
+    @property
+    def root(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllGatherPreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllGatherVPreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllGatherSinglePreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class ReduceScatterPreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class ReduceScatterVPreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class ReduceScatterSinglePreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllToAllSinglePreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllToAllVSinglePreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class AllToAllPreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class BarrierPreHookArgs:
+    @property
+    def async_op(self) -> bool: ...
+
+class ScatterPreHookArgs:
+    @property
+    def output(self) -> Any: ...
+    @property
+    def input(self) -> Any: ...
+    @property
+    def root(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class GatherPreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def root(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class GatherSinglePreHookArgs:
+    @property
+    def input(self) -> Any: ...
+    @property
+    def output(self) -> Any: ...
+    @property
+    def root(self) -> int: ...
+    @property
+    def async_op(self) -> bool: ...
+
+class SplitPreHookArgs:
+    @property
+    def ranks(self) -> List[int]: ...
+    @property
+    def name(self) -> str: ...
+
+class NewWindowPreHookArgs: ...
+
+# Pre-hook args union type
+PreHookArgs = (
+    SendPreHookArgs
+    | RecvPreHookArgs
+    | BroadcastPreHookArgs
+    | AllReducePreHookArgs
+    | ReducePreHookArgs
+    | AllGatherPreHookArgs
+    | AllGatherVPreHookArgs
+    | AllGatherSinglePreHookArgs
+    | ReduceScatterPreHookArgs
+    | ReduceScatterVPreHookArgs
+    | ReduceScatterSinglePreHookArgs
+    | AllToAllSinglePreHookArgs
+    | AllToAllVSinglePreHookArgs
+    | AllToAllPreHookArgs
+    | BarrierPreHookArgs
+    | ScatterPreHookArgs
+    | GatherPreHookArgs
+    | GatherSinglePreHookArgs
+    | SplitPreHookArgs
+    | NewWindowPreHookArgs
+)
+
+# Per-collective post-hook args
+class CollectivePostHookArgs: ...
+class SendPostHookArgs(CollectivePostHookArgs): ...
+class RecvPostHookArgs(CollectivePostHookArgs): ...
+class BroadcastPostHookArgs(CollectivePostHookArgs): ...
+class AllReducePostHookArgs(CollectivePostHookArgs): ...
+class ReducePostHookArgs(CollectivePostHookArgs): ...
+class AllGatherPostHookArgs(CollectivePostHookArgs): ...
+class AllGatherVPostHookArgs(CollectivePostHookArgs): ...
+class AllGatherSinglePostHookArgs(CollectivePostHookArgs): ...
+class ReduceScatterPostHookArgs(CollectivePostHookArgs): ...
+class ReduceScatterVPostHookArgs(CollectivePostHookArgs): ...
+class ReduceScatterSinglePostHookArgs(CollectivePostHookArgs): ...
+class AllToAllSinglePostHookArgs(CollectivePostHookArgs): ...
+class AllToAllVSinglePostHookArgs(CollectivePostHookArgs): ...
+class AllToAllPostHookArgs(CollectivePostHookArgs): ...
+class BarrierPostHookArgs(CollectivePostHookArgs): ...
+class ScatterPostHookArgs(CollectivePostHookArgs): ...
+class GatherPostHookArgs(CollectivePostHookArgs): ...
+class GatherSinglePostHookArgs(CollectivePostHookArgs): ...
+class SplitPostHookArgs: ...
+class NewWindowPostHookArgs: ...
+
+PostHookArgs = (
+    SendPostHookArgs
+    | RecvPostHookArgs
+    | BroadcastPostHookArgs
+    | AllReducePostHookArgs
+    | ReducePostHookArgs
+    | AllGatherPostHookArgs
+    | AllGatherVPostHookArgs
+    | AllGatherSinglePostHookArgs
+    | ReduceScatterPostHookArgs
+    | ReduceScatterVPostHookArgs
+    | ReduceScatterSinglePostHookArgs
+    | AllToAllSinglePostHookArgs
+    | AllToAllVSinglePostHookArgs
+    | AllToAllPostHookArgs
+    | BarrierPostHookArgs
+    | ScatterPostHookArgs
+    | GatherPostHookArgs
+    | GatherSinglePostHookArgs
+    | SplitPostHookArgs
+    | NewWindowPostHookArgs
+)
+
 class CommOptions:
     abort_process_on_timeout_or_error: bool
     timeout: timedelta
     store: Any
     name: str
+    enable_reconfigure: bool
     hints: Dict[str, str]
     def __init__(self) -> None: ...
 
@@ -53,6 +308,21 @@ class BatchP2POptions:
     def __init__(self) -> None: ...
     timeout: timedelta
     hints: Dict[str, str]
+
+class ReconfigureOptions:
+    """Options for the reconfigure() fault tolerance API."""
+
+    uuid: int
+    init_handles: List[InitHandle] | Set[InitHandle]
+    timeout: timedelta | None
+    hints: Dict[str, str]
+    def __init__(
+        self,
+        uuid: int = ...,
+        init_handles: List[InitHandle] | Set[InitHandle] = ...,
+        timeout: timedelta | None = None,
+        hints: Dict[str, str] | None = None,
+    ) -> None: ...
 
 class BroadcastOptions:
     def __init__(self) -> None: ...
@@ -119,9 +389,23 @@ class GatherOptions:
     timeout: timedelta
     hints: Dict[str, str]
 
+class AllGatherPInitOptions:
+    def __init__(self) -> None: ...
+    timeout: timedelta
+    hints: Dict[str, str]
+
+class AllGatherPExecOptions:
+    def __init__(self) -> None: ...
+    timeout: timedelta
+    hints: Dict[str, str]
+
+# Opaque handle type for persistent AllGather
+AllGatherPHandle = Any
+
 class TorchWork:
     def is_completed(self) -> bool: ...
     def wait(self) -> None: ...
+    def wait_blocking(self) -> None: ...
 
 class TorchCommWinAccessType(Enum):
     WIN_ACCESS_TYPE_UNIFIED = auto()
@@ -143,6 +427,7 @@ class TorchCommWindow:
     def tensor_register(
         self,
         tensor: Any,
+        owning: bool = True,
     ) -> None: ...
     def tensor_deregister(
         self,
@@ -175,6 +460,14 @@ class TorchCommWindow:
         rank: int,
     ) -> Any: ...
     def get_attr(self, peer_rank: int) -> TorchCommWindowAttr: ...
+    def get_device_window(
+        self,
+        signal_count: int = -1,
+        counter_count: int = -1,
+        barrier_count: int = 1,
+    ) -> int: ...
+    def register_local_buffer(self, tensor: Any) -> int: ...
+    def deregister_local_buffer(self, handle: int) -> None: ...
 
 class P2POpType(Enum):
     SEND = auto()
@@ -202,7 +495,17 @@ class TorchComm:
     def get_options(self) -> CommOptions: ...
     def get_device(self) -> Any: ...
     def get_backend(self) -> str: ...
+    def get_backend_version(self) -> str: ...
+    def get_backend_impl(self) -> TorchCommBackend: ...
     def unsafe_get_backend(self) -> TorchCommBackend: ...
+    def get_init_handle(self) -> InitHandle: ...
+    def reconfigure(
+        self,
+        uuid: int,
+        init_handles: List[InitHandle] | Set[InitHandle],
+        timeout: timedelta | None = None,
+        hints: Dict[str, str] | None = None,
+    ) -> TorchWork: ...
     def send(
         self,
         tensor: Any,
@@ -345,17 +648,51 @@ class TorchComm:
         hints: Dict[str, str] | None = None,
         timeout: timedelta | None = None,
     ) -> TorchWork: ...
+    def gather_single(
+        self,
+        output: Any,
+        input: Any,
+        root: int,
+        async_op: bool,
+        hints: Dict[str, str] | None = None,
+        timeout: timedelta | None = None,
+    ) -> TorchWork: ...
     def split(
         self,
-        rank_groups: List[List[int]],
+        ranks: List[int],
         name: str,
         hints: Dict[str, str] | None = None,
         timeout: timedelta | None = None,
     ) -> TorchComm: ...
     def batch_op_create(self) -> BatchSendRecv: ...
     def new_window(self, tensor: Any | None = None) -> TorchCommWindow: ...
+    def all_gather_p_init(
+        self,
+        output: Any,
+        hints: Dict[str, str] | None = None,
+        timeout: timedelta | None = None,
+    ) -> AllGatherPHandle: ...
+    def all_gather_p_exec(
+        self,
+        handle: AllGatherPHandle,
+        input: Any,
+        async_op: bool,
+        hints: Dict[str, str] | None = None,
+        timeout: timedelta | None = None,
+    ) -> TorchWork: ...
+    def all_gather_p_free(
+        self,
+        handle: AllGatherPHandle,
+    ) -> None: ...
     @property
     def mem_allocator(self) -> Any: ...
+    def register_pre_hook(
+        self, callback: Callable[[OpName, int, PreHookArgs], None]
+    ) -> RemovableHandle: ...
+    def register_post_hook(
+        self, callback: Callable[[int, PostHookArgs], None]
+    ) -> RemovableHandle: ...
+    def register_abort_hook(self, callback: Callable[[], None]) -> RemovableHandle: ...
 
 def new_comm(
     backend: str,
@@ -364,6 +701,7 @@ def new_comm(
     timeout: timedelta | None = ...,
     store: Any | None = ...,
     name: str | None = ...,
+    enable_reconfigure: bool = False,
     hints: Dict[str, str] | None = ...,
 ) -> TorchComm: ...
 
@@ -371,5 +709,4 @@ class _BackendWrapper:
     def __init__(self, comm: TorchComm) -> None: ...
     def get_comm(self) -> TorchComm: ...
 
-def _get_store(backend_name: str, name_str: str, timeout: timedelta = ...) -> Any: ...
 def get_mem_allocator(backend: str) -> Any: ...

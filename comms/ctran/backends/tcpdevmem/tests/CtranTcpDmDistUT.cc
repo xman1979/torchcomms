@@ -11,15 +11,13 @@
 #include <folly/init/Init.h>
 #include <folly/logging/xlog.h>
 
-#include "comm.h"
 #include "comms/ctran/Ctran.h"
-#include "comms/ctran/backends/CtranCtrl.h"
 #include "comms/ctran/backends/tcpdevmem/CtranTcpDm.h"
 #include "comms/ctran/backends/tcpdevmem/CtranTcpDmSingleton.h"
+#include "comms/ctran/tests/CtranDistTestUtils.h"
 #include "comms/ctran/utils/CudaWrap.h"
 #include "comms/ctran/utils/Exception.h"
 #include "comms/testinfra/TestUtils.h"
-#include "comms/testinfra/TestsDistUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 #include "comms/utils/logger/LogUtils.h"
 
@@ -36,7 +34,7 @@ commResult_t waitTcpReq(
   return commSuccess;
 }
 
-class CtranTcpTest : public NcclxBaseTest {
+class CtranTcpTest : public ctran::CtranDistTestFixture {
  public:
   CtranTcpTest() = default;
   void SetUp() override {
@@ -44,17 +42,12 @@ class CtranTcpTest : public NcclxBaseTest {
     // Use TCP Devmem plugin in regular TCP mode until we have proper
     // kernel and FW installed on the hosts.
     setenv("TCP_DEVMEM_ENABLE", "0", 0);
-    NcclxBaseTest::SetUp();
+    ctran::CtranDistTestFixture::SetUp();
     ncclCvarInit(); // initialize cvars explicitly to take effect
-    this->commDeprecated = createNcclComm(
-        globalRank, numRanks, localRank, false, nullptr, server.get());
-    this->comm = this->commDeprecated->ctranComm_.get();
-
-    this->ctrlMgr = std::make_unique<CtranCtrlManager>();
+    comm_ = makeCtranComm();
 
     try {
-      this->ctranTcpDm =
-          std::make_unique<CtranTcpDm>(this->comm, this->ctrlMgr.get());
+      this->ctranTcpDm = std::make_unique<CtranTcpDm>(comm_.get());
     } catch (const ctran::utils::Exception&) {
       GTEST_SKIP() << "TCPDM backend not enabled. Skip test";
     } catch (const std::runtime_error&) {
@@ -63,11 +56,9 @@ class CtranTcpTest : public NcclxBaseTest {
   }
 
   void TearDown() override {
-    finalizeNcclComm(globalRank, server.get());
-    NCCLCHECK_TEST(ncclCommDestroy(this->commDeprecated));
-    this->ctrlMgr.reset();
     this->ctranTcpDm.reset();
-    NcclxBaseTest::TearDown();
+    comm_.reset();
+    ctran::CtranDistTestFixture::TearDown();
   }
 
   void printTestDesc(const std::string& testName, const std::string& testDesc) {
@@ -83,12 +74,8 @@ class CtranTcpTest : public NcclxBaseTest {
   }
 
  protected:
-  CtranComm* comm{nullptr};
+  std::unique_ptr<CtranComm> comm_{nullptr};
   std::unique_ptr<CtranTcpDm> ctranTcpDm{nullptr};
-  // TODO: remove this once refatoring is finished
-  // !!! DO NOT USE !!!
-  ncclComm_t commDeprecated{nullptr};
-  std::unique_ptr<CtranCtrlManager> ctrlMgr{nullptr};
   const int sendRank{0}, recvRank{1};
 };
 
@@ -98,7 +85,7 @@ TEST_F(CtranTcpTest, RegMrHost) {
 
   char buf[256];
 
-  const auto& cudaDev = this->comm->statex_->cudaDev();
+  const auto& cudaDev = comm_->statex_->cudaDev();
   void* memHandle = nullptr;
 
   COMMCHECK_TEST(CtranTcpDm::regMem(buf, sizeof(buf), cudaDev, &memHandle));
@@ -110,7 +97,7 @@ TEST_F(CtranTcpTest, RegMr) {
   this->printTestDesc(
       "RegMr", "Expect CtranTcpDm to be able to register device memory.");
 
-  const auto& cudaDev = this->comm->statex_->cudaDev();
+  const auto& cudaDev = comm_->statex_->cudaDev();
 
   size_t len = 8192;
   void* buf{nullptr};
@@ -142,7 +129,7 @@ TEST_F(CtranTcpTest, SendRecv) {
   this->printTestDesc(
       "SendRecv", "Expect CtranTcpDm to be able to send and receive data.");
 
-  const auto& cudaDev = this->comm->statex_->cudaDev();
+  const auto& cudaDev = comm_->statex_->cudaDev();
   void* memHandle = nullptr;
   uint32_t send = 0xcafebeef;
   uint32_t recv = 0;
@@ -225,7 +212,7 @@ TEST_F(CtranTcpTest, getIfNames) {
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
-  ::testing::AddGlobalTestEnvironment(new DistEnvironmentBase);
+  ::testing::AddGlobalTestEnvironment(new ctran::CtranDistEnvironment);
   folly::Init init(&argc, &argv);
   return RUN_ALL_TESTS();
 }

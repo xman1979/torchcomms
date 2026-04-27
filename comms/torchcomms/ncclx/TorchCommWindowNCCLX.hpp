@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
@@ -16,6 +17,11 @@
 #include <nccl_device/impl/comm__types.h> // @manual=//comms/ncclx:nccl
 #include "comms/torchcomms/device/DeviceBackendTraits.hpp"
 #include "comms/torchcomms/device/TorchCommDeviceWindow.hpp"
+#endif
+
+#if defined(ENABLE_PIPES)
+#include "comms/torchcomms/device/pipes/PipesDeviceBackend.hpp"
+#include "comms/torchcomms/device/pipes/TorchCommDevicePipesTypes.hpp"
 #endif
 
 namespace torch::comms {
@@ -57,7 +63,6 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   // Type aliases for device-side types (only available with device API)
   // Backend::Comm is the raw communicator type (e.g., ncclDevComm)
   using DeviceWindow = torchcomms::device::TorchCommDeviceWindow<Backend>;
-  using DeviceRegisteredBuffer = torchcomms::device::RegisteredBuffer;
 #endif
 
   TorchCommWindowNCCLX() = delete;
@@ -67,11 +72,12 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   ~TorchCommWindowNCCLX() noexcept override;
 
   TorchCommWindowNCCLX(const TorchCommWindowNCCLX& other) = delete;
+  TorchCommWindowNCCLX(TorchCommWindowNCCLX&& other) = delete;
   TorchCommWindowNCCLX& operator=(const TorchCommWindowNCCLX& other) = delete;
   TorchCommWindowNCCLX& operator=(TorchCommWindowNCCLX&& other) noexcept =
       delete;
 
-  void tensor_register(const at::Tensor& tensor) override;
+  void tensor_register(const at::Tensor& tensor, bool owning = true) override;
   void tensor_deregister() override;
 
   std::shared_ptr<TorchCommWindow> clone() override;
@@ -100,11 +106,25 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   // ==========================================================================
 
   // Register a local buffer for use as source in device-side put operations.
-  // This is NON-COLLECTIVE because it uses local_comm_ (1-rank communicator).
-  DeviceRegisteredBuffer register_local_buffer(const at::Tensor& tensor);
+  // NON-COLLECTIVE — registration is purely local (lkey only, no rkey
+  // exchange). The resulting buffer can only be used as a source for put
+  // operations.
+  //
+  // Backend dispatch:
+  //   - NCCLDeviceBackend: NCCL_WIN_DEVICE_API | NCCL_WIN_LOCAL_ONLY
+  //   - PipesDeviceBackend: MultiPeerTransport::localRegisterIbgdaBuffer
+  //
+  // Prerequisites: Must call tensor_register() then get_device_window() first.
+  RegisteredBuffer register_local_buffer(const at::Tensor& tensor) override;
 
   // Deregister a previously registered local buffer. NON-COLLECTIVE.
-  void deregister_local_buffer(DeviceRegisteredBuffer& buf);
+  void deregister_local_buffer(RegisteredBuffer& buf) override;
+
+  // Device-handle variants: allocate a device-side copy of RegisteredBuffer
+  // and return an opaque int64_t handle for Triton put_block() calls.
+  // NOT thread-safe — concurrent calls require external synchronization.
+  int64_t register_local_buffer_handle(const at::Tensor& tensor) override;
+  void deregister_local_buffer_handle(int64_t handle) override;
 
   // Get a device-side window handle for GPU-initiated operations.
   // Returns a pointer to the cached device window. The window is lazily
@@ -124,24 +144,48 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   // Usage (Triton):
   //   The same pointer can be passed to Triton kernels via torchcomms_put(),
   //   torchcomms_signal(), etc. wrappers that take void* handles.
-  DeviceWindow* get_device_window(
+  void* get_device_window(
       int signal_count = -1,
       int counter_count = -1,
-      int barrier_count = 1);
+      int barrier_count = 1) override;
 
-  // Get the host-side NCCL window handle.
-  // Useful for creating RegisteredBuffer from host code when the device
-  // window's window_ field is in device memory and not directly accessible.
-  ncclWindow_t get_nccl_window() const {
-    return nccl_orig_win_;
-  }
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  // Get the NVLink-mapped address of a peer's window memory.
+  // Returns the device pointer that can be used to directly access the peer's
+  // window buffer via NVLink. Returns 0 (as int64) if the peer is not
+  // NVLink-accessible (e.g., remote node over RDMA).
+  //
+  // Prerequisites: Must call tensor_register() first so that nccl_orig_win_
+  // is initialized.
+  //
+  // Args:
+  //   peer: The world rank of the peer whose address to retrieve.
+  //   offset: Byte offset within the peer's window (default 0).
+  //
+  // Returns: Device pointer as void*, or nullptr if not NVLink-accessible.
+  void* get_nvlink_address(int peer, size_t offset = 0);
+
+  // Get the LSA multimem (NVLS multicast) address for this window.
+  // Returns the device pointer that can be used with multimem.ld_reduce
+  // (hardware-fused all-reduce) and multimem.st (broadcast) PTX instructions
+  // across all LSA-connected peers.
+  //
+  // Prerequisites: Must call tensor_register() first so that nccl_orig_win_
+  // is initialized. Requires lsaMultimem=true in ncclDevCommRequirements and
+  // sm_90+ (Hopper+) hardware with NVLS support.
+  //
+  // Args:
+  //   offset: Byte offset within the window (default 0).
+  //
+  // Returns: Multimem device pointer as void*, or nullptr if not supported.
+  void* get_multimem_address(size_t offset = 0);
+#endif
 #endif
 
  private:
-#ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
-  void initLocalComm();
-  void initNcclOrigWindow(void* ptr, size_t size);
-#endif
+  // Backend-specific behavior is handled via static methods on the Backend
+  // type (e.g., Backend::register_extra_window(), Backend::select_device_win())
+  // instead of if constexpr dispatch.
 
   void checkRequestSizeAndThrow(size_t input_size) const;
   void checkDeviceAndThrow(const at::Tensor& tensor) const;
@@ -152,10 +196,15 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   std::shared_ptr<TorchCommNCCLX> torch_comm_;
   NcclxWindow win_{nullptr};
 
+  // Raw buffer data pointer for graph capture mode.
+  // In graph capture mode, we cannot store buf_tensor_ (it would prevent
+  // pool memory reuse during CUDA graph replay). Instead we store only the
+  // raw data_ptr so that get_device_window() can pass it to
+  // create_device_window() without requiring an at::Tensor reference.
+  void* buf_data_ptr_{nullptr};
+
 #ifdef TORCHCOMMS_HAS_NCCL_DEVICE_API
   // Device API state (only available with NCCLX 2.28+)
-  ncclComm_t local_comm_{nullptr};
-  bool local_comm_initialized_{false};
   NcclxWindow nccl_orig_win_{nullptr};
 
   // Device window is allocated in DEVICE memory (cudaMalloc) for GPU access.
@@ -163,7 +212,15 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   // The custom deleter handles both cudaFree and ncclDevCommDestroy.
   torchcomms::device::DeviceWindowPtr<Backend> device_window_;
 
-  std::vector<DeviceRegisteredBuffer> registered_local_buffers_;
+  std::vector<RegisteredBuffer> registered_local_buffers_;
+
+  // Maps device pointer (from register_local_buffer_handle) to host-side
+  // RegisteredBuffer for cleanup. The device copy is read-only, so no
+  // D2H copy is needed on deregister — we use the cached host copy.
+  std::unordered_map<int64_t, RegisteredBuffer> device_buffer_handles_;
+
+  // No ctran_win_ member needed — Pipes device windows are created
+  // on-demand via nccl_api_->winCreateDeviceWin() in get_device_window().
 #endif
 
   // NCCL API abstraction
@@ -179,6 +236,13 @@ using TorchCommWindowNCCLXGin =
     TorchCommWindowNCCLX<torchcomms::device::NCCLDeviceBackend>;
 #else
 using TorchCommWindowNCCLXGin = TorchCommWindowNCCLX<HostOnlyBackend>;
+#endif
+
+// Type alias for the Pipes backend (IBGDA + NVLink device-side P2P).
+// Only available when ENABLE_PIPES is defined (propagated from ctran_lib).
+#if defined(ENABLE_PIPES)
+using TorchCommWindowNCCLXPipes =
+    TorchCommWindowNCCLX<torchcomms::device::PipesDeviceBackend>;
 #endif
 
 } // namespace torch::comms

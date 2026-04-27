@@ -1,7 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "CudaMock.hpp"
-#include <cstring>
+#include <cstdlib>
 
 using ::testing::_;
 using ::testing::DoAll;
@@ -13,6 +13,8 @@ namespace torch::comms::test {
 void CudaMock::setupDefaultBehaviors() {
   // Device management - return success by default
   ON_CALL(*this, setDevice(_)).WillByDefault(Return(cudaSuccess));
+  ON_CALL(*this, getDevice(_))
+      .WillByDefault(DoAll(SetArgPointee<0>(0), Return(cudaSuccess)));
 
   ON_CALL(*this, getDeviceCount(_))
       .WillByDefault(DoAll(SetArgPointee<0>(1), Return(cudaSuccess)));
@@ -66,6 +68,10 @@ void CudaMock::setupDefaultBehaviors() {
   ON_CALL(*this, graphRetainUserObject(_, _, _, _))
       .WillByDefault(Return(cudaSuccess));
 
+  ON_CALL(*this, userObjectRelease(_, _)).WillByDefault(Return(cudaSuccess));
+
+  ON_CALL(*this, launchHostFunc(_, _, _)).WillByDefault(Return(cudaSuccess));
+
   ON_CALL(*this, streamGetCaptureInfo_v2(_, _, _, _, _, _))
       .WillByDefault(DoAll(
           SetArgPointee<1>(cudaStreamCaptureStatusNone),
@@ -75,6 +81,17 @@ void CudaMock::setupDefaultBehaviors() {
 
   ON_CALL(*this, threadExchangeStreamCaptureMode(_))
       .WillByDefault(Return(cudaSuccess));
+
+  ON_CALL(*this, hostAlloc(_, _, _))
+      .WillByDefault([](void** pHost, size_t size, unsigned int /*flags*/) {
+        *pHost = std::calloc(1, size);
+        return cudaSuccess;
+      });
+
+  ON_CALL(*this, hostFree(_)).WillByDefault([](void* ptr) {
+    std::free(ptr);
+    return cudaSuccess;
+  });
 
   // Memory management - return success by default
   ON_CALL(*this, malloc(_, _))
@@ -102,6 +119,9 @@ void CudaMock::setupDefaultBehaviors() {
   ON_CALL(*this, eventDestroy(_)).WillByDefault(Return(cudaSuccess));
 
   ON_CALL(*this, eventRecord(_, _)).WillByDefault(Return(cudaSuccess));
+
+  ON_CALL(*this, eventRecordWithFlags(_, _, _))
+      .WillByDefault(Return(cudaSuccess));
 
   ON_CALL(*this, eventQuery(_)).WillByDefault(Return(cudaSuccess));
 

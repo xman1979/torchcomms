@@ -5,10 +5,10 @@
  ************************************************************************/
 
 #include "group.h"
+#include "meta/NcclxConfig.h" // @manual
 #include "debug.h"
 #include "enqueue.h"
 #include "transport.h"
-#include "channel.h"
 #include <assert.h>
 #include "bootstrap.h"
 #include "ce_coll.h"
@@ -16,11 +16,11 @@
 #include "nvtx.h"
 
 #include "comms/ctran/Ctran.h"
+#include "meta/algoconf/AlgoConfig.h"
 #include "meta/transport/transportExt.h"
 #include "meta/transport/transportConnect.h"
 #include "meta/transport/transportProxy.h"
 #include "comms/utils/logger/EventsScubaUtil.h"
-#include "comms/ctran/utils/Utils.h"
 #include "meta/wrapper/MetaFactory.h"
 
 #define GROUP_MAX_RECLAIM_STEPS 10
@@ -326,12 +326,9 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
             } else {
               NCCLCHECKGOTO(ncclLaunchKernel(comm, plan), result, failure);
             }
-            INFO(NCCL_COLL, "comm %s %p opCount %ld launched kernel for plan %p",  ctran::utils::parseCommDesc(comm->config.commDesc), comm, comm->opCount, plan);
-            // NOTE: bump up opCount right after launching kernel as this field is dedicated to track number of kernels
-            // including both p2p and collective kernels, no matter proxyOp existance.
-            // Known limitation: It won't be updated properly under cuda graph replay since it is not captured by the graph.
-            // But it is sufficient to unblock log based debugging in eager mode.
-            comm->opCount++;
+            INFO(NCCL_COLL, "comm %s %p opCount %ld launched kernel for plan %p",  NCCLX_CONFIG_FIELD(comm->config, commDesc).c_str(), comm, comm->opCount, plan);
+            // NOTE: opCount is now incremented in ncclLaunchPrepare (enqueue.cc)
+            // before proxy ops are created, so that PT and CT see the same value.
           }
           // Barrier reduction input indicates if we require further rounds.
           if (useBarrier) ncclCommIntraBarrierIn(comm, comm->planner.unlaunchedPlansHead != nullptr ? 1 : 0);
@@ -692,7 +689,7 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
 
   if ((--ncclGroupDepth) > 0) goto exit;
 
-  NCCLCHECKGOTO(metaCommToNccl(ctranGroupEndHook()), ret, fail);
+  NCCLCHECKGOTO(metaCommToNccl(ctranGroupEndHook(ncclx::algoconf::getSendRecvAlgo())), ret, fail);
 
   if ((ret = ncclGroupError) != ncclSuccess) goto fail;
 

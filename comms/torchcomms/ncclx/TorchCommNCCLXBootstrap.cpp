@@ -1,16 +1,17 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include <set>
 #include <stdexcept>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <fmt/core.h>
 #include <torch/csrc/distributed/c10d/PrefixStore.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <torch/csrc/distributed/c10d/TCPStore.hpp> // @manual
-#include "comms/torchcomms/StoreManager.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
-#include "comms/torchcomms/TorchCommUtils.hpp"
 #include "comms/torchcomms/ncclx/TorchCommNCCLX.hpp"
 #include "comms/torchcomms/ncclx/TorchCommNCCLXBootstrap.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/StoreManager.hpp"
+#include "comms/torchcomms/utils/Utils.hpp"
 #include "nccl.h" // @manual
 
 namespace torch::comms {
@@ -24,8 +25,11 @@ const std::string kUniqueidXchgMethodAuto = "auto";
 const std::string kUniqueidXchgMethodTCPStore = "tcpstore";
 const std::string kUniqueidXchgMethodDefault = kUniqueidXchgMethodAuto;
 
-bool isFastInitEnable(ncclConfig_t config) {
-  if (config.fastInitMode == NCCL_FAST_INIT_MODE_RING) {
+#ifdef NCCLX_CONFIG_SUPPORTED
+bool isFastInitEnable(const ncclx::Hints& hints) {
+  std::string fastInitVal;
+  if (hints.get("ncclx::fastInitMode", fastInitVal) == ncclSuccess &&
+      std::stoi(fastInitVal) == NCCL_FAST_INIT_MODE_RING) {
     return true;
   }
   const char* env = std::getenv("NCCL_FASTINIT_MODE");
@@ -34,6 +38,7 @@ bool isFastInitEnable(ncclConfig_t config) {
   }
   return std::string(env) == "ring_hybrid";
 }
+#endif
 
 } // namespace
 
@@ -136,8 +141,7 @@ void TorchCommNCCLXBootstrap::createStore(std::string_view name) {
     if (!is_tcp_store_enabled) {
       throw std::runtime_error("No way to exchange unique ID");
     }
-    store_ = StoreManager::get().getStore(
-        TorchCommNCCLX::kBackendName, name, timeout_);
+    store_ = createPrefixStore(std::string(name), timeout_);
     created_internal_store_ = true;
   }
 }
@@ -202,17 +206,60 @@ void TorchCommNCCLXBootstrap::cleanupTCPStore(ncclComm_t nccl_comm) {
   }
 }
 
-// Helper function to populate NCCL config from hints
-void populateNcclConfigFromHints(
+// TorchComm-layer hint keys that are consumed by the backend init code
+// (TorchCommNCCLX::init), not by ncclConfig.  Skip them here to avoid
+// spurious "unsupported hint" warnings.
+static const std::set<std::string> kTorchCommLayerHints = {
+    std::string(kHintHighPriorityStream),
+    std::string(kHintMaxEventPoolSize),
+    std::string(kHintGarbageCollectIntervalMs),
+    std::string(kHintEnableCudaGraphSupport),
+    std::string(kHintGraphTimeoutCheckIntervalMs),
+};
+
+void populateNcclConfig(
     ncclConfig_t& config,
     const CommOptions& options,
     const std::string& name) {
-  // Iterate over the hints and set the corresponding fields in the config.  For
-  // string arguments, NCCLX uses a "const char*" instead of a std::string.  The
-  // strings only need to be valid for the duration of the
-  // ncclCommInitRankConfig call, so we use .c_str() directly.
+#ifdef NCCLX_CONFIG_SUPPORTED
+  auto* hints = static_cast<ncclx::Hints*>(config.hints);
+#endif
+  constexpr std::string_view kNcclxPrefix = "ncclx::";
+
+  // Iterate over the hints and set the corresponding fields.  Keys with
+  // the "ncclx::" prefix are forwarded to the ncclx::Hints object.  All
+  // other keys are matched against upstream NCCL config fields.  For
+  // string arguments in the config struct, NCCLX uses a "const char*"
+  // instead of a std::string.  The strings only need to be valid for the
+  // duration of the ncclCommInitRankConfig call, so we use .c_str()
+  // directly.
   for (const auto& [key, val] : options.hints) {
-    if (key == "blocking") {
+    // NCCLx-specific fields -- pass via ncclx::Hints
+    if (key.compare(0, kNcclxPrefix.size(), kNcclxPrefix) == 0) {
+#ifdef NCCLX_CONFIG_SUPPORTED
+      if (key == "ncclx::commDesc") {
+        throw std::invalid_argument(
+            "ncclx::commDesc must not be set in hints; "
+            "it is derived internally");
+      }
+      if (key == "ncclx::splitGroupRanks") {
+        throw std::invalid_argument(
+            "ncclx::splitGroupRanks must not be set in hints; "
+            "it is derived from the ranks parameter");
+      }
+      hints->set(key, val);
+      TC_LOG(INFO, nullptr)
+          << "[comm=" << name << "] Setting hint " << key << "=" << val;
+#else
+      TC_LOG(WARNING)
+          << "NCCLx hints are not supported in this NCCL version, ignoring '"
+          << key << "' for comm '" << name << "'";
+#endif
+    }
+    // Upstream NCCL config fields -- set directly on the config struct
+    else if (kTorchCommLayerHints.count(key)) {
+      continue;
+    } else if (key == "blocking") {
       config.blocking = std::stoi(val);
       TC_LOG(INFO, nullptr) << "[comm=" << name
                             << "] Setting config.blocking=" << config.blocking;
@@ -266,16 +313,6 @@ void populateNcclConfigFromHints(
       config.nvlsCTAs = std::stoi(val);
       TC_LOG(INFO, nullptr) << "[comm=" << name
                             << "] Setting config.nvlsCTAs=" << config.nvlsCTAs;
-    } else if (key == "ncclAllGatherAlgo") {
-      config.ncclAllGatherAlgo = val.c_str();
-      TC_LOG(INFO, nullptr)
-          << "[comm=" << name
-          << "] Setting config.ncclAllGatherAlgo=" << config.ncclAllGatherAlgo;
-    } else if (key == "fastInitMode") {
-      config.fastInitMode = std::stoi(val);
-      TC_LOG(INFO, nullptr)
-          << "[comm=" << name
-          << "] Setting config.fastInitMode=" << config.fastInitMode;
     } else {
       TC_LOG(WARNING)
           << "NCCL hint '" << key
@@ -285,19 +322,23 @@ void populateNcclConfigFromHints(
   }
 }
 
-bool TorchCommNCCLXBootstrap::useFastInit(ncclConfig_t config) {
-  if (isFastInitEnable(config)) {
+#ifdef NCCLX_CONFIG_SUPPORTED
+bool TorchCommNCCLXBootstrap::useFastInit(const ncclx::Hints& hints) {
+  if (isFastInitEnable(hints)) {
+    // Use raw dynamic_cast instead of c10::dynamic_intrusive_pointer_cast
+    // because the latter has a refcount leak when the cast fails (the
+    // by-value intrusive_ptr parameter is release()'d before the cast,
+    // and if dynamic_cast returns nullptr, the original pointer is lost
+    // without decrementing the refcount).
     bool isTcpStore = [this]() {
       if (store_ == nullptr) {
         return false;
       }
-      if (auto store =
-              c10::dynamic_intrusive_pointer_cast<c10d::PrefixStore>(store_)) {
-        return c10::dynamic_intrusive_pointer_cast<c10d::TCPStore>(
-                   store->getUnderlyingNonPrefixStore()) != nullptr;
+      if (auto* prefixStore = dynamic_cast<c10d::PrefixStore*>(store_.get())) {
+        return dynamic_cast<c10d::TCPStore*>(
+                   prefixStore->getUnderlyingNonPrefixStore().get()) != nullptr;
       }
-      return c10::dynamic_intrusive_pointer_cast<c10d::TCPStore>(store_) !=
-          nullptr;
+      return dynamic_cast<c10d::TCPStore*>(store_.get()) != nullptr;
     }();
     if (!isTcpStore) {
       throw std::invalid_argument("TcpStore is required for fast init");
@@ -306,6 +347,7 @@ bool TorchCommNCCLXBootstrap::useFastInit(ncclConfig_t config) {
   }
   return false;
 }
+#endif
 
 ncclComm_t TorchCommNCCLXBootstrap::createNcclComm(
     const std::string& name,
@@ -316,18 +358,25 @@ ncclComm_t TorchCommNCCLXBootstrap::createNcclComm(
   // TODO: add logging on failures and successes
   // TODO: use scalable init
   // TODO: get the local rank
-  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-  config.commDesc = name.c_str();
   createStore(name);
 
-  // Populate NCCL config from user-provided hints
-  populateNcclConfigFromHints(config, options, name);
+  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+#ifdef NCCLX_CONFIG_SUPPORTED
+  ncclx::Hints hints;
+  config.hints = &hints;
+#endif
+  populateNcclConfig(config, options, name);
+#ifdef NCCLX_CONFIG_SUPPORTED
+  hints.set("ncclx::commDesc", name);
 
-  if (useFastInit(config)) {
+  if (useFastInit(hints)) {
     uniqueId = ncclUniqueId{};
   } else {
     uniqueId = exchangeUniqueId();
   }
+#else
+  uniqueId = exchangeUniqueId();
+#endif
 
   ncclResult_t ncclErr = nccl_api_->commInitRankConfig(
       &nccl_comm, comm_size_, uniqueId, rank_, &config);

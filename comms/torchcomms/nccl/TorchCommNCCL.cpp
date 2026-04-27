@@ -3,6 +3,7 @@
 #include "comms/torchcomms/nccl/TorchCommNCCL.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -13,20 +14,13 @@
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h> // @manual=//caffe2:torch-cpp-cuda
 
 #include "comms/torchcomms/TorchCommFactory.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/nccl/TorchCommNCCLBootstrap.hpp"
+#include "comms/torchcomms/utils/Logging.hpp"
+#include "comms/torchcomms/utils/StoreManager.hpp"
+#include "comms/torchcomms/utils/TracingGuard.hpp"
+#include "comms/torchcomms/utils/Utils.hpp"
 
 namespace torch::comms {
-
-namespace {
-// Hint key prefix and names for NCCL backend configuration
-constexpr std::string_view kHintPrefix = "torchcomm::nccl::";
-constexpr std::string_view kHintHighPriorityStream =
-    "torchcomm::nccl::high_priority_stream";
-constexpr std::string_view kHintMaxEventPoolSize =
-    "torchcomm::nccl::max_event_pool_size";
-} // namespace
 
 ncclResult_t NCCLException::getResult() const noexcept {
   return result_;
@@ -46,7 +40,44 @@ TorchCommNCCL::TorchCommNCCL(const ncclComm_t nccl_comm)
 
 TorchCommNCCL::~TorchCommNCCL() {
   if (init_state_ == InitializationState::INITIALIZED) {
-    TC_LOG(ERROR, this) << "TorchCommNCCL was not finalized before destruction";
+    TC_LOG(WARNING, this)
+        << "TorchCommNCCL " << name_
+        << " was not finalized before destruction. "
+        << "This may indicate a resource leak. Please call finalize() explicitly.";
+
+    // Signal shutdown to timeout watchdog thread to prevent it from accessing
+    // this object after destruction
+    shutdown_ = true;
+
+    // Wake up the timeout watchdog thread
+    {
+      std::lock_guard<std::mutex> lock(timeout_mutex_);
+      timeout_cv_.notify_all();
+    }
+
+    // Wait for timeout thread to finish. If we're being called from within
+    // the timeout thread itself (e.g., garbageCollect popped a work item whose
+    // destruction released the last shared_ptr to this comm), we must detach
+    // instead of join to avoid a deadlock.
+    if (timeout_thread_.joinable()) {
+      if (std::this_thread::get_id() != timeout_thread_.get_id()) {
+        timeout_thread_.join();
+      } else {
+        timeout_thread_.detach(); // NOLINT(facebook-hte-BadCall-detach)
+      }
+    }
+
+    // Abort the NCCL communicator since we can't do a clean finalization
+    // Note: We don't call the full abortNcclComm() to avoid potential abort()
+    // calls from options_.abort_process_on_timeout_or_error
+    if (nccl_comm_) {
+      // Best effort to abort the communicator - ignore errors since we're
+      // in the destructor
+      if (nccl_api_) {
+        (void)nccl_api_->commAbort(nccl_comm_);
+      }
+      nccl_comm_ = nullptr;
+    }
   }
 
   // We need to detach the memory hook in case finalize is not called,
@@ -58,27 +89,31 @@ void TorchCommNCCL::init(
     at::Device device,
     const std::string& name,
     const CommOptions& options) {
-  // Initialize private members
+  TC_LOG(INFO, this) << "Initializing TorchCommNCCL for device: " << device;
   device_ = device;
   name_ = name;
   options_ = options;
 
-  // Only initialize once
   if (init_state_ == InitializationState::INITIALIZED) {
     throw std::runtime_error("TorchCommNCCL already initialized");
   } else if (init_state_ == InitializationState::FINALIZED) {
     throw std::runtime_error("TorchCommNCCL already finalized");
   }
-  init_state_ = InitializationState::INITIALIZED;
 
-  // Initialize default NCCL API implementation if not already set
   if (!nccl_api_) {
     nccl_api_ = std::make_unique<DefaultNcclApi>();
   }
 
-  // Initialize default CUDA API implementation if not already set
   if (!cuda_api_) {
     cuda_api_ = std::make_unique<DefaultCudaApi>();
+  }
+
+  if (options.enable_reconfigure) {
+    options_.enable_reconfigure = true;
+    reconfigure_store_ = options_.store;
+    TC_LOG(INFO, this)
+        << "TorchCommNCCL dynamic regime enabled, deferring initialization";
+    return;
   }
 
   if (device_.index() == -1 || nccl_comm_ == nullptr) {
@@ -91,13 +126,20 @@ void TorchCommNCCL::init(
     }
   }
 
-  // Set CUDA device and verify it's accessible
+  initNcclResources();
+
+  init_state_ = InitializationState::INITIALIZED;
+  TracingGuard tracingGuard(name_, comm_size_, "init", rank_);
+
+  TC_LOG(INFO, this) << "TorchCommNCCL initialized for rank: " << rank_;
+}
+
+void TorchCommNCCL::initNcclResources() {
   CUDA_CHECK(
       cuda_api_,
       cuda_api_->setDevice(device_.index()),
       fmt::format("Failed to set CUDA device to {}", device_.index()));
 
-  // Verify device properties and memory availability
   cudaDeviceProp device_prop = {};
   CUDA_CHECK(
       cuda_api_,
@@ -105,32 +147,17 @@ void TorchCommNCCL::init(
       fmt::format(
           "Failed to get device properties for device {}", device_.index()));
 
-  // Check available memory
   size_t free_memory, total_memory;
   CUDA_CHECK(
       cuda_api_,
       cuda_api_->memGetInfo(&free_memory, &total_memory),
       fmt::format("Failed to get memory info for device {}", device_.index()));
 
-  // Read hints and store them
-  for (auto const& [key, val] : options_.hints) {
-    if (key.starts_with(kHintPrefix)) {
-      if (key == kHintHighPriorityStream) {
-        high_priority_stream_ = string_to_bool(val);
-      } else {
-        throw std::runtime_error("Unrecognized hint " + key);
-      }
-    } else {
-      // Ignore keys that do not start with "torchcomm::nccl::"
-    }
-  }
+  high_priority_stream_ =
+      options_.getHint<bool>(kHintHighPriorityStream, false);
 
-  // Create internal stream
-  //
-  // Default priority is 0 as per NVIDIA docs (https://fburl.com/2xb0iqwl).
   int stream_priority = 0;
 
-  // Check for high priority stream hint
   if (high_priority_stream_) {
     int leastPriority, greatestPriority;
     CUDA_CHECK(
@@ -140,40 +167,35 @@ void TorchCommNCCL::init(
     stream_priority = greatestPriority;
   }
 
-  CUDA_CHECK(
-      cuda_api_,
-      cuda_api_->streamCreateWithPriority(
-          &internal_stream_, cudaStreamNonBlocking, stream_priority),
-      fmt::format(
-          "Failed to create internal CUDA stream on device {}",
-          device_.index()));
-
-  // Create dependency event for stream synchronization
-  CUDA_CHECK(
-      cuda_api_,
-      cuda_api_->eventCreateWithFlags(
-          &dependency_event_, cudaEventDisableTiming),
-      fmt::format(
-          "Failed to create dependency event on device {}", device_.index()));
-
-  // Allocate CUDA buffer for barrier operations
-  CUDA_CHECK(
-      cuda_api_,
-      cuda_api_->malloc(&barrier_buffer_, sizeof(float)),
-      "Failed to allocate barrier buffer");
-
-  const auto kHintMaxEventPoolSizeKey = std::string(kHintMaxEventPoolSize);
-  if (options_.hints.contains(kHintMaxEventPoolSizeKey)) {
-    max_event_pool_size_ =
-        std::stoull(options_.hints.at(kHintMaxEventPoolSizeKey));
-  } else {
-    max_event_pool_size_ = kDefaultMaxEventPoolSize;
+  if (!internal_stream_) {
+    CUDA_CHECK(
+        cuda_api_,
+        cuda_api_->streamCreateWithPriority(
+            &internal_stream_, cudaStreamNonBlocking, stream_priority),
+        fmt::format(
+            "Failed to create internal CUDA stream on device {}",
+            device_.index()));
   }
 
-  // Give up our internal reference to the store object here.  The caller
-  // would still need to keep a reference to the store object till the init
-  // call returns, at which point the NCCL communicator would already be
-  // created.
+  if (!dependency_event_) {
+    CUDA_CHECK(
+        cuda_api_,
+        cuda_api_->eventCreateWithFlags(
+            &dependency_event_, cudaEventDisableTiming),
+        fmt::format(
+            "Failed to create dependency event on device {}", device_.index()));
+  }
+
+  if (!barrier_buffer_) {
+    CUDA_CHECK(
+        cuda_api_,
+        cuda_api_->malloc(&barrier_buffer_, sizeof(float)),
+        "Failed to allocate barrier buffer");
+  }
+
+  max_event_pool_size_ =
+      options_.getHint<size_t>(kHintMaxEventPoolSize, kDefaultMaxEventPoolSize);
+
   if (options_.store) {
     options_.store.reset();
   }
@@ -192,13 +214,187 @@ void TorchCommNCCL::init(
       nccl_api_->commCount(nccl_comm_, &comm_size_),
       "NCCL Count failed");
 
-  TorchCommTracingGuard tracingGuard(name_, comm_size_, "init", rank_);
+  if (!shutdown_) {
+    timeout_thread_ = std::thread(&TorchCommNCCL::timeoutWatchdog, this);
+  }
 
-  // Start timeout watchdog thread
-  timeout_thread_ = std::thread(&TorchCommNCCL::timeoutWatchdog, this);
-
-  // Register comm with CachingAllocator
   attachMemoryHook();
+}
+
+InitHandle TorchCommNCCL::getInitHandle() const {
+  return fmt::format("nccl:{}", rank_);
+}
+
+namespace {
+
+std::unordered_set<int> parseRanksFromHandles(
+    const std::variant<std::unordered_set<InitHandle>, std::vector<InitHandle>>&
+        handles) {
+  std::unordered_set<int> ranks;
+  auto extractRank = [&](const InitHandle& handle) {
+    auto pos = handle.find(':');
+    if (pos != std::string::npos) {
+      ranks.insert(std::stoi(handle.substr(pos + 1)));
+    }
+  };
+  std::visit(
+      [&](const auto& h) {
+        for (const auto& handle : h) {
+          extractRank(handle);
+        }
+      },
+      handles);
+  return ranks;
+}
+
+} // namespace
+
+c10::intrusive_ptr<TorchWork> TorchCommNCCL::reconfigure(
+    const ReconfigureOptions& opts) {
+  TC_LOG(INFO, this) << "TorchCommNCCL reconfigure starting";
+
+  int new_size = static_cast<int>(
+      std::visit([](const auto& h) { return h.size(); }, opts.handles));
+
+  auto reconfigureTimeout = opts.timeout.value_or(options_.timeout);
+
+  if (comm_state_ == CommState::ERROR && nccl_comm_) {
+    detachMemoryHook();
+    if (timeout_thread_.joinable()) {
+      shutdown_ = true;
+      {
+        std::lock_guard<std::mutex> lock(timeout_mutex_);
+        timeout_cv_.notify_all();
+      }
+      timeout_thread_.join();
+    }
+    workq_.finalize();
+    NCCL_CHECK_IGNORE(
+        nccl_api_,
+        nccl_api_->commAbort(nccl_comm_),
+        "NCCL commAbort failed during error recovery");
+    nccl_comm_ = nullptr;
+  }
+
+  auto growRankIt = opts.hints.find("grow_rank");
+  bool isNewRankJoining = !nccl_comm_ && growRankIt != opts.hints.end();
+
+  if (!nccl_comm_ && !isNewRankJoining) {
+    comm_state_ = CommState::NORMAL;
+    shutdown_ = false;
+
+    comm_size_ = new_size;
+
+    auto bootstrap = std::make_unique<TorchCommNCCLBootstrap>(
+        reconfigure_store_, device_, nccl_api_, cuda_api_, reconfigureTimeout);
+    device_ = bootstrap->getDevice();
+    nccl_comm_ = bootstrap->createNcclComm(
+        fmt::format("{}/reconfigure/{}", name_, opts.uuid), options_);
+
+    initNcclResources();
+  } else if (isNewRankJoining) {
+    comm_state_ = CommState::NORMAL;
+    shutdown_ = false;
+
+    int growRank = std::stoi(growRankIt->second);
+    auto store = createPrefixStore(
+        fmt::format("{}/grow/{}", name_, opts.uuid), reconfigureTimeout);
+
+    store->wait({"unique_id"}, reconfigureTimeout);
+    auto vec = store->get("unique_id");
+    ncclUniqueId uniqueId{};
+    std::memcpy(&uniqueId, vec.data(), sizeof(ncclUniqueId));
+
+    ncclComm_t new_comm = nullptr;
+    NCCL_CHECK(
+        nccl_api_,
+        nccl_comm_,
+        nccl_api_->commGrow(
+            nullptr, new_size, &uniqueId, growRank, &new_comm, nullptr),
+        "NCCL commGrow failed for new rank during reconfigure");
+
+    nccl_comm_ = new_comm;
+    initNcclResources();
+  } else {
+    detachMemoryHook();
+
+    if (timeout_thread_.joinable()) {
+      shutdown_ = true;
+      {
+        std::lock_guard<std::mutex> lock(timeout_mutex_);
+        timeout_cv_.notify_all();
+      }
+      timeout_thread_.join();
+    }
+
+    workq_.finalize();
+
+    ncclComm_t new_comm = nullptr;
+
+    if (new_size <= comm_size_) {
+      auto newRanks = parseRanksFromHandles(opts.handles);
+      std::vector<int> excludeRanks;
+      for (int r = 0; r < comm_size_; ++r) {
+        if (newRanks.find(r) == newRanks.end()) {
+          excludeRanks.push_back(r);
+        }
+      }
+
+      NCCL_CHECK(
+          nccl_api_,
+          nccl_comm_,
+          nccl_api_->commShrink(
+              nccl_comm_,
+              excludeRanks.data(),
+              static_cast<int>(excludeRanks.size()),
+              &new_comm,
+              nullptr,
+              NCCL_SHRINK_ABORT),
+          "NCCL commShrink failed during reconfigure");
+    } else {
+      const ncclUniqueId* uniqueIdPtr = nullptr;
+      ncclUniqueId uniqueId{};
+
+      if (rank_ == 0) {
+        NCCL_CHECK(
+            nccl_api_,
+            nccl_comm_,
+            nccl_api_->commGetUniqueId(nccl_comm_, &uniqueId),
+            "NCCL commGetUniqueId failed during grow");
+
+        auto store = createPrefixStore(
+            fmt::format("{}/grow/{}", name_, opts.uuid), reconfigureTimeout);
+        std::vector<uint8_t> vec(
+            reinterpret_cast<uint8_t*>(&uniqueId),
+            reinterpret_cast<uint8_t*>(&uniqueId) + sizeof(uniqueId));
+        store->set("unique_id", vec);
+
+        uniqueIdPtr = &uniqueId;
+      }
+
+      NCCL_CHECK(
+          nccl_api_,
+          nccl_comm_,
+          nccl_api_->commGrow(
+              nccl_comm_, new_size, uniqueIdPtr, -1, &new_comm, nullptr),
+          "NCCL commGrow failed during reconfigure");
+    }
+
+    nccl_comm_ = new_comm;
+    comm_state_ = CommState::NORMAL;
+    shutdown_ = false;
+
+    initNcclResources();
+  }
+
+  init_state_ = InitializationState::INITIALIZED;
+
+  TracingGuard tracingGuard(name_, comm_size_, "reconfigure", rank_);
+
+  TC_LOG(INFO, this) << "TorchCommNCCL reconfigure completed for rank: "
+                     << rank_;
+
+  return c10::make_intrusive<TorchWorkCompleted>();
 }
 
 void TorchCommNCCL::finalize() {
@@ -305,6 +501,10 @@ void TorchCommNCCL::finalize() {
 }
 
 void TorchCommNCCL::abortNcclComm() {
+  // Call abort hooks before aborting to allow users to capture debug info
+  TC_LOG(INFO, this) << "Calling abort hooks before aborting.";
+  runAbortHooks();
+
   detachMemoryHook();
   if (nccl_comm_) {
     NCCL_CHECK(
@@ -317,6 +517,19 @@ void TorchCommNCCL::abortNcclComm() {
   if (options_.abort_process_on_timeout_or_error) {
     TC_LOG(ERROR, this) << "Aborting process due to timeout";
     abort();
+  }
+}
+
+void TorchCommNCCL::revokeNcclComm() {
+  TC_LOG(INFO, this) << "Calling abort hooks before commRevoke.";
+  runAbortHooks();
+  detachMemoryHook();
+  if (nccl_comm_) {
+    NCCL_CHECK(
+        nccl_api_,
+        nccl_comm_,
+        nccl_api_->commRevoke(nccl_comm_),
+        "NCCL Revoke failed");
   }
 }
 
@@ -372,8 +585,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::send(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
-      name_, comm_size_, "send", dst, tensor, tensor);
+  TracingGuard tracingGuard(name_, comm_size_, "send", dst, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
   auto work = async_op
@@ -417,8 +629,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::recv(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
-      name_, comm_size_, "recv", src, tensor, tensor);
+  TracingGuard tracingGuard(name_, comm_size_, "recv", src, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
   auto work = createWork(
@@ -478,7 +689,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::batch_op_issue(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_,
       comm_size_,
       "batch_op_issue",
@@ -559,7 +770,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::broadcast(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "broadcast", root, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -605,7 +816,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_reduce(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_reduce", rank_, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -653,8 +864,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::reduce(
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
 
-  TorchCommTracingGuard tracingGuard(
-      name_, comm_size_, "reduce", root, tensor, tensor);
+  TracingGuard tracingGuard(name_, comm_size_, "reduce", root, tensor, tensor);
 
   cudaStream_t stream = getOperationStream(async_op);
   auto work = async_op
@@ -716,7 +926,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_gather(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_gather", rank_, tensor_list, {tensor});
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -780,7 +990,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_gather_v(
     ensureTensorContiguous(t);
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_gather_v", rank_, tensor_list, {tensor});
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -849,7 +1059,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_gather_single(
         "Output tensor size must be input_size * comm_size for all_gather_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_gather_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -907,7 +1117,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::reduce_scatter(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "reduce_scatter", rank_, input_list, {output});
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -990,7 +1200,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::reduce_scatter_v(
     ensureTensorContiguous(t);
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "reduce_scatter_v", rank_, input_list, {output});
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -1076,7 +1286,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::reduce_scatter_single(
         "Input tensor size must be output_size * comm_size for reduce_scatter_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "reduce_scatter_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -1134,7 +1344,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_to_all_single(
         "Tensor size must be divisible by comm_size for all_to_all_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_to_all_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -1249,7 +1459,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_to_all_v_single(
         "Sum of output_split_sizes exceeds output tensor size for all_to_all_v_single");
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "all_to_all_v_single", rank_, input, output);
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -1360,7 +1570,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::all_to_all(
     ensureTensorContiguous(output_tensor_list[i]);
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_,
       comm_size_,
       "all_to_all",
@@ -1429,7 +1639,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::barrier(
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
 
-  TorchCommTracingGuard tracingGuard(name_, comm_size_, "barrier", rank_);
+  TracingGuard tracingGuard(name_, comm_size_, "barrier", rank_);
   cudaStream_t stream = getOperationStream(async_op);
   auto work = createWork(
       stream, getOperationTimeout(options.timeout, options_.timeout));
@@ -1486,7 +1696,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::scatter(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "scatter", root, input_tensor_list, {output_tensor});
 
   cudaStream_t stream = getOperationStream(async_op);
@@ -1589,7 +1799,7 @@ c10::intrusive_ptr<TorchWork> TorchCommNCCL::gather(
     }
   }
 
-  TorchCommTracingGuard tracingGuard(
+  TracingGuard tracingGuard(
       name_, comm_size_, "gather", root, {input_tensor}, output_tensor_list);
 
   cudaStream_t stream = getOperationStream(async_op);

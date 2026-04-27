@@ -7,7 +7,6 @@
 #include <folly/init/Init.h>
 #include <folly/logging/xlog.h>
 
-#include "comms/ctran/backends/CtranCtrl.h"
 #include "comms/ctran/backends/ib/CtranIb.h"
 #include "comms/ctran/backends/ib/CtranIbBase.h"
 #include "comms/ctran/tests/CtranDistTestUtils.h"
@@ -30,11 +29,9 @@ class CtranIbCtrlMsgTest : public ctran::CtranDistTestFixture {
     CtranDistTestFixture::SetUp();
     this->comm_ = makeCtranComm();
     this->comm = this->comm_.get();
-    this->ctrlMgr = std::make_unique<CtranCtrlManager>();
   }
 
   void TearDown() override {
-    this->ctrlMgr.reset();
     this->comm_.reset();
     CtranDistTestFixture::TearDown();
   }
@@ -48,7 +45,6 @@ class CtranIbCtrlMsgTest : public ctran::CtranDistTestFixture {
  protected:
   std::unique_ptr<CtranComm> comm_{nullptr};
   CtranComm* comm{nullptr};
-  std::unique_ptr<CtranCtrlManager> ctrlMgr{nullptr};
 };
 
 TEST_F(CtranIbCtrlMsgTest, CtrlMsg) {
@@ -57,7 +53,7 @@ TEST_F(CtranIbCtrlMsgTest, CtrlMsg) {
       "Expect rank 2 can issue multiple send control msgs to ranks 0 and 1, and match to the corresponding recvs");
 
   try {
-    auto ctranIb = std::make_unique<CtranIb>(this->comm, this->ctrlMgr.get());
+    auto ctranIb = std::make_unique<CtranIb>(this->comm);
     std::vector<CtranIbRequest> reqs;
     std::vector<ControlMsg> smsgs;
     ControlMsg rmsg0(ControlMsgType::IB_EXPORT_MEM);
@@ -77,10 +73,10 @@ TEST_F(CtranIbCtrlMsgTest, CtrlMsg) {
       reqs.resize(3, CtranIbRequest());
       smsgs.resize(3, ControlMsg(ControlMsgType::IB_EXPORT_MEM));
       // send two msgs to rank 1
-      smsgs[0].ibExp.remoteAddr = 99;
-      smsgs[0].ibExp.rkeys[0] = recvRank0;
-      smsgs[0].ibExp.rkeys[1] = recvRank0;
-      smsgs[0].ibExp.nKeys = 2;
+      smsgs[0].ibDesc.remoteAddr = 99;
+      smsgs[0].ibDesc.rkeys[0] = recvRank0;
+      smsgs[0].ibDesc.rkeys[1] = recvRank0;
+      smsgs[0].ibDesc.nKeys = 2;
       COMMCHECK_TEST(ctranIb->isendCtrlMsg(
           smsgs[0].type, &smsgs[0], sizeof(smsgs[0]), recvRank0, reqs[0]));
 
@@ -89,19 +85,19 @@ TEST_F(CtranIbCtrlMsgTest, CtrlMsg) {
       // arrived in order
       sleep(2);
 
-      smsgs[1].ibExp.remoteAddr = 100;
-      smsgs[1].ibExp.rkeys[0] = recvRank0;
-      smsgs[1].ibExp.rkeys[1] = recvRank0;
-      smsgs[1].ibExp.nKeys = 2;
+      smsgs[1].ibDesc.remoteAddr = 100;
+      smsgs[1].ibDesc.rkeys[0] = recvRank0;
+      smsgs[1].ibDesc.rkeys[1] = recvRank0;
+      smsgs[1].ibDesc.nKeys = 2;
 
       COMMCHECK_TEST(ctranIb->isendCtrlMsg(
           smsgs[1].type, &smsgs[1], sizeof(smsgs[1]), recvRank0, reqs[1]));
 
       // send one msg to rank 2
-      smsgs[2].ibExp.remoteAddr = 101;
-      smsgs[2].ibExp.rkeys[0] = recvRank1;
-      smsgs[2].ibExp.rkeys[1] = recvRank1;
-      smsgs[2].ibExp.nKeys = 2;
+      smsgs[2].ibDesc.remoteAddr = 101;
+      smsgs[2].ibDesc.rkeys[0] = recvRank1;
+      smsgs[2].ibDesc.rkeys[1] = recvRank1;
+      smsgs[2].ibDesc.nKeys = 2;
       COMMCHECK_TEST(ctranIb->isendCtrlMsg(
           smsgs[2].type, &smsgs[2], sizeof(smsgs[2]), recvRank1, reqs[2]));
     } else if (this->globalRank == recvRank0) {
@@ -126,19 +122,19 @@ TEST_F(CtranIbCtrlMsgTest, CtrlMsg) {
     }
 
     if (this->globalRank == recvRank0) {
-      EXPECT_EQ(rmsg0.ibExp.rkeys[0], recvRank0);
-      EXPECT_EQ(rmsg0.ibExp.rkeys[1], recvRank0);
-      EXPECT_EQ(rmsg0.ibExp.nKeys, 2);
-      EXPECT_EQ(rmsg0.ibExp.remoteAddr, 99);
-      EXPECT_EQ(rmsg1.ibExp.rkeys[0], recvRank0);
-      EXPECT_EQ(rmsg1.ibExp.rkeys[1], recvRank0);
-      EXPECT_EQ(rmsg1.ibExp.nKeys, 2);
-      EXPECT_EQ(rmsg1.ibExp.remoteAddr, 100);
+      EXPECT_EQ(rmsg0.ibDesc.rkeys[0], recvRank0);
+      EXPECT_EQ(rmsg0.ibDesc.rkeys[1], recvRank0);
+      EXPECT_EQ(rmsg0.ibDesc.nKeys, 2);
+      EXPECT_EQ(rmsg0.ibDesc.remoteAddr, 99);
+      EXPECT_EQ(rmsg1.ibDesc.rkeys[0], recvRank0);
+      EXPECT_EQ(rmsg1.ibDesc.rkeys[1], recvRank0);
+      EXPECT_EQ(rmsg1.ibDesc.nKeys, 2);
+      EXPECT_EQ(rmsg1.ibDesc.remoteAddr, 100);
     } else if (this->globalRank == recvRank1) {
-      EXPECT_EQ(rmsg0.ibExp.rkeys[0], recvRank1);
-      EXPECT_EQ(rmsg0.ibExp.rkeys[1], recvRank1);
-      EXPECT_EQ(rmsg0.ibExp.nKeys, 2);
-      EXPECT_EQ(rmsg0.ibExp.remoteAddr, 101);
+      EXPECT_EQ(rmsg0.ibDesc.rkeys[0], recvRank1);
+      EXPECT_EQ(rmsg0.ibDesc.rkeys[1], recvRank1);
+      EXPECT_EQ(rmsg0.ibDesc.nKeys, 2);
+      EXPECT_EQ(rmsg0.ibDesc.remoteAddr, 101);
     }
   } catch (const std::bad_alloc& _) {
     GTEST_SKIP() << "IB backend not enabled. Skip test";

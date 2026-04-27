@@ -23,7 +23,7 @@ namespace ctran {
     }                                                                 \
   } while (0)
 
-void CtranTcpDm::bootstrapPrepare(ctran::bootstrap::IBootstrap* bootstrap) {
+void CtranTcpDm::bootstrapPrepare(meta::comms::IBootstrap* bootstrap) {
   folly::SocketAddress ifAddrSockAddr;
   sockaddr_in6 sin6{};
   auto dev = netdev_->bootstrapIface();
@@ -31,13 +31,13 @@ void CtranTcpDm::bootstrapPrepare(ctran::bootstrap::IBootstrap* bootstrap) {
   sin6.sin6_addr = dev->addr;
   ifAddrSockAddr.setFromSockaddr(&sin6);
   FB_SYSCHECKTHROW_EX(
-      listenSocket_.bindAndListen(ifAddrSockAddr, *dev->name),
+      listenSocket_.bindAndListen(ifAddrSockAddr, dev->name.c_str()),
       rank_,
       commHash_,
       commDesc_);
 
   std::string line =
-      ::comms::tcp_devmem::addrToString(&dev->addr, 0, *dev->name);
+      ::comms::tcp_devmem::addrToString(&dev->addr, 0, dev->name.c_str());
   CLOGF_SUBSYS(
       INFO,
       INIT,
@@ -182,9 +182,7 @@ commResult_t CtranTcpDm::bootstrapConnect(
   return res;
 }
 
-CtranTcpDm::CtranTcpDm(
-    [[maybe_unused]] CtranComm* comm,
-    [[maybe_unused]] CtranCtrlManager* ctrlMgr) {
+CtranTcpDm::CtranTcpDm([[maybe_unused]] CtranComm* comm) {
   transport_ = CtranTcpDmSingleton::getTransport();
 
   cudaDev_ = comm->statex_->cudaDev();

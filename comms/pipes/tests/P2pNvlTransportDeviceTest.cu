@@ -23,27 +23,27 @@ __device__ inline ThreadGroup make_group(GroupType groupType) {
 // =============================================================================
 
 __global__ void testDeviceSignalKernel(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     SignalOp op,
     uint64_t value,
     GroupType groupType) {
   auto group = make_group(groupType);
-  p2p.signal_threadgroup(group, signalId, op, value);
+  p2p->signal(group, signalId, op, value);
 }
 
 __global__ void testDeviceWaitSignalKernel(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     CmpOp op,
     uint64_t value,
     GroupType groupType) {
   auto group = make_group(groupType);
-  p2p.wait_signal_until_threadgroup(group, signalId, op, value);
+  p2p->wait_signal_until(group, signalId, op, value);
 }
 
 __global__ void testDeviceSignalThenWaitKernel(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     SignalOp signalOp,
     uint64_t signalValue,
@@ -51,12 +51,12 @@ __global__ void testDeviceSignalThenWaitKernel(
     uint64_t waitValue,
     GroupType groupType) {
   auto group = make_group(groupType);
-  p2p.signal_threadgroup(group, signalId, signalOp, signalValue);
-  p2p.wait_signal_until_threadgroup(group, signalId, waitOp, waitValue);
+  p2p->signal(group, signalId, signalOp, signalValue);
+  p2p->wait_signal_until(group, signalId, waitOp, waitValue);
 }
 
 void testDeviceSignal(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     SignalOp op,
     uint64_t value,
@@ -69,7 +69,7 @@ void testDeviceSignal(
 }
 
 void testDeviceWaitSignal(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     CmpOp op,
     uint64_t value,
@@ -82,7 +82,7 @@ void testDeviceWaitSignal(
 }
 
 void testDeviceSignalThenWait(
-    P2pNvlTransportDevice p2p,
+    P2pNvlTransportDevice* p2p,
     uint64_t signalId,
     SignalOp signalOp,
     uint64_t signalValue,
@@ -93,6 +93,49 @@ void testDeviceSignalThenWait(
     GroupType groupType) {
   testDeviceSignalThenWaitKernel<<<numBlocks, blockSize>>>(
       p2p, signalId, signalOp, signalValue, waitOp, waitValue, groupType);
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+__global__ void testDevicePutKernel(
+    P2pNvlTransportDevice* p2p,
+    char* dst_d,
+    const char* src_d,
+    std::size_t tileSize,
+    GroupType groupType) {
+  auto group = make_group(groupType);
+  std::size_t offset = group.group_id * tileSize;
+  p2p->put(group, dst_d + offset, src_d + offset, tileSize);
+}
+
+void testDevicePut(
+    P2pNvlTransportDevice* p2p,
+    char* dst_d,
+    const char* src_d,
+    std::size_t tileSize,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType) {
+  testDevicePutKernel<<<numBlocks, blockSize>>>(
+      p2p, dst_d, src_d, tileSize, groupType);
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+__global__ void testDeviceResetSignalKernel(
+    P2pNvlTransportDevice* p2p,
+    uint64_t signalId,
+    GroupType groupType) {
+  auto group = make_group(groupType);
+  p2p->reset_signal(group, signalId);
+}
+
+void testDeviceResetSignal(
+    P2pNvlTransportDevice* p2p,
+    uint64_t signalId,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType) {
+  testDeviceResetSignalKernel<<<numBlocks, blockSize>>>(
+      p2p, signalId, groupType);
   PIPES_KERNEL_LAUNCH_CHECK();
 }
 
@@ -152,6 +195,59 @@ void testRawWaitSignal(
 void testReadSignal(SignalState* signal_d, uint64_t* result_d) {
   testReadSignalKernel<<<1, 1>>>(signal_d, result_d);
   PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+// =============================================================================
+// LL128 transport send/recv test kernels
+// =============================================================================
+
+__global__ void
+testLl128SendKernel(P2pNvlTransportDevice p2p, const char* src, size_t nbytes) {
+  auto group = make_warp_group();
+  Timeout timeout;
+  timeout.start();
+  p2p.ll128_send_group(group, src, nbytes, timeout);
+}
+
+__global__ void
+testLl128RecvKernel(P2pNvlTransportDevice p2p, char* dst, size_t nbytes) {
+  auto group = make_warp_group();
+  Timeout timeout;
+  timeout.start();
+  p2p.ll128_recv_group(group, dst, nbytes, timeout);
+}
+
+void testLl128SendRecv(
+    P2pNvlTransportDevice sender,
+    P2pNvlTransportDevice receiver,
+    const char* src_d,
+    char* dst_d,
+    size_t nbytes,
+    int numBlocks,
+    int blockSize) {
+  cudaStream_t send_stream, recv_stream;
+
+  // Sender on GPU 0
+  PIPES_CUDA_CHECK(cudaSetDevice(0));
+  PIPES_CUDA_CHECK(cudaStreamCreate(&send_stream));
+  testLl128SendKernel<<<numBlocks, blockSize, 0, send_stream>>>(
+      sender, src_d, nbytes);
+  PIPES_KERNEL_LAUNCH_CHECK();
+
+  // Receiver on GPU 1
+  PIPES_CUDA_CHECK(cudaSetDevice(1));
+  PIPES_CUDA_CHECK(cudaStreamCreate(&recv_stream));
+  testLl128RecvKernel<<<numBlocks, blockSize, 0, recv_stream>>>(
+      receiver, dst_d, nbytes);
+  PIPES_KERNEL_LAUNCH_CHECK();
+
+  // Wait for both to complete and destroy streams
+  PIPES_CUDA_CHECK(cudaSetDevice(0));
+  PIPES_CUDA_CHECK(cudaStreamSynchronize(send_stream));
+  PIPES_CUDA_CHECK(cudaStreamDestroy(send_stream));
+  PIPES_CUDA_CHECK(cudaSetDevice(1));
+  PIPES_CUDA_CHECK(cudaStreamSynchronize(recv_stream));
+  PIPES_CUDA_CHECK(cudaStreamDestroy(recv_stream));
 }
 
 } // namespace comms::pipes::test
