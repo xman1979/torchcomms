@@ -169,7 +169,7 @@ function build_third_party {
       build_fb_oss_library "https://github.com/abseil/abseil-cpp" "20240116.2" abseil "-DABSL_BUILD_TEST_HELPERS=OFF"
       build_automake_library "https://github.com/protocolbuffers/protobuf" "v3.20.3" protobuf
       build_automake_library "https://github.com/rockdaboot/libpsl" "libpsl-0.21.0" psl
-      build_fb_oss_library "https://github.com/curl/curl" "curl-8_16_0" curl "-DBUILD_SHARED_LIBS=OFF -DCURL_BROTLI=OFF -DOPENSSL_USE_STATIC_LIBS=ON -DUSE_LIBIDN2=OFF"
+      build_fb_oss_library "https://github.com/curl/curl" "curl-8_16_0" curl "-DBUILD_SHARED_LIBS=OFF -DCURL_BROTLI=OFF -DOPENSSL_USE_STATIC_LIBS=ON -DUSE_LIBIDN2=OFF -DBUILD_CURL_EXE=OFF"
       build_fb_oss_library "https://github.com/open-telemetry/opentelemetry-cpp" "v1.19.0" opentelemetry-cpp "-DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DWITH_OTLP_HTTP=ON -DCMAKE_FIND_LIBRARY_SUFFIXES=.a -DWITH_EXAMPLES=OFF -DCMAKE_LIBRARY_PATH=${CONDA_PREFIX}/lib -DOPENSSL_USE_STATIC_LIBS=TRUE"
     fi
   else
